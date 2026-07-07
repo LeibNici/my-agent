@@ -1,0 +1,156 @@
+"""Agent core — tool-use loop with streaming support."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import AsyncIterator
+
+from app.config import settings
+from app.llm import LLMClient
+from app.tools.registry import execute_tool, get_tools_schema
+from app.skills.base import build_system_prompt, get_tools_for_skills
+
+
+@dataclass
+class AgentEvent:
+    """An event emitted by the agent during processing."""
+    type: str  # "text_delta" | "tool_use" | "tool_result" | "done" | "error"
+    data: dict = field(default_factory=dict)
+
+
+class Agent:
+    """Core agent that runs the tool-use loop with streaming."""
+
+    def __init__(self, llm: LLMClient | None = None):
+        self.llm = llm or LLMClient()
+
+    async def run(
+        self,
+        messages: list[dict],
+        active_skills: list[str] | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Run the agent loop, yielding events as they occur.
+
+        This implements the standard Anthropic tool-use loop:
+        1. Send messages + tools to the LLM
+        2. If LLM returns tool_use → execute → append result → go to 1
+        3. If LLM returns text → done
+        """
+        # Build system prompt with active skills
+        system = build_system_prompt(settings.system_prompt, active_skills or [])
+
+        # Collect available tools (all tools if no skills, or skill-specific tools)
+        if active_skills:
+            allowed_tools = get_tools_for_skills(active_skills)
+            all_schemas = get_tools_schema()
+            tools = [s for s in all_schemas if s["name"] in allowed_tools]
+        else:
+            tools = get_tools_schema()
+
+        # Tool-use loop with iteration limit
+        for iteration in range(settings.max_tool_iterations):
+            # Stream the response
+            full_text = ""
+            tool_calls = []  # collect tool_use blocks
+
+            async with self.llm.client.messages.stream(
+                model=self.llm.model,
+                max_tokens=settings.max_tokens,
+                messages=messages,
+                system=system,
+                tools=tools if tools else None,
+            ) as stream:
+                current_tool = None
+                tool_input_json = ""
+
+                async for event in stream:
+                    etype = getattr(event, "type", None)
+
+                    # Text delta
+                    if etype == "content_block_delta":
+                        delta = event.delta
+                        if getattr(delta, "type", None) == "text_delta":
+                            text = delta.text
+                            full_text += text
+                            yield AgentEvent(type="text_delta", data={"text": text})
+                        elif getattr(delta, "type", None) == "input_json_delta":
+                            tool_input_json += delta.partial_json
+
+                    # Content block start — could be text or tool_use
+                    elif etype == "content_block_start":
+                        block = event.content_block
+                        if getattr(block, "type", None) == "tool_use":
+                            current_tool = {
+                                "id": block.id,
+                                "name": block.name,
+                                "input_json": "",
+                            }
+                            tool_input_json = ""
+
+                    # Content block stop
+                    elif etype == "content_block_stop":
+                        if current_tool:
+                            current_tool["input_json"] = tool_input_json
+                            tool_calls.append(current_tool)
+                            current_tool = None
+                            tool_input_json = ""
+
+            # If there were tool calls, execute them and continue the loop
+            if tool_calls:
+                # Build assistant message with tool_use blocks
+                assistant_blocks = []
+                if full_text:
+                    assistant_blocks.append({"type": "text", "text": full_text})
+                for tc in tool_calls:
+                    try:
+                        inp = json.loads(tc["input_json"]) if tc["input_json"] else {}
+                    except json.JSONDecodeError:
+                        inp = {}
+                    assistant_blocks.append({
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "input": inp,
+                    })
+
+                messages.append({"role": "assistant", "content": assistant_blocks})
+
+                # Execute each tool and collect results
+                tool_result_blocks = []
+                for tc in tool_calls:
+                    try:
+                        inp = json.loads(tc["input_json"]) if tc["input_json"] else {}
+                    except json.JSONDecodeError:
+                        inp = {}
+
+                    yield AgentEvent(type="tool_use", data={
+                        "name": tc["name"],
+                        "input": inp,
+                    })
+
+                    result = await execute_tool(tc["name"], inp)
+
+                    yield AgentEvent(type="tool_result", data={
+                        "name": tc["name"],
+                        "result": result,
+                    })
+
+                    tool_result_blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": tc["id"],
+                        "content": result,
+                    })
+
+                messages.append({"role": "user", "content": tool_result_blocks})
+                # Loop continues — LLM will see tool results
+
+            else:
+                # No tool calls — the response is final text, we're done
+                yield AgentEvent(type="done", data={"text": full_text})
+                return
+
+        # Hit iteration limit
+        yield AgentEvent(type="error", data={
+            "message": f"Reached max tool iterations ({settings.max_tool_iterations})"
+        })

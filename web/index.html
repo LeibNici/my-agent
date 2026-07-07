@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Agent</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <!-- Marked.js for markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- Sidebar -->
+        <aside id="sidebar">
+            <div class="sidebar-header">
+                <h2>💬 My Agent</h2>
+                <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
+            </div>
+
+            <!-- Skills -->
+            <div class="skills-section">
+                <h3>🛠 Skills</h3>
+                <div id="skills-list"></div>
+            </div>
+
+            <!-- Sessions -->
+            <div class="sessions-section">
+                <h3>📝 History</h3>
+                <div id="sessions-list"></div>
+            </div>
+        </aside>
+
+        <!-- Main Chat Area -->
+        <main id="chat-area">
+            <div id="messages">
+                <div class="welcome-message">
+                    <h1>👋 Hello!</h1>
+                    <p>Select a skill and start chatting.</p>
+                    <p>Your agent supports tool-use and will think step by step.</p>
+                </div>
+            </div>
+
+            <!-- Input Area -->
+            <div id="input-area">
+                <div class="input-wrapper">
+                    <textarea
+                        id="message-input"
+                        placeholder="Type your message... (Enter to send, Shift+Enter for new line)"
+                        rows="1"
+                        onkeydown="handleKeyDown(event)"
+                        oninput="autoResize(this)"
+                    ></textarea>
+                    <button id="send-btn" onclick="sendMessage()">Send</button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
