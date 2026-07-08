@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import traceback
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 from app.config import settings
 from app.llm import LLMClient
-from app.tools.registry import execute_tool, get_tools_schema
+from app.tools.registry import execute_tool, get_tools_schema, tool_context
 from app.skills.base import build_system_prompt, get_tools_for_skills
 
 
@@ -29,6 +30,7 @@ class Agent:
         self,
         messages: list[dict],
         active_skills: list[str] | None = None,
+        allowed_repo_paths: list[str] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent loop, yielding events as they occur.
 
@@ -40,6 +42,9 @@ class Agent:
         # Build system prompt with active skills
         system = build_system_prompt(settings.system_prompt, active_skills or [])
 
+        # Set tool context for permission-aware tools
+        tool_context.set({"allowed_repo_paths": allowed_repo_paths or []})
+
         # Collect available tools (all tools if no skills, or skill-specific tools)
         if active_skills:
             allowed_tools = get_tools_for_skills(active_skills)
@@ -48,53 +53,69 @@ class Agent:
         else:
             tools = get_tools_schema()
 
+        # Track all tool exchanges for persistence
+        all_tool_exchanges = []  # list of (assistant_blocks, tool_result_blocks) pairs
+
         # Tool-use loop with iteration limit
         for iteration in range(settings.max_tool_iterations):
             # Stream the response
             full_text = ""
             tool_calls = []  # collect tool_use blocks
 
-            async with self.llm.client.messages.stream(
-                model=self.llm.model,
-                max_tokens=settings.max_tokens,
-                messages=messages,
-                system=system,
-                tools=tools if tools else None,
-            ) as stream:
-                current_tool = None
-                tool_input_json = ""
+            try:
+                async with self.llm.client.messages.stream(
+                    model=self.llm.model,
+                    max_tokens=settings.max_tokens,
+                    messages=messages,
+                    system=system,
+                    tools=tools if tools else None,
+                ) as stream:
+                    current_tool = None
+                    tool_input_json = ""
 
-                async for event in stream:
-                    etype = getattr(event, "type", None)
+                    async for event in stream:
+                        etype = getattr(event, "type", None)
 
-                    # Text delta
-                    if etype == "content_block_delta":
-                        delta = event.delta
-                        if getattr(delta, "type", None) == "text_delta":
-                            text = delta.text
-                            full_text += text
-                            yield AgentEvent(type="text_delta", data={"text": text})
-                        elif getattr(delta, "type", None) == "input_json_delta":
-                            tool_input_json += delta.partial_json
+                        # Text delta
+                        if etype == "content_block_delta":
+                            delta = event.delta
+                            if getattr(delta, "type", None) == "text_delta":
+                                text = delta.text
+                                full_text += text
+                                yield AgentEvent(type="text_delta", data={"text": text})
+                            elif getattr(delta, "type", None) == "input_json_delta":
+                                tool_input_json += delta.partial_json
 
-                    # Content block start — could be text or tool_use
-                    elif etype == "content_block_start":
-                        block = event.content_block
-                        if getattr(block, "type", None) == "tool_use":
-                            current_tool = {
-                                "id": block.id,
-                                "name": block.name,
-                                "input_json": "",
-                            }
-                            tool_input_json = ""
+                        # Content block start — could be text or tool_use
+                        elif etype == "content_block_start":
+                            block = event.content_block
+                            if getattr(block, "type", None) == "tool_use":
+                                current_tool = {
+                                    "id": block.id,
+                                    "name": block.name,
+                                    "input_json": "",
+                                }
+                                tool_input_json = ""
 
-                    # Content block stop
-                    elif etype == "content_block_stop":
-                        if current_tool:
-                            current_tool["input_json"] = tool_input_json
-                            tool_calls.append(current_tool)
-                            current_tool = None
-                            tool_input_json = ""
+                        # Content block stop
+                        elif etype == "content_block_stop":
+                            if current_tool:
+                                current_tool["input_json"] = tool_input_json
+                                tool_calls.append(current_tool)
+                                current_tool = None
+                                tool_input_json = ""
+
+            except Exception as e:
+                # LLM API error — emit error but do NOT emit a success-shaped done.
+                # The done event carries success=false so main.py won't persist.
+                yield AgentEvent(type="error", data={
+                    "message": f"LLM API error: {type(e).__name__}: {str(e)}"
+                })
+                yield AgentEvent(type="done", data={
+                    "text": full_text,
+                    "success": False,
+                })
+                return
 
             # If there were tool calls, execute them and continue the loop
             if tool_calls:
@@ -125,6 +146,7 @@ class Agent:
                         inp = {}
 
                     yield AgentEvent(type="tool_use", data={
+                        "id": tc["id"],
                         "name": tc["name"],
                         "input": inp,
                     })
@@ -132,6 +154,7 @@ class Agent:
                     result = await execute_tool(tc["name"], inp)
 
                     yield AgentEvent(type="tool_result", data={
+                        "id": tc["id"],
                         "name": tc["name"],
                         "result": result,
                     })
@@ -142,15 +165,29 @@ class Agent:
                         "content": result,
                     })
 
+                # Track this tool exchange for persistence
+                all_tool_exchanges.append((assistant_blocks, tool_result_blocks))
+
                 messages.append({"role": "user", "content": tool_result_blocks})
                 # Loop continues — LLM will see tool results
 
             else:
                 # No tool calls — the response is final text, we're done
-                yield AgentEvent(type="done", data={"text": full_text})
+                yield AgentEvent(type="done", data={
+                    "text": full_text,
+                    "success": True,
+                    "tool_exchanges": [
+                        {"assistant": a, "results": r}
+                        for a, r in all_tool_exchanges
+                    ],
+                })
                 return
 
-        # Hit iteration limit
+        # Hit iteration limit — error, not success
         yield AgentEvent(type="error", data={
             "message": f"Reached max tool iterations ({settings.max_tool_iterations})"
+        })
+        yield AgentEvent(type="done", data={
+            "text": "",
+            "success": False,
         })

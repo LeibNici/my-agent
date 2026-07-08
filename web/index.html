@@ -2,19 +2,33 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0">
     <title>My Agent</title>
     <link rel="stylesheet" href="/static/style.css">
     <!-- Marked.js for markdown rendering -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- DOMPurify for HTML sanitization -->
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 </head>
 <body>
     <div id="app">
+        <!-- Mobile overlay -->
+        <div id="sidebar-overlay" onclick="toggleSidebar()"></div>
+
         <!-- Sidebar -->
         <aside id="sidebar">
             <div class="sidebar-header">
                 <h2>💬 My Agent</h2>
                 <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
+            </div>
+
+            <!-- User info -->
+            <div id="user-info" style="padding:10px 20px;font-size:13px;color:var(--text-secondary);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;"></div>
+
+            <!-- Repos -->
+            <div class="skills-section">
+                <h3>📦 仓库</h3>
+                <div id="repos-list"></div>
             </div>
 
             <!-- Skills -->
@@ -32,6 +46,12 @@
 
         <!-- Main Chat Area -->
         <main id="chat-area">
+            <!-- Mobile header -->
+            <div id="mobile-header">
+                <button id="menu-btn" onclick="toggleSidebar()" aria-label="Toggle menu">☰</button>
+                <span class="mobile-title">💬 My Agent</span>
+            </div>
+
             <div id="messages">
                 <div class="welcome-message">
                     <h1>👋 Hello!</h1>

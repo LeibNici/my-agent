@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Login — My Agent</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            height: 100vh;
+            height: 100dvh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-card {
+            background: #16213e;
+            border-radius: 16px;
+            padding: 40px;
+            width: 380px;
+            max-width: 90vw;
+            border: 1px solid #2a2a4a;
+        }
+        .login-card h1 {
+            text-align: center;
+            margin-bottom: 8px;
+            font-size: 24px;
+        }
+        .login-card p {
+            text-align: center;
+            color: #a0a0b0;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .form-group {
+            margin-bottom: 18px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 14px;
+            color: #a0a0b0;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 12px 14px;
+            background: #1a1a2e;
+            border: 1px solid #2a2a4a;
+            border-radius: 10px;
+            color: #e0e0e0;
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .form-group input:focus { border-color: #e94560; }
+        .login-btn {
+            width: 100%;
+            padding: 14px;
+            background: #e94560;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin-top: 8px;
+        }
+        .login-btn:hover { background: #ff6b81; }
+        .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .error-msg {
+            color: #ff6b6b;
+            font-size: 13px;
+            margin-top: 12px;
+            text-align: center;
+            min-height: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <h1>💬 My Agent</h1>
+        <p>登录以开始使用</p>
+        <form onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label>用户名</label>
+                <input type="text" id="username" autofocus required>
+            </div>
+            <div class="form-group">
+                <label>密码</label>
+                <input type="password" id="password" required>
+            </div>
+            <button type="submit" class="login-btn" id="login-btn">登录</button>
+            <div class="error-msg" id="error-msg"></div>
+        </form>
+    </div>
+    <script>
+    async function handleLogin(e) {
+        e.preventDefault();
+        const btn = document.getElementById("login-btn");
+        const errEl = document.getElementById("error-msg");
+        btn.disabled = true;
+        errEl.textContent = "";
+
+        try {
+            const resp = await fetch("/api/auth/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    username: document.getElementById("username").value,
+                    password: document.getElementById("password").value,
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                errEl.textContent = data.detail || "登录失败";
+                btn.disabled = false;
+                return;
+            }
+            localStorage.setItem("token", data.token);
+            localStorage.setItem("user", JSON.stringify(data.user));
+            // Redirect based on role
+            window.location.href = data.user.role === "admin" ? "/admin" : "/";
+        } catch (err) {
+            errEl.textContent = "网络错误，请重试";
+            btn.disabled = false;
+        }
+    }
+
+    // If already logged in, redirect
+    if (localStorage.getItem("token")) {
+        try {
+            const user = JSON.parse(localStorage.getItem("user"));
+            window.location.href = user.role === "admin" ? "/admin" : "/";
+        } catch { /* ignore */ }
+    }
+    </script>
+</body>
+</html>

@@ -1,17 +1,145 @@
+// ===== Auth =====
+const _token = localStorage.getItem("token");
+const _user = JSON.parse(localStorage.getItem("user") || "null");
+if (!_token) { window.location.href = "/login"; }
+
+function authHeaders() {
+    return { "Authorization": `Bearer ${_token}` };
+}
+
+function authFetch(url, opts = {}) {
+    opts.headers = { ...(opts.headers || {}), ...authHeaders() };
+    return fetch(url, opts).then(resp => {
+        if (resp.status === 401) { localStorage.removeItem("token"); window.location.href = "/login"; }
+        return resp;
+    });
+}
+
+function logout() {
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+    window.location.href = "/login";
+}
+
 // ===== State =====
 let currentSessionId = null;
 let activeSkills = [];
+let selectedRepoId = null;
 let isStreaming = false;
+let currentAbortController = null;
 
 // ===== Init =====
 document.addEventListener("DOMContentLoaded", () => {
+    // Show user info in sidebar
+    const header = document.querySelector(".sidebar-header");
+    if (_user && header) {
+        const userInfo = document.createElement("div");
+        userInfo.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:13px;color:var(--text-secondary)";
+        userInfo.innerHTML = `<span>👤 ${_user.username}</span><button onclick="logout()" style="background:none;border:none;color:var(--text-secondary);cursor:pointer;font-size:12px;">退出</button>`;
+        header.insertBefore(userInfo, header.querySelector("#new-chat-btn"));
+    }
+    loadRepos();
     loadSkills();
     loadSessions();
 });
 
+// ===== Escape key to cancel stream =====
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && isStreaming && currentAbortController) {
+        currentAbortController.abort();
+    }
+    // Close sidebar on Escape (mobile)
+    if (e.key === "Escape") {
+        closeSidebar();
+    }
+});
+
+// ===== Mobile sidebar toggle =====
+function toggleSidebar() {
+    const sidebar = document.getElementById("sidebar");
+    const overlay = document.getElementById("sidebar-overlay");
+    sidebar.classList.toggle("open");
+    overlay.classList.toggle("active");
+}
+
+function closeSidebar() {
+    const sidebar = document.getElementById("sidebar");
+    const overlay = document.getElementById("sidebar-overlay");
+    sidebar.classList.remove("open");
+    overlay.classList.remove("active");
+}
+
+// ===== Repos =====
+async function loadRepos() {
+    const resp = await authFetch("/api/repos");
+    const repos = await resp.json();
+    const container = document.getElementById("repos-list");
+    container.innerHTML = "";
+
+    repos.forEach(r => {
+        const chip = document.createElement("button");
+        chip.className = "skill-chip" + (r.id === selectedRepoId ? " active" : "");
+        chip.textContent = r.name;
+        chip.title = r.url;
+        chip.onclick = () => toggleRepo(chip, r.id);
+        container.appendChild(chip);
+    });
+
+    if (repos.length === 0) {
+        container.innerHTML = '<span style="font-size:12px;color:var(--text-secondary)">暂无仓库</span>';
+    }
+}
+
+function toggleRepo(chip, id) {
+    if (selectedRepoId === id) {
+        selectedRepoId = null;
+        chip.classList.remove("active");
+    } else {
+        // Deselect previous
+        document.querySelectorAll("#repos-list .skill-chip").forEach(c => c.classList.remove("active"));
+        selectedRepoId = id;
+        chip.classList.add("active");
+    }
+}
+
 // ===== Skills =====
+
+// ===== Repos =====
+async function loadRepos() {
+    const resp = await authFetch("/api/repos");
+    const repos = await resp.json();
+    const container = document.getElementById("repos-list");
+    if (!container) return;
+    container.innerHTML = "";
+
+    if (repos.length === 0) {
+        container.innerHTML = '<p style="font-size:12px;color:var(--text-secondary);padding:4px 0;">暂无可访问的仓库</p>';
+        return;
+    }
+
+    repos.forEach(r => {
+        const chip = document.createElement("button");
+        chip.className = "skill-chip";
+        chip.textContent = r.name;
+        chip.title = r.url;
+        chip.dataset.repoId = r.id;
+        chip.onclick = () => selectRepo(chip, r.id);
+        container.appendChild(chip);
+    });
+}
+
+function selectRepo(chip, repoId) {
+    // Toggle selection (only one repo at a time)
+    document.querySelectorAll("#repos-list .skill-chip").forEach(c => c.classList.remove("active"));
+    if (selectedRepoId === repoId) {
+        selectedRepoId = null;
+    } else {
+        selectedRepoId = repoId;
+        chip.classList.add("active");
+    }
+}
 async function loadSkills() {
-    const resp = await fetch("/api/skills");
+    const resp = await authFetch("/api/skills");
     const skills = await resp.json();
     const container = document.getElementById("skills-list");
     container.innerHTML = "";
@@ -40,7 +168,7 @@ function toggleSkill(chip, name) {
 
 // ===== Sessions =====
 async function loadSessions() {
-    const resp = await fetch("/api/sessions");
+    const resp = await authFetch("/api/sessions");
     const sessions = await resp.json();
     const container = document.getElementById("sessions-list");
     container.innerHTML = "";
@@ -48,18 +176,32 @@ async function loadSessions() {
     sessions.forEach(s => {
         const item = document.createElement("div");
         item.className = "session-item" + (s.id === currentSessionId ? " active" : "");
-        item.innerHTML = `
-            <span class="session-title">${escapeHtml(s.title)}</span>
-            <button class="delete-btn" onclick="event.stopPropagation(); deleteSession('${s.id}')">×</button>
-        `;
+
+        const title = document.createElement("span");
+        title.className = "session-title";
+        title.textContent = s.title;
+
+        const delBtn = document.createElement("button");
+        delBtn.className = "delete-btn";
+        delBtn.textContent = "×";
+        delBtn.onclick = (e) => { e.stopPropagation(); deleteSession(s.id); };
+
+        item.appendChild(title);
+        item.appendChild(delBtn);
         item.onclick = () => openSession(s.id);
         container.appendChild(item);
     });
 }
 
 async function openSession(sessionId) {
+    // Abort any ongoing stream before switching
+    if (currentAbortController) {
+        currentAbortController.abort();
+    }
+    closeSidebar(); // close mobile sidebar
+
     currentSessionId = sessionId;
-    const resp = await fetch(`/api/sessions/${sessionId}`);
+    const resp = await authFetch(`/api/sessions/${sessionId}`);
     const data = await resp.json();
 
     const messagesDiv = document.getElementById("messages");
@@ -77,7 +219,7 @@ async function openSession(sessionId) {
 }
 
 async function deleteSession(sessionId) {
-    await fetch(`/api/sessions/${sessionId}`, { method: "DELETE" });
+    await authFetch(`/api/sessions/${sessionId}`, { method: "DELETE" });
     if (currentSessionId === sessionId) {
         currentSessionId = null;
         document.getElementById("messages").innerHTML = `
@@ -91,6 +233,10 @@ async function deleteSession(sessionId) {
 }
 
 function newChat() {
+    if (currentAbortController) {
+        currentAbortController.abort();
+    }
+    closeSidebar(); // close mobile sidebar
     currentSessionId = null;
     document.getElementById("messages").innerHTML = `
         <div class="welcome-message">
@@ -119,6 +265,12 @@ async function sendMessage() {
     const text = input.value.trim();
     if (!text || isStreaming) return;
 
+    // Validate message size
+    if (text.length > 10000) {
+        alert("Message too long (max 10,000 characters)");
+        return;
+    }
+
     // Clear welcome
     const messagesDiv = document.getElementById("messages");
     const welcome = messagesDiv.querySelector(".welcome-message");
@@ -131,26 +283,40 @@ async function sendMessage() {
 
     // Send
     isStreaming = true;
+    currentAbortController = new AbortController();
     document.getElementById("send-btn").disabled = true;
 
     // Create assistant bubble
     const { bubble, contentEl } = appendAssistantBubble();
 
     try {
-        const resp = await fetch("/api/chat", {
+        const resp = await authFetch("/api/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 session_id: currentSessionId,
                 message: text,
                 active_skills: activeSkills,
+                repo_id: selectedRepoId,
             }),
+            signal: currentAbortController.signal,
         });
+
+        // Check HTTP status before reading SSE
+        if (!resp.ok) {
+            let errMsg = `Server error: ${resp.status}`;
+            try {
+                const errData = await resp.json();
+                errMsg = errData.detail || errMsg;
+            } catch {}
+            throw new Error(errMsg);
+        }
 
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
         let fullText = "";
+        let eventType = "message";
 
         while (true) {
             const { done, value } = await reader.read();
@@ -162,22 +328,35 @@ async function sendMessage() {
 
             for (const line of lines) {
                 if (line.startsWith("event:")) {
-                    var eventType = line.slice(6).trim();
+                    eventType = line.slice(6).trim();
                 } else if (line.startsWith("data:")) {
                     const dataStr = line.slice(5).trim();
-                    if (!dataStr) continue;
+                    if (!dataStr) {
+                        eventType = "message"; // reset on empty data
+                        continue;
+                    }
                     let data;
                     try { data = JSON.parse(dataStr); } catch { continue; }
 
                     if (eventType === "text") {
                         fullText += data.text;
-                        contentEl.innerHTML = renderMarkdown(fullText);
+                        // During streaming: show plain text (avoids broken partial markdown)
+                        contentEl.innerHTML = escapeHtml(fullText).replace(/\n/g, "<br>");
                         scrollToBottom();
                     } else if (eventType === "tool_use") {
                         appendToolBlock(contentEl, data.name, data.input, null);
                         scrollToBottom();
                     } else if (eventType === "tool_result") {
-                        updateLastToolResult(contentEl, data.name, data.result);
+                        updateToolResult(contentEl, data.name, data.result);
+                        // Detect issue draft and render confirmation card
+                        if (data.name === "draft_issue") {
+                            try {
+                                const draft = JSON.parse(data.result);
+                                if (draft.type === "issue_draft") {
+                                    appendIssueCard(contentEl, draft);
+                                }
+                            } catch {}
+                        }
                         scrollToBottom();
                     } else if (eventType === "done") {
                         if (data.session_id) {
@@ -186,17 +365,35 @@ async function sendMessage() {
                         // Remove typing indicator
                         const typing = contentEl.querySelector(".typing-indicator");
                         if (typing) typing.remove();
+                        // Now render the complete markdown properly
+                        if (fullText) {
+                            contentEl.innerHTML = renderMarkdown(fullText);
+                        }
                     } else if (eventType === "error") {
                         contentEl.innerHTML += `<p style="color:var(--error)">⚠️ ${escapeHtml(data.message)}</p>`;
                     }
+                    // Reset eventType after processing data
+                    eventType = "message";
+                } else if (line.trim() === "") {
+                    // Blank line = SSE event boundary, reset event type
+                    eventType = "message";
                 }
             }
         }
     } catch (err) {
-        contentEl.innerHTML += `<p style="color:var(--error)">⚠️ Connection error: ${escapeHtml(err.message)}</p>`;
+        if (err.name === "AbortError") {
+            const typing = contentEl.querySelector(".typing-indicator");
+            if (typing) typing.remove();
+            contentEl.innerHTML += `<p style="color:var(--text-secondary)">⏹ Stream cancelled</p>`;
+        } else {
+            const typing = contentEl.querySelector(".typing-indicator");
+            if (typing) typing.remove();
+            contentEl.innerHTML += `<p style="color:var(--error)">⚠️ ${escapeHtml(err.message)}</p>`;
+        }
     }
 
     isStreaming = false;
+    currentAbortController = null;
     document.getElementById("send-btn").disabled = false;
     loadSessions();
 }
@@ -268,44 +465,69 @@ function appendToolBlock(container, name, input, result) {
 
     const block = document.createElement("div");
     block.className = "tool-block";
-    block.innerHTML = `
-        <div class="tool-header" onclick="this.nextElementSibling.classList.toggle('open')">
-            <span class="tool-icon">⚙️</span>
-            <span class="tool-name">${escapeHtml(name)}</span>
-            <span class="tool-status">${result !== null ? "✅" : "⏳"}</span>
+    block.dataset.toolName = name;
+
+    const toolHeader = document.createElement("div");
+    toolHeader.className = "tool-header";
+    toolHeader.onclick = () => toolBody.classList.toggle("open");
+    toolHeader.innerHTML = `
+        <span class="tool-icon">⚙️</span>
+        <span class="tool-name">${escapeHtml(name)}</span>
+        <span class="tool-status">${result !== null ? "✅" : "⏳"}</span>
+    `;
+
+    const toolBody = document.createElement("div");
+    toolBody.className = "tool-body";
+    toolBody.innerHTML = `
+        <div class="tool-input">
+            <div class="tool-label">Input</div>
+            <div class="tool-value">${escapeHtml(JSON.stringify(input, null, 2))}</div>
         </div>
-        <div class="tool-body${result !== null ? "" : ""}">
-            <div class="tool-input">
-                <div class="tool-label">Input</div>
-                <div class="tool-value">${escapeHtml(JSON.stringify(input, null, 2))}</div>
-            </div>
-            <div class="tool-output">
-                <div class="tool-label">Output</div>
-                <div class="tool-value tool-result-text">${result !== null ? escapeHtml(truncate(result, 1000)) : "Running..."}</div>
-            </div>
+        <div class="tool-output">
+            <div class="tool-label">Output</div>
+            <div class="tool-value tool-result-text">${result !== null ? escapeHtml(truncate(result, 1000)) : "Running..."}</div>
         </div>
     `;
+
+    block.appendChild(toolHeader);
+    block.appendChild(toolBody);
     container.appendChild(block);
 }
 
-function updateLastToolResult(container, name, result) {
+function updateToolResult(container, name, result) {
+    // Find the LAST tool block with matching name that still shows "Running..."
     const blocks = container.querySelectorAll(".tool-block");
-    const last = blocks[blocks.length - 1];
-    if (!last) return;
-
-    // Update status icon
-    const status = last.querySelector(".tool-status");
-    if (status) status.textContent = "✅";
-
-    // Update result text
-    const resultEl = last.querySelector(".tool-result-text");
-    if (resultEl) resultEl.textContent = truncate(result, 1000);
+    for (let i = blocks.length - 1; i >= 0; i--) {
+        const block = blocks[i];
+        if (block.dataset.toolName === name) {
+            const resultText = block.querySelector(".tool-result-text");
+            if (resultText && resultText.textContent === "Running...") {
+                resultText.textContent = truncate(result, 1000);
+                const status = block.querySelector(".tool-status");
+                if (status) status.textContent = "✅";
+                return;
+            }
+        }
+    }
 }
 
 // ===== Utilities =====
+
+// Configure marked for GFM
+if (typeof marked !== "undefined") {
+    marked.setOptions({
+        breaks: true,
+        gfm: true,
+    });
+}
+
 function renderMarkdown(text) {
     if (typeof marked !== "undefined") {
-        return marked.parse(text);
+        const rawHtml = marked.parse(text);
+        if (typeof DOMPurify !== "undefined") {
+            return DOMPurify.sanitize(rawHtml);
+        }
+        return rawHtml.replace(/<[^>]*>/g, "");
     }
     return escapeHtml(text).replace(/\n/g, "<br>");
 }
@@ -324,4 +546,89 @@ function truncate(str, maxLen) {
 function scrollToBottom() {
     const messagesDiv = document.getElementById("messages");
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+// ===== Issue Draft Card =====
+function appendIssueCard(container, draft) {
+    const card = document.createElement("div");
+    card.className = "issue-card";
+
+    const labelsHtml = (draft.labels || [])
+        .map(l => `<span class="issue-label">${escapeHtml(l)}</span>`)
+        .join(" ");
+
+    card.innerHTML = `
+        <div class="issue-header">
+            <span class="issue-icon">📋</span>
+            <span class="issue-title">${escapeHtml(draft.title)}</span>
+        </div>
+        <div class="issue-body">${renderMarkdown(draft.body)}</div>
+        <div class="issue-labels">${labelsHtml}</div>
+        <div class="issue-actions">
+            <button class="btn-confirm" onclick="submitIssue(this, '${escapeHtml(draft.title)}')">✅ 确认提交</button>
+            <button class="btn-cancel" onclick="this.parentElement.parentElement.querySelector('.issue-status').textContent='已取消'; this.disabled=true; this.previousElementSibling.disabled=true;">❌ 取消</button>
+            <span class="issue-status"></span>
+        </div>
+    `;
+
+    // Store draft data on the card element
+    card.dataset.draft = JSON.stringify(draft);
+    container.appendChild(card);
+    scrollToBottom();
+}
+
+async function submitIssue(btn, title) {
+    const card = btn.closest(".issue-card");
+    const draft = JSON.parse(card.dataset.draft);
+    const statusEl = card.querySelector(".issue-status");
+    const confirmBtn = card.querySelector(".btn-confirm");
+    const cancelBtn = card.querySelector(".btn-cancel");
+
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    statusEl.textContent = "提交中...";
+
+    if (!selectedRepoId) {
+        statusEl.textContent = "❌ 请先选择一个仓库";
+        statusEl.style.color = "var(--error)";
+        confirmBtn.disabled = false;
+        cancelBtn.disabled = false;
+        return;
+    }
+
+    try {
+        const resp = await authFetch("/api/issues/submit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                repo_id: selectedRepoId,
+                title: draft.title,
+                body: draft.body,
+                labels: draft.labels || [],
+            }),
+        });
+
+        const result = await resp.json();
+        if (!resp.ok) {
+            statusEl.textContent = `❌ ${result.detail || "提交失败"}`;
+            statusEl.style.color = "var(--error)";
+            confirmBtn.disabled = false;
+            cancelBtn.disabled = false;
+            return;
+        }
+
+        // Use textContent for safety, build link element manually
+        statusEl.textContent = "✅ 已提交 ";
+        const link = document.createElement("a");
+        link.href = result.issue_url;
+        link.target = "_blank";
+        link.textContent = `#${result.issue_number}`;
+        statusEl.appendChild(link);
+        statusEl.style.color = "var(--success)";
+    } catch (err) {
+        statusEl.textContent = `❌ 网络错误: ${escapeHtml(err.message)}`;
+        statusEl.style.color = "var(--error)";
+        confirmBtn.disabled = false;
+        cancelBtn.disabled = false;
+    }
 }

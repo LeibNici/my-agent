@@ -1,23 +1,38 @@
-"""Pydantic data models for API requests/responses and database records."""
+"""Pydantic data models for API requests/responses."""
 
-from datetime import datetime
 from pydantic import BaseModel, Field
 
 
-# --- API Models ---
+# --- Auth ---
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    token: str
+    user: "UserInfo"
+
+class UserInfo(BaseModel):
+    id: int
+    username: str
+    role: str
+
+
+# --- Chat ---
 
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
     active_skills: list[str] = Field(default_factory=list)
-
+    repo_id: int | None = None  # selected repo for this chat
 
 class SessionInfo(BaseModel):
     id: str
     title: str
+    owner_id: int | None = None
     created_at: str
     updated_at: str
-
 
 class SkillInfo(BaseModel):
     name: str
@@ -26,16 +41,34 @@ class SkillInfo(BaseModel):
     active: bool = False
 
 
-# --- Internal Models ---
+# --- Admin: Users ---
 
-class Message(BaseModel):
-    role: str  # "user" | "assistant"
-    content: str | list  # str for user, list of content blocks for assistant
-    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+class UserUpdate(BaseModel):
+    password: str | None = None
+    is_active: bool | None = None
 
 
-class ToolResult(BaseModel):
-    tool_use_id: str
+# --- Admin: Repos ---
+
+class RepoCreate(BaseModel):
     name: str
-    result: str
-    error: bool = False
+    url: str
+    description: str = ""
+
+class RepoUpdate(BaseModel):
+    name: str | None = None
+    url: str | None = None
+    description: str | None = None
+
+
+# --- Admin: Permissions ---
+
+class PermissionGrant(BaseModel):
+    user_id: int
+    repo_id: int
+    access_level: str = "read"

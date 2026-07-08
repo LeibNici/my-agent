@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import inspect
 import json
+from contextvars import ContextVar
 from typing import Any, Callable, get_type_hints
 
 # Global tool registry
 _TOOLS: dict[str, dict[str, Any]] = {}
 _HANDLERS: dict[str, Callable] = {}
+
+# Context variable for per-request tool context (e.g., user's allowed repo paths)
+tool_context: ContextVar[dict] = ContextVar("tool_context", default={})
 
 
 def _python_type_to_json_schema(py_type: type) -> dict:
