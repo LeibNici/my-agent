@@ -1,0 +1,12 @@
+{
+  "id": "full-repo-code-review",
+  "title": "Full-repository code review",
+  "status": "in_progress",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "Archive task",
+  "createdAt": "2026-07-08T01:17:01Z",
+  "branch": "main"
+}
