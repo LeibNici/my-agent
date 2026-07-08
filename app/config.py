@@ -89,6 +89,7 @@ class AppSettings(BaseSettings):
     repos_dir: str = "/tmp/agent-repos"
     github_token: str = ""  # GitHub API token for issue submission
     repo_sync_interval_minutes: int = 10  # 0 disables periodic background sync
+    cors_origins: str = "http://localhost:8000,http://127.0.0.1:8000"  # comma-separated
 
     model_config = {
         "env_file": ".env",

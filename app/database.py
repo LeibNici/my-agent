@@ -22,6 +22,22 @@ async def _connect():
 
 # ==================== Schema ====================
 
+async def _table_columns(db, table: str) -> set[str]:
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in await cursor.fetchall()}
+
+
+async def _add_column_if_missing(db, table: str, column: str, ddl: str, columns: set[str]):
+    """Add `column` to `table` if not already present. `columns` is the
+    table's current column set (from _table_columns) — passed in and
+    updated in place so multiple checks against the same table share one
+    PRAGMA table_info round-trip instead of re-querying it per column."""
+    if column not in columns:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        await db.commit()
+        columns.add(column)
+
+
 async def init_db():
     """Create all tables if they don't exist."""
     async with _connect() as db:
@@ -127,53 +143,31 @@ async def init_db():
         await db.commit()
 
         # Migration: add owner_id to existing sessions table if missing
-        cursor = await db.execute("PRAGMA table_info(sessions)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        if "owner_id" not in columns:
-            await db.execute("ALTER TABLE sessions ADD COLUMN owner_id INTEGER")
-            await db.commit()
+        sessions_columns = await _table_columns(db, "sessions")
+        await _add_column_if_missing(db, "sessions", "owner_id", "INTEGER", sessions_columns)
 
         # Migration: add resolved_at to existing sessions table if missing —
         # set once a session's task (e.g. an issue submission) is complete,
         # so the next message on it transparently starts a fresh session
         # instead of tacking onto a closed thread.
-        cursor = await db.execute("PRAGMA table_info(sessions)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        if "resolved_at" not in columns:
-            await db.execute("ALTER TABLE sessions ADD COLUMN resolved_at TEXT")
-            await db.commit()
+        await _add_column_if_missing(db, "sessions", "resolved_at", "TEXT", sessions_columns)
 
         # Migration: add draft_tool_use_id to existing issue_submissions table
         # if missing — a stable key to reconcile a draft card to its real
         # submission by (title text alone collides/misses too easily).
-        cursor = await db.execute("PRAGMA table_info(issue_submissions)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        if "draft_tool_use_id" not in columns:
-            await db.execute("ALTER TABLE issue_submissions ADD COLUMN draft_tool_use_id TEXT")
-            await db.commit()
+        issue_submissions_columns = await _table_columns(db, "issue_submissions")
+        await _add_column_if_missing(db, "issue_submissions", "draft_tool_use_id", "TEXT", issue_submissions_columns)
 
-        # Migration: add branch to existing repositories table if missing
-        cursor = await db.execute("PRAGMA table_info(repositories)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        if "branch" not in columns:
-            await db.execute("ALTER TABLE repositories ADD COLUMN branch TEXT")
-            await db.commit()
-
-        # Migration: add separate username/token credential columns if missing
-        cursor = await db.execute("PRAGMA table_info(repositories)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        if "cred_username" not in columns:
-            await db.execute("ALTER TABLE repositories ADD COLUMN cred_username TEXT")
-            await db.commit()
-        if "cred_token" not in columns:
-            await db.execute("ALTER TABLE repositories ADD COLUMN cred_token TEXT")
-            await db.commit()
+        # Migration: add branch and separate username/token credential columns
+        # to existing repositories table if missing
+        repositories_columns = await _table_columns(db, "repositories")
+        await _add_column_if_missing(db, "repositories", "branch", "TEXT", repositories_columns)
+        await _add_column_if_missing(db, "repositories", "cred_username", "TEXT", repositories_columns)
+        await _add_column_if_missing(db, "repositories", "cred_token", "TEXT", repositories_columns)
 
         # Migration: split any legacy combined "credentials" column (a short-lived
         # earlier design) into cred_username/cred_token
-        cursor = await db.execute("PRAGMA table_info(repositories)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        if "credentials" in columns:
+        if "credentials" in repositories_columns:
             cursor = await db.execute(
                 "SELECT id, credentials FROM repositories WHERE credentials IS NOT NULL AND cred_token IS NULL"
             )

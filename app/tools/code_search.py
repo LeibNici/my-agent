@@ -1,64 +1,78 @@
 """Code search tools — search and browse repository code with permission checks."""
 
+import asyncio
 import os
 
 from app.tools.registry import tool
-from app.tools.access import get_allowed_paths, no_access_reason
+from app.tools.access import get_allowed_paths, no_access_reason, is_within_allowed_paths
 
 
 def _validate_repo_path(path: str, allowed_paths: list[str]) -> tuple[bool, str, str]:
     """Validate path is within allowed repos."""
     real_path = os.path.realpath(os.path.expanduser(path))
-    for allowed in allowed_paths:
-        if real_path.startswith(allowed + os.sep) or real_path == allowed:
-            return True, real_path, ""
+    if is_within_allowed_paths(real_path, allowed_paths):
+        return True, real_path, ""
     return False, real_path, "Access denied: path is outside your assigned repositories"
+
+
+async def _search_one_repo(repo_path: str, keyword: str, file_pattern: str) -> list[str]:
+    if not os.path.isdir(repo_path):
+        return []
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "grep", "-rn", "-P", "--include", file_pattern,
+            "--exclude-dir=.*", "--exclude=.*",  # never search into dotfiles/dotdirs (.env, .git, .ssh, ...)
+            "--", keyword, repo_path,  # -- prevents flag injection
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if not stdout:
+            return []
+        return [line.replace(repo_path + "/", "", 1) for line in stdout.decode(errors="replace").strip().split("\n")]
+    except asyncio.TimeoutError:
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
+        return [f"(search timed out for {os.path.basename(repo_path)})"]
+    except asyncio.CancelledError:
+        # The chat request itself was cancelled (e.g. user hit stop) — kill
+        # the grep child instead of leaving it running as an orphan.
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
+        raise
+    except Exception as e:
+        return [f"(search error: {e})"]
 
 
 @tool("Search for a keyword in repository code. Returns matching file paths, line numbers, and content lines. Use this to find relevant code for the user's question.")
 async def code_search(keyword: str, file_pattern: str = "*", max_results: int = 20) -> str:
     """Search repository code for a keyword using grep."""
-    import asyncio
-
     allowed_paths = get_allowed_paths()
     if not allowed_paths:
         return no_access_reason(prefix="Error")
 
+    # Search every accessible repo concurrently — a user with several granted
+    # repos previously paid the SUM of each repo's grep time (run one at a
+    # time); this bounds it to the slowest single repo instead. Results are
+    # still assembled in repo order and capped at max_results: tasks all start
+    # immediately, but once the cap is hit we stop waiting and cancel the rest
+    # instead of blocking on every repo's grep.
+    tasks = [
+        asyncio.ensure_task(_search_one_repo(repo_path, keyword, file_pattern))
+        for repo_path in allowed_paths
+    ]
     results = []
-    for repo_path in allowed_paths:
-        if not os.path.isdir(repo_path):
-            continue
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "grep", "-rn", "-P", "--include", file_pattern,
-                "--exclude-dir=.*", "--exclude=.*",  # never search into dotfiles/dotdirs (.env, .git, .ssh, ...)
-                "--", keyword, repo_path,  # -- prevents flag injection
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            if stdout:
-                for line in stdout.decode(errors="replace").strip().split("\n"):
-                    clean = line.replace(repo_path + "/", "", 1)
-                    results.append(clean)
-                    if len(results) >= max_results:
-                        break
-        except asyncio.TimeoutError:
-            if proc is not None:
-                proc.kill()
-                await proc.wait()
-            results.append(f"(search timed out for {os.path.basename(repo_path)})")
-        except asyncio.CancelledError:
-            # The chat request itself was cancelled (e.g. user hit stop) — kill
-            # the grep child instead of leaving it running as an orphan.
-            if proc is not None:
-                proc.kill()
-                await proc.wait()
-            raise
-        except Exception as e:
-            results.append(f"(search error: {e})")
+    for i, task in enumerate(tasks):
+        results.extend(await task)
         if len(results) >= max_results:
+            remaining = tasks[i + 1:]
+            for t in remaining:
+                t.cancel()
+            if remaining:
+                await asyncio.gather(*remaining, return_exceptions=True)
             break
 
     if not results:

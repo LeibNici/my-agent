@@ -25,6 +25,7 @@ from app.database import (
     init_db,
     create_session,
     list_sessions,
+    list_repos,
     get_session,
     delete_session,
     add_message,
@@ -114,7 +115,6 @@ async def lifespan(app: FastAPI):
     await ensure_admin_user()
     # Sync all repos on startup — one repo's failure (bad path, filesystem
     # error, ...) must not prevent the app itself from starting.
-    from app.database import list_repos
     from app.repo_sync import sync_all_repos, periodic_sync_loop
     try:
         repos = await list_repos()
@@ -136,7 +136,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="My Agent", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_origins=[o.strip() for o in app_settings.cors_origins.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -185,6 +185,17 @@ async def get_me(user: dict = Depends(get_current_user)):
     return UserInfo(id=user["id"], username=user["username"], role=user["role"])
 
 
+@app.get("/api/config")
+async def get_config(user: dict = Depends(get_current_user)):
+    """Static client-side limits, kept separate from user identity (auth/me)
+    — the frontend reads these instead of hardcoding its own copy that can
+    silently drift from the server's actual enforcement."""
+    return {
+        "max_images_per_message": MAX_IMAGES_PER_MESSAGE,
+        "max_image_bytes": int(MAX_IMAGE_BASE64_CHARS * 3 / 4),
+    }
+
+
 # ==================== User Repos ====================
 
 def _public_repo(r: dict) -> dict:
@@ -199,13 +210,18 @@ def _public_repo(r: dict) -> dict:
     }
 
 
+async def _get_visible_repos(user: dict) -> list[dict]:
+    """Repos a user can see — every repo for admins, only granted ones
+    otherwise. Shared by every route that needs this same admin bypass so
+    the rule lives in one place instead of being re-branched per call site."""
+    if user["role"] == "admin":
+        return await list_repos()
+    return await get_user_repos(user["id"])
+
+
 @app.get("/api/repos")
 async def api_user_repos(user: dict = Depends(get_current_user)):
-    if user["role"] == "admin":
-        from app.database import list_repos
-        repos = await list_repos()
-    else:
-        repos = await get_user_repos(user["id"])
+    repos = await _get_visible_repos(user)
     return [_public_repo(r) for r in repos]
 
 
@@ -228,21 +244,26 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+async def _sse_reject(message: str):
+    """The standard 'reject this request' SSE sequence — factored out so
+    every early-exit validation in chat_event_stream yields the same
+    error/done/end shape instead of each one hand-rolling its own copy."""
+    yield {"event": "error", "data": json.dumps({"message": message})}
+    yield {"event": "done", "data": json.dumps({"session_id": None, "text": ""})}
+    yield {"event": "end", "data": ""}
+
+
 async def chat_event_stream(req: ChatRequest, current_user: dict):
     """Generate SSE events for a chat message."""
     if len(req.message) > MAX_MESSAGE_LENGTH:
-        yield {"event": "error", "data": json.dumps({
-            "message": f"Message too long ({len(req.message)} chars). Max {MAX_MESSAGE_LENGTH}."
-        })}
-        yield {"event": "done", "data": json.dumps({"session_id": None, "text": ""})}
-        yield {"event": "end", "data": ""}
+        async for e in _sse_reject(f"Message too long ({len(req.message)} chars). Max {MAX_MESSAGE_LENGTH}."):
+            yield e
         return
 
     image_error = _validate_images(req.images)
     if image_error:
-        yield {"event": "error", "data": json.dumps({"message": image_error})}
-        yield {"event": "done", "data": json.dumps({"session_id": None, "text": ""})}
-        yield {"event": "end", "data": ""}
+        async for e in _sse_reject(image_error):
+            yield e
         return
 
     session_id = req.session_id
@@ -253,9 +274,8 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
     if not session:
         session_id = await create_session(title="New Chat", owner_id=current_user["id"])
     elif not _user_owns_session(session, current_user):
-        yield {"event": "error", "data": json.dumps({"message": "Access denied"})}
-        yield {"event": "done", "data": json.dumps({"session_id": None, "text": ""})}
-        yield {"event": "end", "data": ""}
+        async for e in _sse_reject("Access denied"):
+            yield e
         return
     elif session.get("resolved_at"):
         # This thread's task (e.g. an issue submission) is already done —
@@ -297,11 +317,7 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
         await add_message(session_id, "user", user_content)
 
         # Build allowed repo paths — filter by repo_id if specified
-        if current_user["role"] == "admin":
-            from app.database import list_repos
-            all_repos = await list_repos()
-        else:
-            all_repos = await get_user_repos(current_user["id"])
+        all_repos = await _get_visible_repos(current_user)
 
         if req.repo_id:
             granted_repos = [r for r in all_repos if r["id"] == req.repo_id]
@@ -417,14 +433,22 @@ async def get_owned_session(session_id: str, user: dict = Depends(get_current_us
 
 @app.get("/api/sessions/{session_id}")
 async def api_get_session(session_id: str, session: dict = Depends(get_owned_session)):
-    messages = await get_messages(session_id)
-    issue_submissions = await get_issue_submissions_for_session(session_id)
+    # Independent reads (each opens its own DB connection) — run concurrently
+    # instead of paying two sequential round-trips.
+    messages, issue_submissions = await asyncio.gather(
+        get_messages(session_id),
+        get_issue_submissions_for_session(session_id),
+    )
     return {"session": session, "messages": messages, "issue_submissions": issue_submissions}
 
 
 @app.delete("/api/sessions/{session_id}")
 async def api_delete_session(session_id: str, session: dict = Depends(get_owned_session)):
     await delete_session(session_id)
+    # _session_locks otherwise grows for the life of the process — one entry
+    # per session ever created, never removed. Deletion is the one point
+    # where we know for certain the lock will never be needed again.
+    _session_locks.pop(session_id, None)
     return {"ok": True}
 
 

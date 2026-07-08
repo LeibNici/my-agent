@@ -30,9 +30,22 @@ let isStreaming = false;
 let currentAbortController = null;
 let pendingImages = []; // { mediaType, data (base64, no prefix), previewUrl (data URL) }
 
-const MAX_IMAGES_PER_MESSAGE = 5;
-const MAX_IMAGE_BYTES = 4_500_000; // matches the server's ~4.5MB decoded cap
+// Fallback defaults, used until loadConfig() below overwrites them with the
+// server's real values — kept in sync via /api/config instead of two
+// separately hardcoded copies that can silently drift apart.
+let MAX_IMAGES_PER_MESSAGE = 5;
+let MAX_IMAGE_BYTES = 4_500_000;
 const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+async function loadConfig() {
+    try {
+        const resp = await authFetch("/api/config");
+        if (!resp.ok) return;
+        const config = await resp.json();
+        if (config.max_images_per_message) MAX_IMAGES_PER_MESSAGE = config.max_images_per_message;
+        if (config.max_image_bytes) MAX_IMAGE_BYTES = config.max_image_bytes;
+    } catch {} // keep the fallback defaults above if this fails
+}
 
 // ===== Init =====
 document.addEventListener("DOMContentLoaded", () => {
@@ -56,6 +69,7 @@ document.addEventListener("DOMContentLoaded", () => {
         userInfo.appendChild(logoutBtn);
         header.insertBefore(userInfo, header.querySelector("#new-chat-btn"));
     }
+    loadConfig();
     loadRepos();
     loadSkills();
     loadSessions();
@@ -809,17 +823,6 @@ function renderMarkdown(text) {
         return rawHtml.replace(/<[^>]*>/g, "");
     }
     return escapeHtml(text).replace(/\n/g, "<br>");
-}
-
-function escapeHtml(str) {
-    // Manual replace (not the div.textContent/innerHTML trick) so this is safe
-    // both in text-node context and when interpolated into an HTML attribute value.
-    return String(str ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
 }
 
 function truncate(str, maxLen) {

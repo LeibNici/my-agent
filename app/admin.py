@@ -20,6 +20,24 @@ from app.models import (
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_admin)])
 
 
+async def get_existing_user(user_id: int) -> dict:
+    """Dependency: fetch a user, 404ing if it doesn't exist — shared by every
+    admin route that operates on a specific user."""
+    user = await get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+async def get_existing_repo(repo_id: int) -> dict:
+    """Dependency: fetch a repo, 404ing if it doesn't exist — shared by every
+    admin route that operates on a specific repo."""
+    repo = await get_repo(repo_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+    return repo
+
+
 # ==================== Users ====================
 
 @router.get("/users")
@@ -37,10 +55,7 @@ async def api_create_user(req: UserCreate):
 
 
 @router.patch("/users/{user_id}")
-async def api_update_user(user_id: int, req: UserUpdate):
-    user = await get_user_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+async def api_update_user(user_id: int, req: UserUpdate, user: dict = Depends(get_existing_user)):
     if req.password is not None:
         await update_user_password(user_id, hash_password(req.password))
     if req.is_active is not None:
@@ -49,10 +64,7 @@ async def api_update_user(user_id: int, req: UserUpdate):
 
 
 @router.delete("/users/{user_id}")
-async def api_delete_user(user_id: int):
-    user = await get_user_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+async def api_delete_user(user_id: int, user: dict = Depends(get_existing_user)):
     if user["role"] == "admin":
         raise HTTPException(status_code=403, detail="Cannot delete admin user")
     await delete_user(user_id)
@@ -85,10 +97,7 @@ async def api_list_repos():
 
 
 @router.get("/repos/{repo_id}")
-async def api_get_repo(repo_id: int):
-    repo = await get_repo(repo_id)
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repo not found")
+async def api_get_repo(repo: dict = Depends(get_existing_repo)):
     return _admin_repo_view(repo)
 
 
@@ -107,11 +116,7 @@ async def api_create_repo(req: RepoCreate):
 
 
 @router.patch("/repos/{repo_id}")
-async def api_update_repo(repo_id: int, req: RepoUpdate):
-    repo = await get_repo(repo_id)
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repo not found")
-
+async def api_update_repo(repo_id: int, req: RepoUpdate, repo: dict = Depends(get_existing_repo)):
     # Cosmetic fields are safe to update immediately regardless of sync outcome.
     await update_repo(repo_id, name=req.name, description=req.description)
 
@@ -141,20 +146,14 @@ async def api_update_repo(repo_id: int, req: RepoUpdate):
 
 
 @router.delete("/repos/{repo_id}")
-async def api_delete_repo(repo_id: int):
-    repo = await get_repo(repo_id)
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repo not found")
+async def api_delete_repo(repo_id: int, repo: dict = Depends(get_existing_repo)):
     await delete_repo(repo_id)
     return {"ok": True}
 
 
 @router.post("/repos/{repo_id}/sync")
-async def api_sync_repo(repo_id: int):
+async def api_sync_repo(repo_id: int, repo: dict = Depends(get_existing_repo)):
     """Manually trigger an immediate sync for one repo."""
-    repo = await get_repo(repo_id)
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repo not found")
     from app.repo_sync import sync_and_persist
     success, msg = await sync_and_persist(
         repo_id, repo["url"], repo.get("branch"),
@@ -206,8 +205,5 @@ async def api_usage_recent(limit: int = 50):
 
 
 @router.get("/users/{user_id}/repos")
-async def api_get_user_repos(user_id: int):
-    user = await get_user_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+async def api_get_user_repos(user_id: int, user: dict = Depends(get_existing_user)):
     return await get_user_repos(user_id)

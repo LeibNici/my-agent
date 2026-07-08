@@ -222,16 +222,21 @@ async def sync_and_persist(
 
 
 async def sync_all_repos(repos: list[dict]):
-    """Sync all repositories. Called at startup and by the periodic sync loop."""
-    for repo in repos:
+    """Sync all repositories concurrently. Called at startup and by the
+    periodic sync loop — each repo already has its own lock (_get_repo_lock),
+    so there's no correctness reason to sync them one at a time, and doing so
+    means one slow/hanging remote blocks every repo behind it in the list."""
+    async def _sync_one(repo: dict):
         if not repo.get("url"):
-            continue
+            return
         success, msg = await sync_and_persist(
             repo["id"], repo["url"], repo.get("branch"),
             cred_username=repo.get("cred_username"), cred_token=repo.get("cred_token"),
         )
         status = "✅" if success else "❌"
         print(f"  {status} [{repo['name']}] {msg}")
+
+    await asyncio.gather(*(_sync_one(repo) for repo in repos))
 
 
 async def periodic_sync_loop(interval_minutes: int):

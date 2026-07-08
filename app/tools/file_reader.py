@@ -2,7 +2,7 @@
 
 import os
 from app.tools.registry import tool
-from app.tools.access import get_allowed_paths, no_access_reason
+from app.tools.access import get_allowed_paths, no_access_reason, is_within_allowed_paths
 
 
 def _resolve_path(path: str, allowed_paths: list[str]) -> str:
@@ -30,12 +30,9 @@ def _is_path_allowed(real_path: str, allowed_paths: list[str]) -> tuple[bool, st
     if not allowed_paths:
         return False, no_access_reason()
 
-    # Check if path is under any allowed directory
-    for allowed in allowed_paths:
-        if real_path.startswith(allowed + os.sep) or real_path == allowed:
-            return True, ""
-
-    return False, f"Access denied: path is outside your assigned repositories"
+    if is_within_allowed_paths(real_path, allowed_paths):
+        return True, ""
+    return False, "Access denied: path is outside your assigned repositories"
 
 
 @tool("Read the contents of a file at the given path. Supports text files. Only files within your assigned repositories are accessible. Paths may be absolute or relative to a repository root (as returned by code_search). Use start_line together with max_lines to jump to a specific section of a large file (e.g. a line number found via code_search) instead of always reading from the top.")

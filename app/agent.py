@@ -150,20 +150,24 @@ class Agent:
 
             # If there were tool calls, execute them and continue the loop
             if tool_calls:
+                # Parse each tool call's input once — reused below both when
+                # building the assistant message and when executing the tool.
+                for tc in tool_calls:
+                    try:
+                        tc["input"] = json.loads(tc["input_json"]) if tc["input_json"] else {}
+                    except json.JSONDecodeError:
+                        tc["input"] = {}
+
                 # Build assistant message with tool_use blocks
                 assistant_blocks = []
                 if full_text:
                     assistant_blocks.append({"type": "text", "text": full_text})
                 for tc in tool_calls:
-                    try:
-                        inp = json.loads(tc["input_json"]) if tc["input_json"] else {}
-                    except json.JSONDecodeError:
-                        inp = {}
                     assistant_blocks.append({
                         "type": "tool_use",
                         "id": tc["id"],
                         "name": tc["name"],
-                        "input": inp,
+                        "input": tc["input"],
                     })
 
                 messages.append({"role": "assistant", "content": assistant_blocks})
@@ -171,10 +175,7 @@ class Agent:
                 # Execute each tool and collect results
                 tool_result_blocks = []
                 for tc in tool_calls:
-                    try:
-                        inp = json.loads(tc["input_json"]) if tc["input_json"] else {}
-                    except json.JSONDecodeError:
-                        inp = {}
+                    inp = tc["input"]
 
                     yield AgentEvent(type="tool_use", data={
                         "id": tc["id"],

@@ -6,17 +6,23 @@ if (!isAuthorizedAdmin) { window.location.href = "/login"; }
 
 document.getElementById("admin-user").textContent = user.username || "";
 
-function esc(str) {
-    return String(str ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-}
+// escapeHtml is defined in shared.js (loaded before this file) — aliased as
+// `esc` here since every call site in this file already uses that name.
+const esc = escapeHtml;
 
 function authHeaders() {
     return { "Content-Type": "application/json", "Authorization": `Bearer ${token}` };
+}
+
+// Wraps fetch + auth headers + "parse error body, tolerating a non-JSON one"
+// — several admin actions used to hand-roll this, some without the try/catch
+// around resp.json() (so a malformed/empty error body threw instead of
+// showing a message). One wrapper, one behavior everywhere.
+async function apiRequest(url, opts = {}) {
+    const resp = await fetch(url, { ...opts, headers: { ...authHeaders(), ...(opts.headers || {}) } });
+    let data;
+    try { data = await resp.json(); } catch { data = {}; }
+    return { ok: resp.ok, status: resp.status, data };
 }
 
 function showMsg(text, ok = true) {
@@ -66,11 +72,10 @@ async function createUser() {
     const password = document.getElementById("new-password").value;
     const role = document.getElementById("new-role").value;
     if (!username || !password) return showMsg("请填写用户名和密码", false);
-    const resp = await fetch("/api/admin/users", {
-        method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ username, password, role }),
+    const { ok, data } = await apiRequest("/api/admin/users", {
+        method: "POST", body: JSON.stringify({ username, password, role }),
     });
-    if (!resp.ok) { const d = await resp.json(); return showMsg(d.detail || "创建失败", false); }
+    if (!ok) return showMsg(data.detail || "创建失败", false);
     showMsg(`用户 ${username} 创建成功`);
     document.getElementById("new-username").value = "";
     document.getElementById("new-password").value = "";
@@ -131,15 +136,15 @@ async function createRepo() {
     const credToken = document.getElementById("new-repo-cred-token").value.trim();
     const desc = document.getElementById("new-repo-desc").value.trim();
     if (!name || !url) return showMsg("请填写名称和 URL", false);
-    const resp = await fetch("/api/admin/repos", {
-        method: "POST", headers: authHeaders(),
+    const { ok, data } = await apiRequest("/api/admin/repos", {
+        method: "POST",
         body: JSON.stringify({
             name, url, branch: branch || null,
             cred_username: credUsername || null, cred_token: credToken || null,
             description: desc,
         }),
     });
-    if (!resp.ok) { const d = await resp.json(); return showMsg(d.detail || "创建失败", false); }
+    if (!ok) return showMsg(data.detail || "创建失败", false);
     showMsg(`仓库 ${name} 添加成功`);
     document.getElementById("new-repo-name").value = "";
     document.getElementById("new-repo-url").value = "";
@@ -196,13 +201,10 @@ async function saveRepoEdit() {
         body.cred_token = credToken;
     }
 
-    const resp = await fetch(`/api/admin/repos/${id}`, {
-        method: "PATCH", headers: authHeaders(),
-        body: JSON.stringify(body),
+    const { ok, data } = await apiRequest(`/api/admin/repos/${id}`, {
+        method: "PATCH", body: JSON.stringify(body),
     });
-    let d;
-    try { d = await resp.json(); } catch { d = {}; }
-    if (!resp.ok) return showMsg(d.detail || "保存失败", false);
+    if (!ok) return showMsg(data.detail || "保存失败", false);
     showMsg("仓库已更新");
     closeRepoEdit();
     loadRepos();
@@ -211,11 +213,9 @@ async function saveRepoEdit() {
 async function syncRepo(id, btn) {
     btn.disabled = true;
     try {
-        const resp = await fetch(`/api/admin/repos/${id}/sync`, { method: "POST", headers: authHeaders() });
-        let d;
-        try { d = await resp.json(); } catch { d = {}; }
-        if (!resp.ok || !d.ok) return showMsg(d.detail || d.message || "同步失败", false);
-        showMsg(`同步成功：${d.message}`);
+        const { ok, data } = await apiRequest(`/api/admin/repos/${id}/sync`, { method: "POST" });
+        if (!ok || !data.ok) return showMsg(data.detail || data.message || "同步失败", false);
+        showMsg(`同步成功：${data.message}`);
         loadRepos();
     } catch (err) {
         showMsg(`网络错误: ${err.message}`, false);
@@ -246,33 +246,31 @@ function renderPerms() {
     const tbody = document.getElementById("perms-table");
     tbody.innerHTML = lastPerms.map(p => {
         const key = `${p.user_id}-${p.repo_id}`;
-        if (key === editingPermKey) {
-            return `
-        <tr>
-            <td>${esc(p.username)}</td>
-            <td>${esc(p.repo_name)}</td>
+        const isEditing = key === editingPermKey;
+        const levelCell = isEditing ? `
             <td>
                 <select id="perm-edit-level-${key}">
                     <option value="read" ${p.access_level === 'read' ? 'selected' : ''}>只读</option>
                     <option value="write" ${p.access_level === 'write' ? 'selected' : ''}>读写</option>
                     <option value="admin" ${p.access_level === 'admin' ? 'selected' : ''}>管理</option>
                 </select>
-            </td>
+            </td>` : `
+            <td><span class="badge ${p.access_level === 'read' ? 'badge-read' : 'badge-write'}">${esc(p.access_level)}</span></td>`;
+        const actionCell = isEditing ? `
             <td>
                 <button class="btn btn-sm btn-primary" onclick="saveEditPerm(${p.user_id}, ${p.repo_id})">保存</button>
                 <button class="btn btn-sm" onclick="cancelEditPerm()">取消</button>
-            </td>
-        </tr>`;
-        }
+            </td>` : `
+            <td>
+                <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="startEditPerm(${p.user_id}, ${p.repo_id})">编辑</button>
+                <button class="btn btn-sm btn-danger" onclick="revokePerm(${p.user_id}, ${p.repo_id})">撤销</button>
+            </td>`;
         return `
         <tr>
             <td>${esc(p.username)}</td>
             <td>${esc(p.repo_name)}</td>
-            <td><span class="badge ${p.access_level === 'read' ? 'badge-read' : 'badge-write'}">${esc(p.access_level)}</span></td>
-            <td>
-                <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="startEditPerm(${p.user_id}, ${p.repo_id})">编辑</button>
-                <button class="btn btn-sm btn-danger" onclick="revokePerm(${p.user_id}, ${p.repo_id})">撤销</button>
-            </td>
+            ${levelCell}
+            ${actionCell}
         </tr>`;
     }).join("");
 }
@@ -290,11 +288,10 @@ function cancelEditPerm() {
 async function saveEditPerm(userId, repoId) {
     const key = `${userId}-${repoId}`;
     const level = document.getElementById(`perm-edit-level-${key}`).value;
-    const resp = await fetch("/api/admin/permissions", {
-        method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ user_id: userId, repo_id: repoId, access_level: level }),
+    const { ok, data } = await apiRequest("/api/admin/permissions", {
+        method: "POST", body: JSON.stringify({ user_id: userId, repo_id: repoId, access_level: level }),
     });
-    if (!resp.ok) { const d = await resp.json(); return showMsg(d.detail || "更新失败", false); }
+    if (!ok) return showMsg(data.detail || "更新失败", false);
     showMsg("权限已更新");
     editingPermKey = null;
     loadPerms();
@@ -305,11 +302,10 @@ async function grantPerm() {
     const repoId = parseInt(document.getElementById("perm-repo").value);
     const level = document.getElementById("perm-level").value;
     if (!userId || !repoId) return showMsg("请选择用户和仓库", false);
-    const resp = await fetch("/api/admin/permissions", {
-        method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ user_id: userId, repo_id: repoId, access_level: level }),
+    const { ok, data } = await apiRequest("/api/admin/permissions", {
+        method: "POST", body: JSON.stringify({ user_id: userId, repo_id: repoId, access_level: level }),
     });
-    if (!resp.ok) { const d = await resp.json(); return showMsg(d.detail || "授权失败", false); }
+    if (!ok) return showMsg(data.detail || "授权失败", false);
     showMsg("权限已授予");
     loadPerms();
 }

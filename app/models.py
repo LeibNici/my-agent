@@ -1,5 +1,7 @@
 """Pydantic data models for API requests/responses."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -83,4 +85,4 @@ class RepoUpdate(BaseModel):
 class PermissionGrant(BaseModel):
     user_id: int
     repo_id: int
-    access_level: str = "read"
+    access_level: Literal["read", "write", "admin"] = "read"
