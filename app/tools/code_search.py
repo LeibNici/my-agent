@@ -7,7 +7,7 @@ from app.tools.registry import tool, tool_context
 
 def _get_allowed_paths() -> list[str]:
     """Get allowed repo paths from tool context."""
-    ctx = tool_context.get()
+    ctx = tool_context.get() or {}
     paths = ctx.get("allowed_repo_paths", [])
     return [os.path.realpath(p) for p in paths if p]
 
@@ -34,9 +34,11 @@ async def code_search(keyword: str, file_pattern: str = "*", max_results: int = 
     for repo_path in allowed_paths:
         if not os.path.isdir(repo_path):
             continue
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "grep", "-rn", "-P", "--include", file_pattern,
+                "--exclude-dir=.*", "--exclude=.*",  # never search into dotfiles/dotdirs (.env, .git, .ssh, ...)
                 "--", keyword, repo_path,  # -- prevents flag injection
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -49,6 +51,9 @@ async def code_search(keyword: str, file_pattern: str = "*", max_results: int = 
                     if len(results) >= max_results:
                         break
         except asyncio.TimeoutError:
+            if proc is not None:
+                proc.kill()
+                await proc.wait()
             results.append(f"(search timed out for {os.path.basename(repo_path)})")
         except Exception as e:
             results.append(f"(search error: {e})")
@@ -101,7 +106,13 @@ def _build_tree(current: str, depth: int, max_depth: int) -> str:
     except PermissionError:
         return f"{indent}(permission denied)"
 
-    entries = [e for e in entries if not e.startswith(".")]
+    # Skip dotfiles and symlinks — symlinks are never followed, since a committed
+    # symlink pointing outside the repo (e.g. to /etc) would otherwise let this
+    # walk escape the sandboxed allowed_paths boundary.
+    entries = [
+        e for e in entries
+        if not e.startswith(".") and not os.path.islink(os.path.join(current, e))
+    ]
     dirs = [e for e in entries if os.path.isdir(os.path.join(current, e)) and e not in _SKIP_DIRS]
     files = [e for e in entries if os.path.isfile(os.path.join(current, e)) and e not in _SKIP_DIRS]
 

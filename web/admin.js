@@ -1,14 +1,18 @@
 // ===== Auth check =====
 const token = localStorage.getItem("token");
 const user = JSON.parse(localStorage.getItem("user") || "{}");
-if (!token || user.role !== "admin") { window.location.href = "/login"; }
+const isAuthorizedAdmin = !!token && user.role === "admin";
+if (!isAuthorizedAdmin) { window.location.href = "/login"; }
 
 document.getElementById("admin-user").textContent = user.username || "";
 
 function esc(str) {
-    const d = document.createElement("div");
-    d.textContent = String(str ?? "");
-    return d.innerHTML;
+    return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
 }
 
 function authHeaders() {
@@ -17,7 +21,7 @@ function authHeaders() {
 
 function showMsg(text, ok = true) {
     const area = document.getElementById("msg-area");
-    area.innerHTML = `<div class="msg ${ok ? 'msg-ok' : 'msg-err'}">${text}</div>`;
+    area.innerHTML = `<div class="msg ${ok ? 'msg-ok' : 'msg-err'}">${esc(text)}</div>`;
     setTimeout(() => area.innerHTML = "", 3000);
 }
 
@@ -173,6 +177,8 @@ async function revokePerm(userId, repoId) {
 }
 
 // ===== Init =====
-loadUsers();
-loadRepos();
-loadPerms();
+if (isAuthorizedAdmin) {
+    loadUsers();
+    loadRepos();
+    loadPerms();
+}

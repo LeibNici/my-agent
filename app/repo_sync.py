@@ -1,10 +1,15 @@
 """Repository sync service — clone and pull git repos to local storage."""
 
 import asyncio
+import ipaddress
 import os
 import shutil
+import socket
+from urllib.parse import urlparse
 
 from app.config import app_settings
+
+GIT_TIMEOUT_SECONDS = 120
 
 
 def get_repo_local_path(repo_id: int) -> str:
@@ -12,15 +17,38 @@ def get_repo_local_path(repo_id: int) -> str:
     return os.path.join(app_settings.repos_dir, str(repo_id))
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize a git URL for comparison (strip trailing slash / .git suffix)."""
+    return url.rstrip("/").removesuffix(".git")
+
+
+def _is_disallowed_host(host: str) -> bool:
+    """Reject hosts that resolve to loopback/private/link-local addresses,
+    to reduce SSRF exposure from admin-supplied clone URLs."""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            addr = ipaddress.ip_address(socket.gethostbyname(host))
+        except (socket.gaierror, OSError):
+            return False  # can't resolve — let git itself fail on it
+    return addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_reserved
+
+
 async def _run_git(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
-    """Run a git command and return (returncode, stdout, stderr)."""
+    """Run a git command with a timeout and return (returncode, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
         "git", *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=GIT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 1, "", f"git command timed out after {GIT_TIMEOUT_SECONDS}s"
     return proc.returncode, stdout.decode(), stderr.decode()
 
 
@@ -29,6 +57,10 @@ async def clone_repo(url: str, repo_id: int) -> tuple[bool, str]:
     # Validate URL protocol — only allow http(s) and git://
     if not url.startswith(("https://", "http://", "git://")):
         return False, f"Invalid URL protocol: only https://, http://, and git:// are allowed"
+
+    host = urlparse(url).hostname
+    if host and _is_disallowed_host(host):
+        return False, f"Refusing to clone from internal/private host: {host}"
 
     local_path = get_repo_local_path(repo_id)
 
@@ -69,7 +101,14 @@ async def sync_repo(url: str, repo_id: int) -> tuple[bool, str, str]:
     local_path = get_repo_local_path(repo_id)
 
     if os.path.isdir(os.path.join(local_path, ".git")):
-        success, msg = await pull_repo(repo_id)
+        # If the configured URL no longer matches the clone's current origin
+        # (e.g. an admin changed it), re-clone instead of pulling from the old remote.
+        returncode, stdout, _ = await _run_git(["remote", "get-url", "origin"], cwd=local_path)
+        current_url = stdout.strip() if returncode == 0 else None
+        if current_url and _normalize_url(current_url) != _normalize_url(url):
+            success, msg = await clone_repo(url, repo_id)
+        else:
+            success, msg = await pull_repo(repo_id)
     else:
         success, msg = await clone_repo(url, repo_id)
 

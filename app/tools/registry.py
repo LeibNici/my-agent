@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from contextvars import ContextVar
@@ -11,8 +12,10 @@ from typing import Any, Callable, get_type_hints
 _TOOLS: dict[str, dict[str, Any]] = {}
 _HANDLERS: dict[str, Callable] = {}
 
-# Context variable for per-request tool context (e.g., user's allowed repo paths)
-tool_context: ContextVar[dict] = ContextVar("tool_context", default={})
+# Context variable for per-request tool context (e.g., user's allowed repo paths).
+# default=None (not a mutable dict) — a dict default would be a single shared object
+# returned by every .get() in a context that never called .set().
+tool_context: ContextVar[dict | None] = ContextVar("tool_context", default=None)
 
 
 def _python_type_to_json_schema(py_type: type) -> dict:
@@ -84,7 +87,12 @@ async def execute_tool(name: str, input_data: dict) -> str:
 
     handler = _HANDLERS[name]
     try:
-        result = handler(**input_data)
+        if inspect.iscoroutinefunction(handler):
+            result = handler(**input_data)
+        else:
+            # Sync handlers may do blocking I/O (file reads, subprocess calls) —
+            # offload to a thread so they don't stall the event loop for other requests.
+            result = asyncio.to_thread(handler, **input_data)
         if inspect.isawaitable(result):
             result = await result
         if not isinstance(result, str):

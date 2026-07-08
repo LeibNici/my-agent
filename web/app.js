@@ -1,7 +1,8 @@
 // ===== Auth =====
 const _token = localStorage.getItem("token");
 const _user = JSON.parse(localStorage.getItem("user") || "null");
-if (!_token) { window.location.href = "/login"; }
+const _isAuthenticated = !!_token;
+if (!_isAuthenticated) { window.location.href = "/login"; }
 
 function authHeaders() {
     return { "Authorization": `Bearer ${_token}` };
@@ -30,12 +31,24 @@ let currentAbortController = null;
 
 // ===== Init =====
 document.addEventListener("DOMContentLoaded", () => {
+    if (!_isAuthenticated) return; // redirect to /login is already in flight — don't fire authenticated requests
+
     // Show user info in sidebar
     const header = document.querySelector(".sidebar-header");
     if (_user && header) {
         const userInfo = document.createElement("div");
         userInfo.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:13px;color:var(--text-secondary)";
-        userInfo.innerHTML = `<span>👤 ${_user.username}</span><button onclick="logout()" style="background:none;border:none;color:var(--text-secondary);cursor:pointer;font-size:12px;">退出</button>`;
+
+        const nameSpan = document.createElement("span");
+        nameSpan.textContent = `👤 ${_user.username}`;
+
+        const logoutBtn = document.createElement("button");
+        logoutBtn.textContent = "退出";
+        logoutBtn.style.cssText = "background:none;border:none;color:var(--text-secondary);cursor:pointer;font-size:12px;";
+        logoutBtn.onclick = logout;
+
+        userInfo.appendChild(nameSpan);
+        userInfo.appendChild(logoutBtn);
         header.insertBefore(userInfo, header.querySelector("#new-chat-btn"));
     }
     loadRepos();
@@ -68,41 +81,6 @@ function closeSidebar() {
     sidebar.classList.remove("open");
     overlay.classList.remove("active");
 }
-
-// ===== Repos =====
-async function loadRepos() {
-    const resp = await authFetch("/api/repos");
-    const repos = await resp.json();
-    const container = document.getElementById("repos-list");
-    container.innerHTML = "";
-
-    repos.forEach(r => {
-        const chip = document.createElement("button");
-        chip.className = "skill-chip" + (r.id === selectedRepoId ? " active" : "");
-        chip.textContent = r.name;
-        chip.title = r.url;
-        chip.onclick = () => toggleRepo(chip, r.id);
-        container.appendChild(chip);
-    });
-
-    if (repos.length === 0) {
-        container.innerHTML = '<span style="font-size:12px;color:var(--text-secondary)">暂无仓库</span>';
-    }
-}
-
-function toggleRepo(chip, id) {
-    if (selectedRepoId === id) {
-        selectedRepoId = null;
-        chip.classList.remove("active");
-    } else {
-        // Deselect previous
-        document.querySelectorAll("#repos-list .skill-chip").forEach(c => c.classList.remove("active"));
-        selectedRepoId = id;
-        chip.classList.add("active");
-    }
-}
-
-// ===== Skills =====
 
 // ===== Repos =====
 async function loadRepos() {
@@ -533,9 +511,14 @@ function renderMarkdown(text) {
 }
 
 function escapeHtml(str) {
-    const div = document.createElement("div");
-    div.textContent = str;
-    return div.innerHTML;
+    // Manual replace (not the div.textContent/innerHTML trick) so this is safe
+    // both in text-node context and when interpolated into an HTML attribute value.
+    return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
 }
 
 function truncate(str, maxLen) {
@@ -565,7 +548,7 @@ function appendIssueCard(container, draft) {
         <div class="issue-body">${renderMarkdown(draft.body)}</div>
         <div class="issue-labels">${labelsHtml}</div>
         <div class="issue-actions">
-            <button class="btn-confirm" onclick="submitIssue(this, '${escapeHtml(draft.title)}')">✅ 确认提交</button>
+            <button class="btn-confirm" onclick="submitIssue(this)">✅ 确认提交</button>
             <button class="btn-cancel" onclick="this.parentElement.parentElement.querySelector('.issue-status').textContent='已取消'; this.disabled=true; this.previousElementSibling.disabled=true;">❌ 取消</button>
             <span class="issue-status"></span>
         </div>
@@ -577,7 +560,7 @@ function appendIssueCard(container, draft) {
     scrollToBottom();
 }
 
-async function submitIssue(btn, title) {
+async function submitIssue(btn) {
     const card = btn.closest(".issue-card");
     const draft = JSON.parse(card.dataset.draft);
     const statusEl = card.querySelector(".issue-status");
@@ -622,6 +605,7 @@ async function submitIssue(btn, title) {
         const link = document.createElement("a");
         link.href = result.issue_url;
         link.target = "_blank";
+        link.rel = "noopener noreferrer";
         link.textContent = `#${result.issue_number}`;
         statusEl.appendChild(link);
         statusEl.style.color = "var(--success)";

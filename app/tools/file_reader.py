@@ -2,32 +2,36 @@
 
 import os
 from app.tools.registry import tool, tool_context
-from app.config import app_settings
-
-# Default workspace (project root)
-WORKSPACE_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 def _get_allowed_paths() -> list[str]:
     """Get the current user's allowed repo paths from tool context ONLY.
     No fallback, no global enumeration — deny-by-default."""
-    ctx = tool_context.get()
+    ctx = tool_context.get() or {}
     paths = ctx.get("allowed_repo_paths", [])
     return [os.path.realpath(p) for p in paths if p]
 
 
-def _is_path_allowed(path: str) -> tuple[bool, str]:
-    """Check if a path is within allowed directories."""
-    real_path = os.path.realpath(path)
+def _resolve_path(path: str, allowed_paths: list[str]) -> str:
+    """Resolve a path to an absolute one. Relative paths (as returned by
+    code_search, which strips the repo prefix) are resolved against each
+    allowed repo root in turn, matching how they were produced."""
+    if os.path.isabs(path):
+        return os.path.realpath(path)
+    for root in allowed_paths:
+        candidate = os.path.realpath(os.path.join(root, path))
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.realpath(path)
 
+
+def _is_path_allowed(real_path: str, allowed_paths: list[str]) -> tuple[bool, str]:
+    """Check if an already-resolved path is within allowed directories."""
     # Block all dotfiles/dotdirs by default
     parts = real_path.split(os.sep)
     for part in parts:
         if part.startswith(".") and part not in (".", ".."):
             return False, f"Access denied: dotfiles/directories are not readable ('{part}')"
-
-    # Get user's allowed paths from context
-    allowed_paths = _get_allowed_paths()
 
     # No permissions = no access (deny-by-default, no fallback)
     if not allowed_paths:
@@ -41,13 +45,14 @@ def _is_path_allowed(path: str) -> tuple[bool, str]:
     return False, f"Access denied: path is outside your assigned repositories"
 
 
-@tool("Read the contents of a file at the given path. Supports text files. Only files within your assigned repositories are accessible.")
+@tool("Read the contents of a file at the given path. Supports text files. Only files within your assigned repositories are accessible. Paths may be absolute or relative to a repository root (as returned by code_search).")
 def file_reader(path: str, max_lines: int = 200) -> str:
     """Read a file and return its contents."""
-    path = os.path.expanduser(path)
+    allowed_paths = _get_allowed_paths()
+    path = _resolve_path(os.path.expanduser(path), allowed_paths)
 
     # Security: validate path
-    allowed, reason = _is_path_allowed(path)
+    allowed, reason = _is_path_allowed(path, allowed_paths)
     if not allowed:
         return f"Error: {reason}"
 

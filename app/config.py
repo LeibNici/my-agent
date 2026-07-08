@@ -8,7 +8,12 @@ _SECRET_FILE = os.path.join(os.path.dirname(__file__), "..", ".jwt_secret")
 
 
 def _load_or_create_jwt_secret() -> str:
-    """Load JWT secret from file, or generate and persist a new one."""
+    """Load JWT secret from file, or generate and persist a new one.
+
+    Uses an exclusive create (O_EXCL) so that if multiple worker processes
+    race on first boot, only one wins the write — the losers re-read the
+    winner's file instead of each keeping their own different in-memory secret.
+    """
     try:
         with open(_SECRET_FILE, "r") as f:
             secret = f.read().strip()
@@ -16,11 +21,18 @@ def _load_or_create_jwt_secret() -> str:
                 return secret
     except FileNotFoundError:
         pass
-    # Generate new secret and persist it
     secret = secrets.token_urlsafe(32)
     try:
-        with open(_SECRET_FILE, "w") as f:
+        fd = os.open(_SECRET_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(secret)
+    except FileExistsError:
+        # Another process won the race — use what it wrote.
+        try:
+            with open(_SECRET_FILE, "r") as f:
+                secret = f.read().strip() or secret
+        except OSError:
+            pass
     except OSError:
         pass  # fallback to ephemeral if we can't write
     return secret

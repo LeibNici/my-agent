@@ -1,43 +1,22 @@
 """GitHub Issue tool — draft and submit issues."""
 
-import json
 import httpx
 
 from app.config import app_settings
-from app.tools.registry import tool, tool_context
+from app.tools.registry import tool
 
 
 @tool("Generate a GitHub Issue draft with title, body (markdown), and labels. This creates a preview for the user to confirm before submission. Include technical details in the body for the development team.")
-def draft_issue(title: str, body: str, labels: str = "bug") -> str:
-    """Create an Issue draft preview. Returns formatted markdown for user confirmation."""
+def draft_issue(title: str, body: str, labels: str = "bug") -> dict:
+    """Create an Issue draft. Returns a structured draft for the frontend confirmation card."""
     label_list = [l.strip() for l in labels.split(",") if l.strip()]
 
-    draft = {
+    return {
+        "type": "issue_draft",
         "title": title,
         "body": body,
         "labels": label_list,
     }
-
-    preview = f"""📋 **Issue 草稿**
-
-**标题:** {title}
-
-**标签:** {', '.join(label_list)}
-
----
-
-{body}
-
----
-
-确认提交此 Issue 吗？"""
-
-    # Store the draft in tool context so the frontend can access it for submission
-    ctx = tool_context.get()
-    ctx["pending_issue"] = draft
-    tool_context.set(ctx)
-
-    return preview
 
 
 async def submit_github_issue(repo_url: str, title: str, body: str, labels: list[str]) -> dict:

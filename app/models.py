@@ -45,11 +45,11 @@ class SkillInfo(BaseModel):
 
 class UserCreate(BaseModel):
     username: str
-    password: str
+    password: str = Field(min_length=8)
     role: str = "user"
 
 class UserUpdate(BaseModel):
-    password: str | None = None
+    password: str | None = Field(default=None, min_length=8)
     is_active: bool | None = None
 
 

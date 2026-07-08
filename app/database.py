@@ -302,16 +302,21 @@ async def list_permissions() -> list[dict]:
 # ==================== Sessions ====================
 
 async def create_session(title: str = "New Chat", owner_id: int = None) -> str:
-    """Create a new session, return its ID."""
-    session_id = str(uuid.uuid4())[:8]
+    """Create a new session, return its ID. Retries on the (rare) short-ID collision."""
     now = datetime.now().isoformat()
     async with _connect() as db:
-        await db.execute(
-            "INSERT INTO sessions (id, title, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, title, owner_id, now, now),
-        )
-        await db.commit()
-    return session_id
+        for _ in range(5):
+            session_id = str(uuid.uuid4())[:8]
+            try:
+                await db.execute(
+                    "INSERT INTO sessions (id, title, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (session_id, title, owner_id, now, now),
+                )
+                await db.commit()
+                return session_id
+            except aiosqlite.IntegrityError:
+                continue
+        raise RuntimeError("Failed to allocate a unique session ID after 5 attempts")
 
 
 async def list_sessions(owner_id: int = None) -> list[dict]:
