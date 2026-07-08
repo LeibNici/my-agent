@@ -2,14 +2,8 @@
 
 import os
 
-from app.tools.registry import tool, tool_context
-
-
-def _get_allowed_paths() -> list[str]:
-    """Get allowed repo paths from tool context."""
-    ctx = tool_context.get() or {}
-    paths = ctx.get("allowed_repo_paths", [])
-    return [os.path.realpath(p) for p in paths if p]
+from app.tools.registry import tool
+from app.tools.access import get_allowed_paths, no_access_reason
 
 
 def _validate_repo_path(path: str, allowed_paths: list[str]) -> tuple[bool, str, str]:
@@ -26,9 +20,9 @@ async def code_search(keyword: str, file_pattern: str = "*", max_results: int = 
     """Search repository code for a keyword using grep."""
     import asyncio
 
-    allowed_paths = _get_allowed_paths()
+    allowed_paths = get_allowed_paths()
     if not allowed_paths:
-        return "Error: you have no repository permissions assigned"
+        return no_access_reason(prefix="Error")
 
     results = []
     for repo_path in allowed_paths:
@@ -69,9 +63,9 @@ async def code_search(keyword: str, file_pattern: str = "*", max_results: int = 
 @tool("List the directory structure of a repository or path. Shows files and folders up to the specified depth. Use '.' to list all accessible repositories.")
 def list_directory(path: str = ".", max_depth: int = 3) -> str:
     """List directory structure within allowed repositories."""
-    allowed_paths = _get_allowed_paths()
+    allowed_paths = get_allowed_paths()
     if not allowed_paths:
-        return "Error: you have no repository permissions assigned"
+        return no_access_reason(prefix="Error")
 
     if path == ".":
         parts = []

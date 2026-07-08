@@ -31,6 +31,7 @@ class Agent:
         messages: list[dict],
         active_skills: list[str] | None = None,
         allowed_repo_paths: list[str] | None = None,
+        unsynced_repo_names: list[str] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent loop, yielding events as they occur.
 
@@ -43,7 +44,12 @@ class Agent:
         system = build_system_prompt(settings.system_prompt, active_skills or [])
 
         # Set tool context for permission-aware tools
-        tool_context.set({"allowed_repo_paths": allowed_repo_paths or []})
+        tool_context.set({
+            "allowed_repo_paths": allowed_repo_paths or [],
+            # Granted but never-synced repos — lets tools report the real
+            # cause instead of a blanket "no permissions" when paths are empty.
+            "unsynced_repo_names": unsynced_repo_names or [],
+        })
 
         # Collect available tools (all tools if no skills, or skill-specific tools)
         if active_skills:

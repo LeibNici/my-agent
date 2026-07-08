@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0">
     <title>My Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Public+Sans:wght@400;500;600;700&family=Source+Serif+4:ital,wght@1,400;1,500&display=swap">
     <link rel="stylesheet" href="/static/style.css">
     <!-- Marked.js for markdown rendering (pinned version + SRI) -->
     <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
@@ -22,28 +25,25 @@
         <!-- Sidebar -->
         <aside id="sidebar">
             <div class="sidebar-header">
-                <h2>💬 My Agent</h2>
+                <h2>my_agent</h2>
                 <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
             </div>
 
-            <!-- User info -->
-            <div id="user-info" style="padding:10px 20px;font-size:13px;color:var(--text-secondary);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;"></div>
-
             <!-- Repos -->
             <div class="skills-section">
-                <h3>📦 仓库</h3>
+                <h3>Repositories</h3>
                 <div id="repos-list"></div>
             </div>
 
             <!-- Skills -->
             <div class="skills-section">
-                <h3>🛠 Skills</h3>
+                <h3>Skills</h3>
                 <div id="skills-list"></div>
             </div>
 
             <!-- Sessions -->
             <div class="sessions-section">
-                <h3>📝 History</h3>
+                <h3>History</h3>
                 <div id="sessions-list"></div>
             </div>
         </aside>
@@ -53,14 +53,13 @@
             <!-- Mobile header -->
             <div id="mobile-header">
                 <button id="menu-btn" onclick="toggleSidebar()" aria-label="Toggle menu">☰</button>
-                <span class="mobile-title">💬 My Agent</span>
+                <span class="mobile-title">my_agent</span>
             </div>
 
             <div id="messages">
                 <div class="welcome-message">
-                    <h1>👋 Hello!</h1>
-                    <p>Select a skill and start chatting.</p>
-                    <p>Your agent supports tool-use and will think step by step.</p>
+                    <h1>Where should we start?</h1>
+                    <p>Choose a repo and a skill on the left, or just start typing.</p>
                 </div>
             </div>
 

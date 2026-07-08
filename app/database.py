@@ -44,6 +44,7 @@ async def init_db():
                 url TEXT NOT NULL,
                 local_path TEXT,
                 description TEXT DEFAULT '',
+                branch TEXT,
                 created_at TEXT NOT NULL
             )
         """)
@@ -89,6 +90,13 @@ async def init_db():
         columns = [row[1] for row in await cursor.fetchall()]
         if "owner_id" not in columns:
             await db.execute("ALTER TABLE sessions ADD COLUMN owner_id INTEGER")
+            await db.commit()
+
+        # Migration: add branch to existing repositories table if missing
+        cursor = await db.execute("PRAGMA table_info(repositories)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if "branch" not in columns:
+            await db.execute("ALTER TABLE repositories ADD COLUMN branch TEXT")
             await db.commit()
 
 
@@ -167,13 +175,13 @@ async def delete_user(user_id: int):
 
 # ==================== Repositories ====================
 
-async def create_repo(name: str, url: str, description: str = "", local_path: str = None) -> int:
+async def create_repo(name: str, url: str, description: str = "", local_path: str = None, branch: str = None) -> int:
     """Create a new repository entry, return repo ID."""
     now = datetime.now().isoformat()
     async with _connect() as db:
         cursor = await db.execute(
-            "INSERT INTO repositories (name, url, local_path, description, created_at) VALUES (?, ?, ?, ?, ?)",
-            (name, url, local_path, description, now),
+            "INSERT INTO repositories (name, url, local_path, description, branch, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, url, local_path, description, branch, now),
         )
         await db.commit()
         return cursor.lastrowid
@@ -200,7 +208,7 @@ async def get_repo(repo_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-async def update_repo(repo_id: int, name: str = None, url: str = None, description: str = None, local_path: str = None):
+async def update_repo(repo_id: int, name: str = None, url: str = None, description: str = None, local_path: str = None, branch: str = None):
     """Update repository fields."""
     fields = []
     values = []
@@ -208,6 +216,8 @@ async def update_repo(repo_id: int, name: str = None, url: str = None, descripti
         fields.append("name = ?"); values.append(name)
     if url is not None:
         fields.append("url = ?"); values.append(url)
+    if branch is not None:
+        fields.append("branch = ?"); values.append(branch or None)
     if description is not None:
         fields.append("description = ?"); values.append(description)
     if local_path is not None:

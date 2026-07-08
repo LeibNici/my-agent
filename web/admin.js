@@ -48,7 +48,7 @@ async function loadUsers() {
             <td>${u.id}</td>
             <td>${esc(u.username)}</td>
             <td><span class="badge ${u.role === 'admin' ? 'badge-admin' : 'badge-user'}">${esc(u.role)}</span></td>
-            <td>${u.is_active ? '✅' : '🚫'}</td>
+            <td><span style="font-family:var(--font-mono);font-size:12px;color:${u.is_active ? 'var(--moss)' : 'var(--faint)'}">${u.is_active ? 'active' : 'disabled'}</span></td>
             <td>${esc(u.created_at?.slice(0, 10) || '')}</td>
             <td>
                 <button class="btn btn-sm btn-primary" onclick="resetPwd(${u.id})">重置密码</button>
@@ -106,8 +106,12 @@ async function loadRepos() {
             <td>${r.id}</td>
             <td>${esc(r.name)}</td>
             <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(r.url)}</td>
+            <td>${esc(r.branch || '(default)')}</td>
             <td>${esc(r.description || '-')}</td>
-            <td><button class="btn btn-sm btn-danger" onclick="deleteRepo(${r.id})">删除</button></td>
+            <td>
+                <button class="btn btn-sm btn-primary" onclick="syncRepo(${r.id}, this)">同步</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteRepo(${r.id})">删除</button>
+            </td>
         </tr>
     `).join("");
     // Update permission dropdown
@@ -118,18 +122,36 @@ async function loadRepos() {
 async function createRepo() {
     const name = document.getElementById("new-repo-name").value.trim();
     const url = document.getElementById("new-repo-url").value.trim();
+    const branch = document.getElementById("new-repo-branch").value.trim();
     const desc = document.getElementById("new-repo-desc").value.trim();
     if (!name || !url) return showMsg("请填写名称和 URL", false);
     const resp = await fetch("/api/admin/repos", {
         method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ name, url, description: desc }),
+        body: JSON.stringify({ name, url, branch: branch || null, description: desc }),
     });
     if (!resp.ok) { const d = await resp.json(); return showMsg(d.detail || "创建失败", false); }
     showMsg(`仓库 ${name} 添加成功`);
     document.getElementById("new-repo-name").value = "";
     document.getElementById("new-repo-url").value = "";
+    document.getElementById("new-repo-branch").value = "";
     document.getElementById("new-repo-desc").value = "";
     loadRepos();
+}
+
+async function syncRepo(id, btn) {
+    btn.disabled = true;
+    try {
+        const resp = await fetch(`/api/admin/repos/${id}/sync`, { method: "POST", headers: authHeaders() });
+        let d;
+        try { d = await resp.json(); } catch { d = {}; }
+        if (!resp.ok || !d.ok) return showMsg(d.detail || d.message || "同步失败", false);
+        showMsg(`同步成功：${d.message}`);
+        loadRepos();
+    } catch (err) {
+        showMsg(`网络错误: ${err.message}`, false);
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 async function deleteRepo(id) {

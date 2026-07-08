@@ -78,14 +78,25 @@ async def ensure_admin_user():
 async def lifespan(app: FastAPI):
     await init_db()
     await ensure_admin_user()
-    # Sync all repos on startup
+    # Sync all repos on startup — one repo's failure (bad path, filesystem
+    # error, ...) must not prevent the app itself from starting.
     from app.database import list_repos
-    from app.repo_sync import sync_all_repos
-    repos = await list_repos()
-    if repos:
-        print("Syncing repositories...")
-        await sync_all_repos(repos)
+    from app.repo_sync import sync_all_repos, periodic_sync_loop
+    try:
+        repos = await list_repos()
+        if repos:
+            print("Syncing repositories...")
+            await sync_all_repos(repos)
+    except Exception as e:
+        print(f"  ❌ Startup repo sync failed: {type(e).__name__}: {e}")
+
+    sync_task = asyncio.create_task(periodic_sync_loop(app_settings.repo_sync_interval_minutes))
     yield
+    sync_task.cancel()
+    try:
+        await sync_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(title="My Agent", lifespan=lifespan)
@@ -154,6 +165,7 @@ def _public_repo(r: dict) -> dict:
         "name": r["name"],
         "url": _mask_url_credentials(r.get("url", "")),
         "description": r.get("description", ""),
+        "branch": r.get("branch"),
         "access_level": r.get("access_level"),
     }
 
@@ -225,18 +237,20 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
             all_repos = await get_user_repos(current_user["id"])
 
         if req.repo_id:
-            allowed_repo_paths = [
-                r["local_path"] for r in all_repos
-                if r.get("local_path") and r["id"] == req.repo_id
-            ]
+            granted_repos = [r for r in all_repos if r["id"] == req.repo_id]
         else:
-            allowed_repo_paths = [r["local_path"] for r in all_repos if r.get("local_path")]
+            granted_repos = all_repos
+        allowed_repo_paths = [r["local_path"] for r in granted_repos if r.get("local_path")]
+        # Repos the user is granted but that have never synced successfully —
+        # distinct from "no permission" so tools can report the real cause.
+        unsynced_repo_names = [r["name"] for r in granted_repos if not r.get("local_path")]
 
         try:
             async for event in agent.run(
                 messages,
                 active_skills=req.active_skills,
                 allowed_repo_paths=allowed_repo_paths,
+                unsynced_repo_names=unsynced_repo_names,
             ):
                 if event.type == "text_delta":
                     full_text += event.data["text"]

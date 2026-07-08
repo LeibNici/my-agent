@@ -59,11 +59,13 @@ class RepoCreate(BaseModel):
     name: str
     url: str
     description: str = ""
+    branch: str | None = None  # None/empty = clone the remote's default branch
 
 class RepoUpdate(BaseModel):
     name: str | None = None
     url: str | None = None
     description: str | None = None
+    branch: str | None = None
 
 
 # --- Admin: Permissions ---

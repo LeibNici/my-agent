@@ -4,99 +4,232 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Login — My Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Public+Sans:wght@400;500;600;700&family=Source+Serif+4:ital,wght@1,400;1,500&display=swap">
+    <link rel="stylesheet" href="/static/style.css">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; height: 100dvh; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a2e;
-            color: #e0e0e0;
-            height: 100vh;
-            height: 100dvh;
+            overflow: hidden;
+            display: flex;
+        }
+
+        /* ===== Left: ambient system panel (hidden on mobile) ===== */
+        .system-panel {
+            width: 44%;
+            min-width: 380px;
+            background: var(--ink-950);
+            border-right: 1px solid var(--line);
+            padding: 48px 40px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .system-panel .brand {
+            font-family: var(--font-display);
+            font-weight: 800;
+            font-size: 15px;
+            letter-spacing: 0.02em;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .system-panel .brand::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            border-radius: 2px;
+            background: var(--moss);
+            box-shadow: 0 0 0 3px var(--moss-dim);
+        }
+
+        .log {
+            font-family: var(--font-mono);
+            font-size: 13px;
+            line-height: 2.1;
+            color: var(--faint);
+        }
+
+        .log .line {
+            opacity: 0;
+            transform: translateY(4px);
+            animation: logIn 0.4s ease forwards;
+            white-space: pre;
+        }
+
+        .log .line:nth-child(1) { animation-delay: 0.1s; }
+        .log .line:nth-child(2) { animation-delay: 0.5s; }
+        .log .line:nth-child(3) { animation-delay: 0.9s; }
+        .log .line:nth-child(4) { animation-delay: 1.3s; }
+        .log .line:nth-child(5) { animation-delay: 1.7s; }
+
+        @keyframes logIn {
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .log .ok { color: var(--moss); }
+        .log .pending { color: var(--amber); }
+        .log .path { color: var(--paper); }
+
+        .log .cursor {
+            display: inline-block;
+            width: 7px;
+            height: 14px;
+            background: var(--moss);
+            margin-left: 2px;
+            vertical-align: -2px;
+            animation: blink 1.1s step-end infinite;
+        }
+
+        .system-panel .foot {
+            font-family: var(--font-display);
+            font-size: 11px;
+            color: var(--faint);
+            letter-spacing: 0.04em;
+        }
+
+        /* ===== Right: the actual form ===== */
+        .form-panel {
+            flex: 1;
             display: flex;
             align-items: center;
             justify-content: center;
+            padding: 24px;
+            background: var(--ink-900);
         }
+
         .login-card {
-            background: #16213e;
-            border-radius: 16px;
-            padding: 40px;
-            width: 380px;
-            max-width: 90vw;
-            border: 1px solid #2a2a4a;
+            width: 360px;
+            max-width: 100%;
         }
+
         .login-card h1 {
-            text-align: center;
-            margin-bottom: 8px;
-            font-size: 24px;
+            font-family: var(--font-serif);
+            font-style: italic;
+            font-weight: 500;
+            font-size: 30px;
+            color: var(--paper);
+            margin-bottom: 6px;
+            letter-spacing: -0.01em;
         }
-        .login-card p {
-            text-align: center;
-            color: #a0a0b0;
-            margin-bottom: 30px;
+
+        .login-card .sub {
+            font-family: var(--font-body);
+            color: var(--mute);
+            margin-bottom: 32px;
             font-size: 14px;
         }
+
         .form-group {
             margin-bottom: 18px;
         }
+
         .form-group label {
             display: block;
             margin-bottom: 6px;
-            font-size: 14px;
-            color: #a0a0b0;
+            font-family: var(--font-display);
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--faint);
         }
+
         .form-group input {
             width: 100%;
             padding: 12px 14px;
-            background: #1a1a2e;
-            border: 1px solid #2a2a4a;
-            border-radius: 10px;
-            color: #e0e0e0;
+            background: var(--ink-950);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            color: var(--paper);
+            font-family: var(--font-body);
             font-size: 15px;
             outline: none;
-            transition: border-color 0.2s;
+            transition: border-color 0.15s;
         }
-        .form-group input:focus { border-color: #e94560; }
+
+        .form-group input:focus { border-color: var(--moss); }
+
         .login-btn {
             width: 100%;
             padding: 14px;
-            background: #e94560;
-            color: white;
+            background: var(--moss);
+            color: var(--ink-950);
             border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 600;
+            border-radius: 8px;
+            font-family: var(--font-body);
+            font-size: 15px;
+            font-weight: 700;
             cursor: pointer;
-            transition: background 0.2s;
+            transition: background 0.15s, transform 0.1s;
             margin-top: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
         }
-        .login-btn:hover { background: #ff6b81; }
-        .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .login-btn::before {
+            content: "$";
+            font-family: var(--font-mono);
+            font-weight: 700;
+            opacity: 0.55;
+        }
+
+        .login-btn:hover { background: var(--accent-hover); }
+        .login-btn:active { transform: scale(0.99); }
+        .login-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
         .error-msg {
-            color: #ff6b6b;
+            color: var(--rust);
+            font-family: var(--font-body);
             font-size: 13px;
-            margin-top: 12px;
+            margin-top: 14px;
             text-align: center;
             min-height: 20px;
+        }
+
+        @media (max-width: 760px) {
+            .system-panel { display: none; }
+            .form-panel { width: 100%; }
         }
     </style>
 </head>
 <body>
-    <div class="login-card">
-        <h1>💬 My Agent</h1>
-        <p>登录以开始使用</p>
-        <form onsubmit="handleLogin(event)">
-            <div class="form-group">
-                <label>用户名</label>
-                <input type="text" id="username" autofocus required>
-            </div>
-            <div class="form-group">
-                <label>密码</label>
-                <input type="password" id="password" required>
-            </div>
-            <button type="submit" class="login-btn" id="login-btn">登录</button>
-            <div class="error-msg" id="error-msg"></div>
-        </form>
-    </div>
+    <aside class="system-panel">
+        <div class="brand">my_agent</div>
+        <div class="log">
+            <div class="line">tools registered <span class="path">file_reader, code_search, calculator, web_search, draft_issue</span></div>
+            <div class="line">repositories <span class="pending">syncing…</span></div>
+            <div class="line">repositories <span class="ok">synced</span></div>
+            <div class="line">access is scoped per repository <span class="ok">✓</span></div>
+            <div class="line">awaiting authentication<span class="cursor"></span></div>
+        </div>
+        <div class="foot">internal · permissioned · tool-use enabled</div>
+    </aside>
+
+    <main class="form-panel">
+        <div class="login-card">
+            <h1>Welcome back.</h1>
+            <p class="sub">登录以进入你的工作区</p>
+            <form onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label for="username">用户名</label>
+                    <input type="text" id="username" autofocus required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">密码</label>
+                    <input type="password" id="password" required autocomplete="current-password">
+                </div>
+                <button type="submit" class="login-btn" id="login-btn">登录</button>
+                <div class="error-msg" id="error-msg"></div>
+            </form>
+        </div>
+    </main>
+
     <script>
     async function handleLogin(e) {
         e.preventDefault();

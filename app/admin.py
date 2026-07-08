@@ -66,14 +66,11 @@ async def api_list_repos():
 
 @router.post("/repos")
 async def api_create_repo(req: RepoCreate):
-    repo_id = await create_repo(req.name, req.url, req.description)
-    # Auto-sync: clone the repo in the background
-    from app.repo_sync import sync_repo
-    from app.database import update_repo
-    success, msg, local_path = await sync_repo(req.url, repo_id)
-    if success:
-        await update_repo(repo_id, local_path=local_path)
-    return {"id": repo_id, "name": req.name, "url": req.url, "synced": success, "sync_message": msg}
+    repo_id = await create_repo(req.name, req.url, req.description, branch=req.branch)
+    # Clone the repo now (blocking — bounded by repo_sync's git timeout)
+    from app.repo_sync import sync_and_persist
+    success, msg = await sync_and_persist(repo_id, req.url, req.branch)
+    return {"id": repo_id, "name": req.name, "url": req.url, "branch": req.branch, "synced": success, "sync_message": msg}
 
 
 @router.patch("/repos/{repo_id}")
@@ -81,13 +78,25 @@ async def api_update_repo(repo_id: int, req: RepoUpdate):
     repo = await get_repo(repo_id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
-    await update_repo(repo_id, name=req.name, url=req.url, description=req.description)
-    # If URL changed, resync the repo
-    if req.url and req.url != repo["url"]:
-        from app.repo_sync import sync_repo
-        success, msg, local_path = await sync_repo(req.url, repo_id)
-        if success:
-            await update_repo(repo_id, local_path=local_path)
+
+    # Cosmetic fields are safe to update immediately regardless of sync outcome.
+    await update_repo(repo_id, name=req.name, description=req.description)
+
+    url_changed = req.url is not None and req.url != repo["url"]
+    branch_changed = req.branch is not None and req.branch != (repo.get("branch") or "")
+    if url_changed or branch_changed:
+        from app.repo_sync import sync_and_persist
+        sync_url = req.url if req.url is not None else repo["url"]
+        sync_branch = req.branch if req.branch is not None else repo.get("branch")
+        success, msg = await sync_and_persist(repo_id, sync_url, sync_branch, force_reclone=True)
+        if not success:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Repo record kept unchanged — resync with the new url/branch failed: {msg}",
+            )
+        # Only commit the new url/branch once the resync actually succeeded, so
+        # the DB never describes a repo/branch that isn't what's actually on disk.
+        await update_repo(repo_id, url=req.url, branch=req.branch)
     return {"ok": True}
 
 
@@ -98,6 +107,17 @@ async def api_delete_repo(repo_id: int):
         raise HTTPException(status_code=404, detail="Repo not found")
     await delete_repo(repo_id)
     return {"ok": True}
+
+
+@router.post("/repos/{repo_id}/sync")
+async def api_sync_repo(repo_id: int):
+    """Manually trigger an immediate sync for one repo."""
+    repo = await get_repo(repo_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+    from app.repo_sync import sync_and_persist
+    success, msg = await sync_and_persist(repo_id, repo["url"], repo.get("branch"))
+    return {"ok": success, "message": msg}
 
 
 # ==================== Permissions ====================

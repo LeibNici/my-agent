@@ -40,7 +40,7 @@ document.addEventListener("DOMContentLoaded", () => {
         userInfo.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:13px;color:var(--text-secondary)";
 
         const nameSpan = document.createElement("span");
-        nameSpan.textContent = `👤 ${_user.username}`;
+        nameSpan.textContent = _user.username;
 
         const logoutBtn = document.createElement("button");
         logoutBtn.textContent = "退出";
@@ -202,8 +202,8 @@ async function deleteSession(sessionId) {
         currentSessionId = null;
         document.getElementById("messages").innerHTML = `
             <div class="welcome-message">
-                <h1>👋 Hello!</h1>
-                <p>Select a skill and start chatting.</p>
+                <h1>Where should we start?</h1>
+                <p>Choose a repo and a skill on the left, or just start typing.</p>
             </div>
         `;
     }
@@ -218,8 +218,8 @@ function newChat() {
     currentSessionId = null;
     document.getElementById("messages").innerHTML = `
         <div class="welcome-message">
-            <h1>👋 Hello!</h1>
-            <p>Select a skill and start chatting.</p>
+            <h1>Where should we start?</h1>
+            <p>Choose a repo and a skill on the left, or just start typing.</p>
         </div>
     `;
     loadSessions();
@@ -348,7 +348,7 @@ async function sendMessage() {
                             contentEl.innerHTML = renderMarkdown(fullText);
                         }
                     } else if (eventType === "error") {
-                        contentEl.innerHTML += `<p style="color:var(--error)">⚠️ ${escapeHtml(data.message)}</p>`;
+                        contentEl.innerHTML += `<p style="color:var(--error)">${escapeHtml(data.message)}</p>`;
                     }
                     // Reset eventType after processing data
                     eventType = "message";
@@ -366,7 +366,7 @@ async function sendMessage() {
         } else {
             const typing = contentEl.querySelector(".typing-indicator");
             if (typing) typing.remove();
-            contentEl.innerHTML += `<p style="color:var(--error)">⚠️ ${escapeHtml(err.message)}</p>`;
+            contentEl.innerHTML += `<p style="color:var(--error)">${escapeHtml(err.message)}</p>`;
         }
     }
 
@@ -382,7 +382,7 @@ function appendUserMessage(text) {
     const div = document.createElement("div");
     div.className = "message user";
     div.innerHTML = `
-        <div class="message-header">🧑 You</div>
+        <div class="message-header">You</div>
         <div class="message-content">${renderMarkdown(text)}</div>
     `;
     messagesDiv.appendChild(div);
@@ -396,7 +396,7 @@ function appendAssistantBubble() {
 
     const header = document.createElement("div");
     header.className = "message-header";
-    header.innerHTML = "🤖 Agent";
+    header.innerHTML = "Agent";
 
     const contentEl = document.createElement("div");
     contentEl.className = "message-content";
@@ -430,7 +430,7 @@ function appendAssistantMessage(content) {
         });
     }
 
-    div.innerHTML = `<div class="message-header">🤖 Agent</div>`;
+    div.innerHTML = `<div class="message-header">Agent</div>`;
     div.appendChild(contentEl);
     messagesDiv.appendChild(div);
     scrollToBottom();
@@ -442,16 +442,15 @@ function appendToolBlock(container, name, input, result) {
     if (typing) typing.remove();
 
     const block = document.createElement("div");
-    block.className = "tool-block";
+    block.className = "tool-block" + (result !== null ? " tool-block--ok" : "");
     block.dataset.toolName = name;
 
     const toolHeader = document.createElement("div");
     toolHeader.className = "tool-header";
     toolHeader.onclick = () => toolBody.classList.toggle("open");
     toolHeader.innerHTML = `
-        <span class="tool-icon">⚙️</span>
         <span class="tool-name">${escapeHtml(name)}</span>
-        <span class="tool-status">${result !== null ? "✅" : "⏳"}</span>
+        <span class="tool-status">${result !== null ? "done" : "running"}</span>
     `;
 
     const toolBody = document.createElement("div");
@@ -481,8 +480,9 @@ function updateToolResult(container, name, result) {
             const resultText = block.querySelector(".tool-result-text");
             if (resultText && resultText.textContent === "Running...") {
                 resultText.textContent = truncate(result, 1000);
+                block.classList.add("tool-block--ok");
                 const status = block.querySelector(".tool-status");
-                if (status) status.textContent = "✅";
+                if (status) status.textContent = "done";
                 return;
             }
         }
@@ -542,14 +542,13 @@ function appendIssueCard(container, draft) {
 
     card.innerHTML = `
         <div class="issue-header">
-            <span class="issue-icon">📋</span>
             <span class="issue-title">${escapeHtml(draft.title)}</span>
         </div>
         <div class="issue-body">${renderMarkdown(draft.body)}</div>
         <div class="issue-labels">${labelsHtml}</div>
         <div class="issue-actions">
-            <button class="btn-confirm" onclick="submitIssue(this)">✅ 确认提交</button>
-            <button class="btn-cancel" onclick="this.parentElement.parentElement.querySelector('.issue-status').textContent='已取消'; this.disabled=true; this.previousElementSibling.disabled=true;">❌ 取消</button>
+            <button class="btn-confirm" onclick="submitIssue(this)">确认提交</button>
+            <button class="btn-cancel" onclick="this.parentElement.parentElement.querySelector('.issue-status').textContent='已取消'; this.disabled=true; this.previousElementSibling.disabled=true;">取消</button>
             <span class="issue-status"></span>
         </div>
     `;
@@ -572,7 +571,7 @@ async function submitIssue(btn) {
     statusEl.textContent = "提交中...";
 
     if (!selectedRepoId) {
-        statusEl.textContent = "❌ 请先选择一个仓库";
+        statusEl.textContent = "请先选择一个仓库";
         statusEl.style.color = "var(--error)";
         confirmBtn.disabled = false;
         cancelBtn.disabled = false;
@@ -593,7 +592,7 @@ async function submitIssue(btn) {
 
         const result = await resp.json();
         if (!resp.ok) {
-            statusEl.textContent = `❌ ${result.detail || "提交失败"}`;
+            statusEl.textContent = result.detail || "提交失败";
             statusEl.style.color = "var(--error)";
             confirmBtn.disabled = false;
             cancelBtn.disabled = false;
@@ -601,7 +600,7 @@ async function submitIssue(btn) {
         }
 
         // Use textContent for safety, build link element manually
-        statusEl.textContent = "✅ 已提交 ";
+        statusEl.textContent = "已提交 ";
         const link = document.createElement("a");
         link.href = result.issue_url;
         link.target = "_blank";
@@ -610,7 +609,7 @@ async function submitIssue(btn) {
         statusEl.appendChild(link);
         statusEl.style.color = "var(--success)";
     } catch (err) {
-        statusEl.textContent = `❌ 网络错误: ${escapeHtml(err.message)}`;
+        statusEl.textContent = `网络错误: ${escapeHtml(err.message)}`;
         statusEl.style.color = "var(--error)";
         confirmBtn.disabled = false;
         cancelBtn.disabled = false;

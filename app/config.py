@@ -63,6 +63,7 @@ class AppSettings(BaseSettings):
     admin_password: str = "admin123"  # change after first login!
     repos_dir: str = "/tmp/agent-repos"
     github_token: str = ""  # GitHub API token for issue submission
+    repo_sync_interval_minutes: int = 10  # 0 disables periodic background sync
 
     model_config = {
         "env_file": ".env",
