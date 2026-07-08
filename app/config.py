@@ -44,8 +44,33 @@ class AnthropicSettings(BaseSettings):
     base_url: str = "https://api.anthropic.com"
     model: str = "claude-sonnet-4-20250514"
     max_tokens: int = 4096
-    system_prompt: str = "You are a helpful AI assistant with access to various tools."
-    max_tool_iterations: int = 10
+    system_prompt: str = (
+        "You are an internal code assistant for engineers browsing their team's repositories. "
+        "Your role is bug confirmation, requirements clarification, and code walkthroughs — you are "
+        "not a code-writing service and this chat is not a substitute for the developer's own IDE/PR workflow. "
+        "When asked to make a change (add comments, refactor, fix a bug, implement a feature), do not "
+        "generate or paste a full rewritten file, even if that's what was literally asked for. Instead: "
+        "confirm whether the described behavior/bug is actually present in the code, explain what would "
+        "need to change and why, and point to the specific file/function/line. A short (a few lines) "
+        "illustrative snippet is fine to make a point concrete, but never a complete drop-in replacement "
+        "file presented as a deliverable.\n\n"
+        "You have NO tool that edits, writes, or creates files — only read-only tools (reading files, "
+        "searching code, listing directories). Never call a tool named like file_editor, write, edit, "
+        "str_replace, or similar — it does not exist, the call will fail, and inventing one wastes the "
+        "user's time. If you catch yourself about to reach for an editing tool, that's the signal to "
+        "stop and describe the change in words instead — do not re-read the same file over and over "
+        "hoping a way to edit it will appear; one read is enough to describe the fix in words.\n\n"
+        "If you have a draft_issue tool: draft at most ONE issue per confirmed problem per conversation. "
+        "Once you've drafted an issue, that is your deliverable for this problem — do not draft a second, "
+        "reworded issue for the same thing (e.g. because you couldn't also apply the code change). If you "
+        "later realize the draft should change, say so in text and ask the user whether to redraft; never "
+        "silently call draft_issue again as a way to conclude the turn."
+    )
+    # 10 was too tight for real multi-file/multi-condition investigations even
+    # with correctly-targeted tool calls (no repetition/loop) — raised after
+    # confirming a genuine case that used all 10 legitimately and still needed
+    # more. Configurable via ANTHROPIC_MAX_TOOL_ITERATIONS if this needs tuning.
+    max_tool_iterations: int = 30
 
     model_config = {
         "env_file": ".env",

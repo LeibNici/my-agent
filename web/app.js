@@ -28,6 +28,11 @@ let activeSkills = [];
 let selectedRepoId = null;
 let isStreaming = false;
 let currentAbortController = null;
+let pendingImages = []; // { mediaType, data (base64, no prefix), previewUrl (data URL) }
+
+const MAX_IMAGES_PER_MESSAGE = 5;
+const MAX_IMAGE_BYTES = 4_500_000; // matches the server's ~4.5MB decoded cap
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
 // ===== Init =====
 document.addEventListener("DOMContentLoaded", () => {
@@ -54,6 +59,16 @@ document.addEventListener("DOMContentLoaded", () => {
     loadRepos();
     loadSkills();
     loadSessions();
+
+    const inputArea = document.getElementById("input-area");
+    if (inputArea) {
+        inputArea.addEventListener("dragover", (e) => e.preventDefault());
+        inputArea.addEventListener("drop", (e) => {
+            e.preventDefault();
+            const files = e.dataTransfer && e.dataTransfer.files;
+            if (files) Array.from(files).filter(f => f.type.startsWith("image/")).forEach(addImageFile);
+        });
+    }
 });
 
 // ===== Escape key to cancel stream =====
@@ -97,8 +112,8 @@ async function loadRepos() {
 
     repos.forEach(r => {
         const chip = document.createElement("button");
-        chip.className = "skill-chip";
-        chip.textContent = r.name;
+        chip.className = "repo-chip";
+        chip.innerHTML = `<span class="repo-branch">${escapeHtml(r.branch || "main")}</span><span class="repo-name">${escapeHtml(r.name)}</span>`;
         chip.title = r.url;
         chip.dataset.repoId = r.id;
         chip.onclick = () => selectRepo(chip, r.id);
@@ -108,7 +123,7 @@ async function loadRepos() {
 
 function selectRepo(chip, repoId) {
     // Toggle selection (only one repo at a time)
-    document.querySelectorAll("#repos-list .skill-chip").forEach(c => c.classList.remove("active"));
+    document.querySelectorAll("#repos-list .repo-chip").forEach(c => c.classList.remove("active"));
     if (selectedRepoId === repoId) {
         selectedRepoId = null;
     } else {
@@ -153,18 +168,40 @@ async function loadSessions() {
 
     sessions.forEach(s => {
         const item = document.createElement("div");
-        item.className = "session-item" + (s.id === currentSessionId ? " active" : "");
+        item.className = "session-item"
+            + (s.id === currentSessionId ? " active" : "")
+            + (s.resolved_at ? " resolved" : "");
+        if (s.resolved_at) item.title = "已提交 issue，本会话已完结";
+
+        const info = document.createElement("div");
+        info.className = "session-info";
 
         const title = document.createElement("span");
         title.className = "session-title";
         title.textContent = s.title;
+
+        const idSpan = document.createElement("span");
+        idSpan.className = "session-id";
+        idSpan.textContent = s.id;
+        idSpan.title = "点击复制会话 ID，用于追踪/反馈问题";
+        idSpan.onclick = (e) => {
+            e.stopPropagation();
+            navigator.clipboard.writeText(s.id).then(() => {
+                const original = idSpan.textContent;
+                idSpan.textContent = "已复制";
+                setTimeout(() => { idSpan.textContent = original; }, 1000);
+            });
+        };
+
+        info.appendChild(title);
+        info.appendChild(idSpan);
 
         const delBtn = document.createElement("button");
         delBtn.className = "delete-btn";
         delBtn.textContent = "×";
         delBtn.onclick = (e) => { e.stopPropagation(); deleteSession(s.id); };
 
-        item.appendChild(title);
+        item.appendChild(info);
         item.appendChild(delBtn);
         item.onclick = () => openSession(s.id);
         container.appendChild(item);
@@ -185,13 +222,42 @@ async function openSession(sessionId) {
     const messagesDiv = document.getElementById("messages");
     messagesDiv.innerHTML = "";
 
+    // Tool results are persisted as separate "user"-role bookkeeping messages
+    // (tool_use_id -> content) rather than attached to the assistant's
+    // tool_use block itself — map them up front so each tool_use can show
+    // what it actually returned (needed to reconstruct issue_draft cards).
+    const toolResults = {};
     data.messages.forEach(msg => {
-        if (msg.role === "user") {
-            appendUserMessage(typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content));
-        } else if (msg.role === "assistant") {
-            appendAssistantMessage(msg.content);
+        if (msg.role === "user" && Array.isArray(msg.content)) {
+            msg.content.forEach(block => {
+                if (block.type === "tool_result") toolResults[block.tool_use_id] = block.content;
+            });
         }
     });
+
+    // Match a drafted issue to its real outcome primarily by the draft_issue
+    // tool_use id (stable, collision-free) — title is kept only as a fallback
+    // for rows recorded before draft_tool_use_id existed, since two drafts in
+    // one session can otherwise share a title and reconcile to the wrong card.
+    const submissionsById = {};
+    const submissionsByTitle = {};
+    (data.issue_submissions || []).forEach(s => {
+        if (s.draft_tool_use_id) submissionsById[s.draft_tool_use_id] = s;
+        else submissionsByTitle[s.title] = s;
+    });
+
+    data.messages.forEach(msg => {
+        if (msg.role === "user") {
+            // Pure tool-result relay messages have no standalone bubble —
+            // they're shown via the paired tool_use block above.
+            if (Array.isArray(msg.content) && msg.content.length && msg.content.every(b => b.type === "tool_result")) return;
+            appendUserMessage(msg.content);
+        } else if (msg.role === "assistant") {
+            appendAssistantMessage(msg.content, toolResults, submissionsById, submissionsByTitle);
+        }
+    });
+
+    if (data.session && data.session.resolved_at) appendResolvedNotice();
 
     loadSessions(); // refresh active highlight
 }
@@ -238,10 +304,17 @@ function autoResize(textarea) {
     textarea.style.height = Math.min(textarea.scrollHeight, 150) + "px";
 }
 
+function fillExample(btn) {
+    const input = document.getElementById("message-input");
+    input.value = btn.textContent;
+    autoResize(input);
+    input.focus();
+}
+
 async function sendMessage() {
     const input = document.getElementById("message-input");
     const text = input.value.trim();
-    if (!text || isStreaming) return;
+    if ((!text && pendingImages.length === 0) || isStreaming) return;
 
     // Validate message size
     if (text.length > 10000) {
@@ -254,15 +327,24 @@ async function sendMessage() {
     const welcome = messagesDiv.querySelector(".welcome-message");
     if (welcome) welcome.remove();
 
-    // Show user message
-    appendUserMessage(text);
+    const imagesToSend = pendingImages.map(img => ({ media_type: img.mediaType, data: img.data }));
+
+    // Show user message (images + text, matching what's actually sent)
+    const userContent = imagesToSend.length
+        ? [
+            ...imagesToSend.map(img => ({ type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } })),
+            ...(text ? [{ type: "text", text }] : []),
+          ]
+        : text;
+    appendUserMessage(userContent);
     input.value = "";
     input.style.height = "auto";
+    clearPendingImages();
 
     // Send
     isStreaming = true;
     currentAbortController = new AbortController();
-    document.getElementById("send-btn").disabled = true;
+    setSendButtonState("stop");
 
     // Create assistant bubble
     const { bubble, contentEl } = appendAssistantBubble();
@@ -276,6 +358,7 @@ async function sendMessage() {
                 message: text,
                 active_skills: activeSkills,
                 repo_id: selectedRepoId,
+                images: imagesToSend,
             }),
             signal: currentAbortController.signal,
         });
@@ -295,6 +378,17 @@ async function sendMessage() {
         let buffer = "";
         let fullText = "";
         let eventType = "message";
+        // Text arrives in runs separated by tool calls (preamble, then tool
+        // calls, then a final answer, etc). Each run gets its own element
+        // appended after whatever came before it, so later tool blocks or
+        // text never overwrite earlier ones.
+        const textRuns = []; // [{el, text}]
+        let activeRun = null;
+        // Every tool call for this message collapses into ONE group, pinned
+        // as the last element in the bubble — text always gets inserted
+        // before it, so the reply reads as continuous prose with the tool
+        // activity log tucked at the end instead of interrupting it.
+        let messageToolGroup = null;
 
         while (true) {
             const { done, value } = await reader.read();
@@ -316,38 +410,75 @@ async function sendMessage() {
                     let data;
                     try { data = JSON.parse(dataStr); } catch { continue; }
 
-                    if (eventType === "text") {
+                    if (eventType === "session") {
+                        // Fires once, right at the start of the turn — learn the
+                        // real session_id well before "done", so an issue-draft
+                        // card rendered mid-turn can be submitted against the
+                        // right session even if the user confirms immediately.
+                        if (data.session_id) currentSessionId = data.session_id;
+                    } else if (eventType === "text") {
+                        if (!activeRun) {
+                            hideThinking(contentEl);
+                            const el = document.createElement("div");
+                            el.className = "text-run";
+                            // Keep text ahead of the (single) tool group rather
+                            // than appending after it — the log stays pinned
+                            // at the end no matter how many more tool calls follow.
+                            if (messageToolGroup) {
+                                contentEl.insertBefore(el, messageToolGroup.el);
+                            } else {
+                                contentEl.appendChild(el);
+                            }
+                            activeRun = { el, text: "" };
+                            textRuns.push(activeRun);
+                        }
+                        activeRun.text += data.text;
                         fullText += data.text;
                         // During streaming: show plain text (avoids broken partial markdown)
-                        contentEl.innerHTML = escapeHtml(fullText).replace(/\n/g, "<br>");
+                        activeRun.el.innerHTML = escapeHtml(activeRun.text).replace(/\n/g, "<br>");
                         scrollToBottom();
                     } else if (eventType === "tool_use") {
-                        appendToolBlock(contentEl, data.name, data.input, null);
+                        activeRun = null; // any further text starts a new run, still inserted before the tool group
+                        if (!messageToolGroup) {
+                            hideThinking(contentEl);
+                            messageToolGroup = createToolGroup(contentEl);
+                        }
+                        messageToolGroup.total++;
+                        messageToolGroup.counts[data.name] = (messageToolGroup.counts[data.name] || 0) + 1;
+                        updateToolGroupSummary(messageToolGroup);
+                        appendToolBlock(messageToolGroup.bodyEl, data.name, data.input, null);
                         scrollToBottom();
                     } else if (eventType === "tool_result") {
-                        updateToolResult(contentEl, data.name, data.result);
+                        if (messageToolGroup) {
+                            updateToolResult(messageToolGroup.bodyEl, data.name, data.result);
+                            messageToolGroup.done++;
+                            updateToolGroupSummary(messageToolGroup);
+                        }
                         // Detect issue draft and render confirmation card
                         if (data.name === "draft_issue") {
                             try {
                                 const draft = JSON.parse(data.result);
                                 if (draft.type === "issue_draft") {
-                                    appendIssueCard(contentEl, draft);
+                                    appendIssueCard(contentEl, draft, null, data.id);
                                 }
                             } catch {}
                         }
+                        // The model may take a while to start its next step (another
+                        // tool call, or the final answer) — show a visible "still
+                        // working" cue instead of going silent until it does.
+                        showThinking(contentEl);
                         scrollToBottom();
                     } else if (eventType === "done") {
                         if (data.session_id) {
                             currentSessionId = data.session_id;
                         }
-                        // Remove typing indicator
-                        const typing = contentEl.querySelector(".typing-indicator");
-                        if (typing) typing.remove();
-                        // Now render the complete markdown properly
-                        if (fullText) {
-                            contentEl.innerHTML = renderMarkdown(fullText);
+                        hideThinking(contentEl);
+                        // Now render each text run as complete markdown, in place
+                        for (const run of textRuns) {
+                            run.el.innerHTML = renderMarkdown(run.text);
                         }
                     } else if (eventType === "error") {
+                        hideThinking(contentEl);
                         contentEl.innerHTML += `<p style="color:var(--error)">${escapeHtml(data.message)}</p>`;
                     }
                     // Reset eventType after processing data
@@ -359,31 +490,144 @@ async function sendMessage() {
             }
         }
     } catch (err) {
+        hideThinking(contentEl);
         if (err.name === "AbortError") {
-            const typing = contentEl.querySelector(".typing-indicator");
-            if (typing) typing.remove();
             contentEl.innerHTML += `<p style="color:var(--text-secondary)">⏹ Stream cancelled</p>`;
         } else {
-            const typing = contentEl.querySelector(".typing-indicator");
-            if (typing) typing.remove();
             contentEl.innerHTML += `<p style="color:var(--error)">${escapeHtml(err.message)}</p>`;
         }
     }
 
     isStreaming = false;
     currentAbortController = null;
-    document.getElementById("send-btn").disabled = false;
+    setSendButtonState("send");
     loadSessions();
 }
 
+function setSendButtonState(state) {
+    const btn = document.getElementById("send-btn");
+    if (state === "stop") {
+        btn.textContent = "■ Stop";
+        btn.classList.add("stop-state");
+        btn.onclick = stopStreaming;
+        btn.disabled = false;
+    } else {
+        btn.textContent = "Send";
+        btn.classList.remove("stop-state");
+        btn.onclick = sendMessage;
+        btn.disabled = false;
+    }
+}
+
+function stopStreaming() {
+    if (currentAbortController) {
+        currentAbortController.abort();
+    }
+}
+
+// ===== Image attachments =====
+function showChatNotice(text) {
+    const el = document.getElementById("chat-notice");
+    el.textContent = text;
+    setTimeout(() => { if (el.textContent === text) el.textContent = ""; }, 4000);
+}
+
+function addImageFile(file) {
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+        showChatNotice(`Unsupported image type: ${file.type || "unknown"}`);
+        return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+        showChatNotice(`Image too large (max ${Math.round(MAX_IMAGE_BYTES / 1_000_000)}MB): ${file.name}`);
+        return;
+    }
+    if (pendingImages.length >= MAX_IMAGES_PER_MESSAGE) {
+        showChatNotice(`Max ${MAX_IMAGES_PER_MESSAGE} images per message`);
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+        const dataUrl = reader.result;
+        const base64Data = dataUrl.slice(dataUrl.indexOf(",") + 1);
+        pendingImages.push({ mediaType: file.type, data: base64Data, previewUrl: dataUrl });
+        renderImagePreviews();
+    };
+    reader.readAsDataURL(file);
+}
+
+function renderImagePreviews() {
+    const strip = document.getElementById("image-preview-strip");
+    strip.innerHTML = pendingImages.map((img, i) => `
+        <div class="image-preview-item">
+            <img src="${img.previewUrl}" alt="pending image">
+            <button class="remove-btn" onclick="removePendingImage(${i})" title="Remove">×</button>
+        </div>
+    `).join("");
+}
+
+function removePendingImage(index) {
+    pendingImages.splice(index, 1);
+    renderImagePreviews();
+}
+
+function clearPendingImages() {
+    pendingImages = [];
+    renderImagePreviews();
+}
+
+function handleImageFilesSelected(fileList) {
+    Array.from(fileList).forEach(addImageFile);
+    document.getElementById("image-file-input").value = "";
+}
+
+function handlePaste(event) {
+    const items = event.clipboardData && event.clipboardData.items;
+    if (!items) return;
+    let handledImage = false;
+    for (const item of items) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+            const file = item.getAsFile();
+            if (file) {
+                addImageFile(file);
+                handledImage = true;
+            }
+        }
+    }
+    if (handledImage) event.preventDefault();
+}
+
 // ===== DOM Helpers =====
-function appendUserMessage(text) {
+// Only valid base64 characters — guarantees nothing here can break out of
+// the src="..." attribute (quotes/angle-brackets aren't valid base64), and
+// rejects malformed data instead of silently interpolating it.
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function renderUserContent(content) {
+    if (typeof content === "string") return renderMarkdown(content);
+    if (Array.isArray(content)) {
+        return content.map(block => {
+            if (block.type === "image" && block.source && block.source.data) {
+                const mediaType = escapeHtml(block.source.media_type || "image/png");
+                const data = block.source.data;
+                if (typeof data !== "string" || !BASE64_RE.test(data)) {
+                    return `<div class="msg-image-error">[图片数据无效，无法显示]</div>`;
+                }
+                return `<img class="msg-image" src="data:${mediaType};base64,${data}" alt="attached image">`;
+            }
+            if (block.type === "text") return renderMarkdown(block.text || "");
+            return "";
+        }).join("");
+    }
+    return renderMarkdown(JSON.stringify(content));
+}
+
+function appendUserMessage(content) {
     const messagesDiv = document.getElementById("messages");
     const div = document.createElement("div");
     div.className = "message user";
     div.innerHTML = `
         <div class="message-header">You</div>
-        <div class="message-content">${renderMarkdown(text)}</div>
+        <div class="message-content">${renderUserContent(content)}</div>
     `;
     messagesDiv.appendChild(div);
     scrollToBottom();
@@ -410,7 +654,20 @@ function appendAssistantBubble() {
     return { bubble: div, contentEl };
 }
 
-function appendAssistantMessage(content) {
+function showThinking(container) {
+    if (container.querySelector(".typing-indicator")) return; // already showing
+    const indicator = document.createElement("div");
+    indicator.className = "typing-indicator";
+    indicator.innerHTML = "<span></span><span></span><span></span>";
+    container.appendChild(indicator);
+}
+
+function hideThinking(container) {
+    const typing = container.querySelector(".typing-indicator");
+    if (typing) typing.remove();
+}
+
+function appendAssistantMessage(content, toolResults = {}, submissionsById = {}, submissionsByTitle = {}) {
     const messagesDiv = document.getElementById("messages");
     const div = document.createElement("div");
     div.className = "message assistant";
@@ -425,7 +682,17 @@ function appendAssistantMessage(content) {
             if (block.type === "text") {
                 contentEl.innerHTML += renderMarkdown(block.text || "");
             } else if (block.type === "tool_use") {
-                appendToolBlock(contentEl, block.name, block.input, "completed");
+                const result = toolResults[block.id];
+                appendToolBlock(contentEl, block.name, block.input, result !== undefined ? result : "completed");
+                if (block.name === "draft_issue" && result !== undefined) {
+                    try {
+                        const draft = JSON.parse(result);
+                        if (draft.type === "issue_draft") {
+                            const submission = submissionsById[block.id] || submissionsByTitle[draft.title] || null;
+                            appendIssueCard(contentEl, draft, submission, block.id);
+                        }
+                    } catch {}
+                }
             }
         });
     }
@@ -434,6 +701,40 @@ function appendAssistantMessage(content) {
     div.appendChild(contentEl);
     messagesDiv.appendChild(div);
     scrollToBottom();
+}
+
+function createToolGroup(container) {
+    const group = document.createElement("div");
+    group.className = "tool-group";
+    group.innerHTML = `
+        <div class="tool-group-header" onclick="this.parentElement.classList.toggle('open')">
+            <span class="tool-group-chevron">▸</span>
+            <span class="tool-group-summary"></span>
+            <span class="tool-group-status">running</span>
+        </div>
+        <div class="tool-group-body"></div>
+    `;
+    container.appendChild(group);
+    return {
+        el: group,
+        bodyEl: group.querySelector(".tool-group-body"),
+        summaryEl: group.querySelector(".tool-group-summary"),
+        statusEl: group.querySelector(".tool-group-status"),
+        counts: {},
+        total: 0,
+        done: 0,
+    };
+}
+
+function updateToolGroupSummary(g) {
+    const parts = Object.entries(g.counts).map(([name, n]) => (n > 1 ? `${name} ×${n}` : name));
+    g.summaryEl.textContent = parts.join(", ");
+    if (g.done >= g.total) {
+        g.statusEl.textContent = "done";
+        g.el.classList.add("tool-group--ok");
+    } else {
+        g.statusEl.textContent = `${g.done}/${g.total}`;
+    }
 }
 
 function appendToolBlock(container, name, input, result) {
@@ -532,9 +833,10 @@ function scrollToBottom() {
 }
 
 // ===== Issue Draft Card =====
-function appendIssueCard(container, draft) {
+function appendIssueCard(container, draft, submission = null, toolUseId = null) {
     const card = document.createElement("div");
     card.className = "issue-card";
+    if (toolUseId) card.dataset.toolUseId = toolUseId;
 
     const labelsHtml = (draft.labels || [])
         .map(l => `<span class="issue-label">${escapeHtml(l)}</span>`)
@@ -547,8 +849,8 @@ function appendIssueCard(container, draft) {
         <div class="issue-body">${renderMarkdown(draft.body)}</div>
         <div class="issue-labels">${labelsHtml}</div>
         <div class="issue-actions">
-            <button class="btn-confirm" onclick="submitIssue(this)">确认提交</button>
-            <button class="btn-cancel" onclick="this.parentElement.parentElement.querySelector('.issue-status').textContent='已取消'; this.disabled=true; this.previousElementSibling.disabled=true;">取消</button>
+            <button class="btn-confirm" onclick="submitIssue(this)" ${submission ? "disabled" : ""}>确认提交</button>
+            <button class="btn-cancel" onclick="this.parentElement.parentElement.querySelector('.issue-status').textContent='已取消'; this.disabled=true; this.previousElementSibling.disabled=true;" ${submission ? "disabled" : ""}>取消</button>
             <span class="issue-status"></span>
         </div>
     `;
@@ -556,6 +858,30 @@ function appendIssueCard(container, draft) {
     // Store draft data on the card element
     card.dataset.draft = JSON.stringify(draft);
     container.appendChild(card);
+
+    // Reconciled against the real outcome (issue_submissions) — reflect the
+    // actual filed issue instead of showing an active, re-clickable draft.
+    if (submission) {
+        const statusEl = card.querySelector(".issue-status");
+        statusEl.textContent = "已提交 ";
+        const link = document.createElement("a");
+        link.href = submission.issue_url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = `#${submission.issue_number}`;
+        statusEl.appendChild(link);
+        statusEl.style.color = "var(--success)";
+    }
+
+    scrollToBottom();
+}
+
+function appendResolvedNotice() {
+    const messagesDiv = document.getElementById("messages");
+    const div = document.createElement("div");
+    div.className = "session-resolved-notice";
+    div.textContent = "✅ 本次任务已完结 — 发送新消息将开始一个新会话";
+    messagesDiv.appendChild(div);
     scrollToBottom();
 }
 
@@ -587,6 +913,8 @@ async function submitIssue(btn) {
                 title: draft.title,
                 body: draft.body,
                 labels: draft.labels || [],
+                session_id: currentSessionId,
+                draft_tool_use_id: card.dataset.toolUseId || null,
             }),
         });
 
@@ -608,6 +936,12 @@ async function submitIssue(btn) {
         link.textContent = `#${result.issue_number}`;
         statusEl.appendChild(link);
         statusEl.style.color = "var(--success)";
+
+        // Submitting closes out this thread's task server-side (resolved_at) —
+        // reflect that here so the user isn't surprised when their next
+        // message lands in a brand new session.
+        appendResolvedNotice();
+        loadSessions();
     } catch (err) {
         statusEl.textContent = `网络错误: ${escapeHtml(err.message)}`;
         statusEl.style.color = "var(--error)";

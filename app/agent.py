@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -16,7 +17,7 @@ from app.skills.base import build_system_prompt, get_tools_for_skills
 @dataclass
 class AgentEvent:
     """An event emitted by the agent during processing."""
-    type: str  # "text_delta" | "tool_use" | "tool_result" | "done" | "error"
+    type: str  # "text_delta" | "tool_use" | "tool_result" | "tool_exchange" | "llm_metrics" | "done" | "error"
     data: dict = field(default_factory=dict)
 
 
@@ -59,14 +60,20 @@ class Agent:
         else:
             tools = get_tools_schema()
 
-        # Track all tool exchanges for persistence
-        all_tool_exchanges = []  # list of (assistant_blocks, tool_result_blocks) pairs
-
         # Tool-use loop with iteration limit
         for iteration in range(settings.max_tool_iterations):
             # Stream the response
             full_text = ""
             tool_calls = []  # collect tool_use blocks
+
+            # Timing/usage for this single LLM call — lets slow sessions be
+            # diagnosed from real numbers (time-to-first-token vs. total call
+            # time, token counts) instead of inferring everything from
+            # message timestamps after the fact.
+            t_request_start = time.monotonic()
+            t_first_token = None
+            input_tokens = 0
+            output_tokens = 0
 
             try:
                 async with self.llm.client.messages.stream(
@@ -81,6 +88,14 @@ class Agent:
 
                     async for event in stream:
                         etype = getattr(event, "type", None)
+
+                        if t_first_token is None and etype in ("content_block_start", "content_block_delta"):
+                            t_first_token = time.monotonic()
+
+                        if etype == "message_start":
+                            input_tokens = event.message.usage.input_tokens
+                        elif etype == "message_delta":
+                            output_tokens = event.usage.output_tokens
 
                         # Text delta
                         if etype == "content_block_delta":
@@ -123,6 +138,16 @@ class Agent:
                 })
                 return
 
+            t_request_end = time.monotonic()
+            yield AgentEvent(type="llm_metrics", data={
+                "iteration": iteration,
+                "model": self.llm.model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "ttft_ms": int((t_first_token - t_request_start) * 1000) if t_first_token else None,
+                "total_ms": int((t_request_end - t_request_start) * 1000),
+            })
+
             # If there were tool calls, execute them and continue the loop
             if tool_calls:
                 # Build assistant message with tool_use blocks
@@ -157,7 +182,7 @@ class Agent:
                         "input": inp,
                     })
 
-                    result = await execute_tool(tc["name"], inp)
+                    result = await execute_tool(tc["name"], inp, available_tools=[t["name"] for t in tools])
 
                     yield AgentEvent(type="tool_result", data={
                         "id": tc["id"],
@@ -171,8 +196,14 @@ class Agent:
                         "content": result,
                     })
 
-                # Track this tool exchange for persistence
-                all_tool_exchanges.append((assistant_blocks, tool_result_blocks))
+                # Emit this completed exchange immediately (not batched until the
+                # end) so the caller can persist it right away — if the request
+                # gets cancelled or errors out in a later iteration, exchanges
+                # that already fully completed aren't lost.
+                yield AgentEvent(type="tool_exchange", data={
+                    "assistant": assistant_blocks,
+                    "results": tool_result_blocks,
+                })
 
                 messages.append({"role": "user", "content": tool_result_blocks})
                 # Loop continues — LLM will see tool results
@@ -182,10 +213,6 @@ class Agent:
                 yield AgentEvent(type="done", data={
                     "text": full_text,
                     "success": True,
-                    "tool_exchanges": [
-                        {"assistant": a, "results": r}
-                        for a, r in all_tool_exchanges
-                    ],
                 })
                 return
 

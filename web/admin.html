@@ -103,6 +103,28 @@
         }
         .msg-ok { background: var(--moss-dim); color: var(--moss); border-color: var(--moss); }
         .msg-err { background: var(--rust-dim); color: var(--rust); border-color: var(--rust); }
+
+        .stat-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px; margin-bottom: 16px;
+        }
+        .stat-card {
+            background: var(--ink-900); border: 1px solid var(--line); border-radius: 10px;
+            padding: 16px;
+        }
+        .stat-label {
+            font-family: var(--font-display); font-size: 10px; font-weight: 700;
+            text-transform: uppercase; letter-spacing: 0.06em; color: var(--faint);
+            margin-bottom: 8px;
+        }
+        .stat-value {
+            font-family: var(--font-mono); font-size: 22px; font-weight: 700; color: var(--paper);
+            font-variant-numeric: tabular-nums;
+        }
+        .stat-value .stat-unit { font-size: 12px; font-weight: 500; color: var(--mute); margin-left: 3px; }
+        .stat-sub { font-family: var(--font-mono); font-size: 11px; color: var(--mute); margin-top: 4px; }
+        #usage-recent-table td, #usage-by-user-table td { font-family: var(--font-mono); font-size: 12.5px; }
+        #usage-recent-table td:nth-child(2), #usage-by-user-table td:nth-child(1) { font-family: var(--font-body); font-size: 13.5px; }
     </style>
 </head>
 <body>
@@ -118,6 +140,7 @@
             <button class="tab-btn active" onclick="switchTab('users', this)">用户</button>
             <button class="tab-btn" onclick="switchTab('repos', this)">仓库</button>
             <button class="tab-btn" onclick="switchTab('perms', this)">权限</button>
+            <button class="tab-btn" onclick="switchTab('usage', this)">用量</button>
         </div>
         <div class="admin-content">
             <div id="msg-area"></div>
@@ -148,14 +171,34 @@
                         <input id="new-repo-name" placeholder="仓库名称" style="flex:1;min-width:120px;">
                         <input id="new-repo-url" placeholder="Git URL" style="flex:2;min-width:200px;">
                         <input id="new-repo-branch" placeholder="分支（可选，默认为远程默认分支）" style="flex:1;min-width:160px;">
+                        <input id="new-repo-cred-username" placeholder="用户名（私有仓库可选）" style="flex:1;min-width:140px;">
+                        <input id="new-repo-cred-token" type="password" placeholder="令牌/密码（可选）" style="flex:1;min-width:140px;">
                         <input id="new-repo-desc" placeholder="描述（可选）" style="flex:1;min-width:120px;">
                         <button class="btn btn-primary" onclick="createRepo()">添加</button>
                     </div>
                 </div>
                 <div class="card">
                     <h3>仓库列表</h3>
-                    <table><thead><tr><th>ID</th><th>名称</th><th>URL</th><th>分支</th><th>描述</th><th>操作</th></tr></thead>
+                    <table><thead><tr><th>ID</th><th>名称</th><th>URL</th><th>分支</th><th>描述</th><th>凭证</th><th>操作</th></tr></thead>
                     <tbody id="repos-table"></tbody></table>
+                </div>
+                <div class="card" id="edit-repo-card" style="display:none;">
+                    <h3>编辑仓库</h3>
+                    <div class="form-row">
+                        <input id="edit-repo-name" placeholder="仓库名称" style="flex:1;min-width:120px;">
+                        <input id="edit-repo-url" placeholder="Git URL" style="flex:2;min-width:200px;">
+                        <input id="edit-repo-branch" placeholder="分支（可选，默认为远程默认分支）" style="flex:1;min-width:160px;">
+                        <input id="edit-repo-cred-username" placeholder="用户名（留空则不修改）" style="flex:1;min-width:140px;">
+                        <input id="edit-repo-cred-token" type="password" placeholder="令牌/密码（留空则不修改）" style="flex:1;min-width:140px;">
+                        <input id="edit-repo-desc" placeholder="描述（可选）" style="flex:1;min-width:120px;">
+                    </div>
+                    <div class="form-row" style="align-items:center;">
+                        <label style="display:flex;align-items:center;gap:6px;font-family:var(--font-body);font-size:13px;color:var(--mute);">
+                            <input type="checkbox" id="edit-repo-clear-credentials"> 清除已保存的凭证
+                        </label>
+                        <button class="btn btn-primary" onclick="saveRepoEdit()">保存</button>
+                        <button class="btn btn-sm" style="background:var(--ink-800);color:var(--mute);" onclick="closeRepoEdit()">取消</button>
+                    </div>
                 </div>
             </div>
 
@@ -174,6 +217,28 @@
                     <h3>权限列表</h3>
                     <table><thead><tr><th>用户</th><th>仓库</th><th>权限</th><th>操作</th></tr></thead>
                     <tbody id="perms-table"></tbody></table>
+                </div>
+            </div>
+
+            <!-- Usage Panel -->
+            <div id="panel-usage" class="panel">
+                <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
+                    <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="loadUsage()">刷新</button>
+                </div>
+                <div class="stat-grid" id="usage-summary-cards"></div>
+                <div class="card">
+                    <h3>按用户统计</h3>
+                    <table>
+                        <thead><tr><th>用户</th><th>调用次数</th><th>输入 Token</th><th>输出 Token</th><th>平均首字延迟</th><th>平均总耗时</th></tr></thead>
+                        <tbody id="usage-by-user-table"></tbody>
+                    </table>
+                </div>
+                <div class="card">
+                    <h3>最近调用</h3>
+                    <table>
+                        <thead><tr><th>时间</th><th>会话</th><th>用户</th><th>轮次</th><th>输入</th><th>输出</th><th>首字延迟</th><th>总耗时</th></tr></thead>
+                        <tbody id="usage-recent-table"></tbody>
+                    </table>
                 </div>
             </div>
         </div>

@@ -49,6 +49,13 @@ async def code_search(keyword: str, file_pattern: str = "*", max_results: int = 
                 proc.kill()
                 await proc.wait()
             results.append(f"(search timed out for {os.path.basename(repo_path)})")
+        except asyncio.CancelledError:
+            # The chat request itself was cancelled (e.g. user hit stop) — kill
+            # the grep child instead of leaving it running as an orphan.
+            if proc is not None:
+                proc.kill()
+                await proc.wait()
+            raise
         except Exception as e:
             results.append(f"(search error: {e})")
         if len(results) >= max_results:

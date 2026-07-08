@@ -8,7 +8,9 @@ from app.database import (
     update_user_password, set_user_active, delete_user,
     create_repo, list_repos, get_repo, update_repo, delete_repo,
     grant_permission, revoke_permission, list_permissions, get_user_repos,
+    get_usage_summary, get_usage_by_user, get_recent_llm_calls,
 )
+from app.repo_sync import mask_url_credentials
 from app.models import (
     UserCreate, UserUpdate,
     RepoCreate, RepoUpdate,
@@ -59,17 +61,48 @@ async def api_delete_user(user_id: int):
 
 # ==================== Repositories ====================
 
+def _admin_repo_view(repo: dict) -> dict:
+    """cred_username isn't secret (it's just who we authenticate as) so it's
+    shown as-is; cred_token is never echoed back — only whether one is set,
+    so the table/edit form can show status without displaying the secret.
+    Also strips the retired combined 'credentials' column, if a row still has
+    one lying around from before the startup migration ran.
+
+    The url field itself is masked too — an admin can paste a credential
+    directly into the URL (e.g. https://user:token@host/repo.git) instead of
+    using the dedicated fields, and that shouldn't round-trip back out to the
+    client any more than cred_token does."""
+    r = dict(repo)
+    r["has_token"] = bool(r.pop("cred_token", None))
+    r.pop("credentials", None)
+    r["url"] = mask_url_credentials(r.get("url", ""))
+    return r
+
+
 @router.get("/repos")
 async def api_list_repos():
-    return await list_repos()
+    return [_admin_repo_view(r) for r in await list_repos()]
+
+
+@router.get("/repos/{repo_id}")
+async def api_get_repo(repo_id: int):
+    repo = await get_repo(repo_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+    return _admin_repo_view(repo)
 
 
 @router.post("/repos")
 async def api_create_repo(req: RepoCreate):
-    repo_id = await create_repo(req.name, req.url, req.description, branch=req.branch)
+    repo_id = await create_repo(
+        req.name, req.url, req.description, branch=req.branch,
+        cred_username=req.cred_username, cred_token=req.cred_token,
+    )
     # Clone the repo now (blocking — bounded by repo_sync's git timeout)
     from app.repo_sync import sync_and_persist
-    success, msg = await sync_and_persist(repo_id, req.url, req.branch)
+    success, msg = await sync_and_persist(
+        repo_id, req.url, req.branch, cred_username=req.cred_username, cred_token=req.cred_token,
+    )
     return {"id": repo_id, "name": req.name, "url": req.url, "branch": req.branch, "synced": success, "sync_message": msg}
 
 
@@ -84,19 +117,26 @@ async def api_update_repo(repo_id: int, req: RepoUpdate):
 
     url_changed = req.url is not None and req.url != repo["url"]
     branch_changed = req.branch is not None and req.branch != (repo.get("branch") or "")
-    if url_changed or branch_changed:
+    username_changed = req.cred_username is not None and req.cred_username != (repo.get("cred_username") or "")
+    token_changed = req.cred_token is not None and req.cred_token != (repo.get("cred_token") or "")
+    if url_changed or branch_changed or username_changed or token_changed:
         from app.repo_sync import sync_and_persist
         sync_url = req.url if req.url is not None else repo["url"]
         sync_branch = req.branch if req.branch is not None else repo.get("branch")
-        success, msg = await sync_and_persist(repo_id, sync_url, sync_branch, force_reclone=True)
+        sync_username = req.cred_username if req.cred_username is not None else repo.get("cred_username")
+        sync_token = req.cred_token if req.cred_token is not None else repo.get("cred_token")
+        success, msg = await sync_and_persist(
+            repo_id, sync_url, sync_branch, force_reclone=True,
+            cred_username=sync_username, cred_token=sync_token,
+        )
         if not success:
             raise HTTPException(
                 status_code=502,
-                detail=f"Repo record kept unchanged — resync with the new url/branch failed: {msg}",
+                detail=f"Repo record kept unchanged — resync with the new url/branch/credentials failed: {msg}",
             )
-        # Only commit the new url/branch once the resync actually succeeded, so
-        # the DB never describes a repo/branch that isn't what's actually on disk.
-        await update_repo(repo_id, url=req.url, branch=req.branch)
+        # Only commit the new url/branch/credentials once the resync actually succeeded,
+        # so the DB never describes a repo that isn't what's actually on disk.
+        await update_repo(repo_id, url=req.url, branch=req.branch, cred_username=req.cred_username, cred_token=req.cred_token)
     return {"ok": True}
 
 
@@ -116,7 +156,10 @@ async def api_sync_repo(repo_id: int):
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
     from app.repo_sync import sync_and_persist
-    success, msg = await sync_and_persist(repo_id, repo["url"], repo.get("branch"))
+    success, msg = await sync_and_persist(
+        repo_id, repo["url"], repo.get("branch"),
+        cred_username=repo.get("cred_username"), cred_token=repo.get("cred_token"),
+    )
     return {"ok": success, "message": msg}
 
 
@@ -143,6 +186,23 @@ async def api_grant_permission(req: PermissionGrant):
 async def api_revoke_permission(user_id: int, repo_id: int):
     await revoke_permission(user_id, repo_id)
     return {"ok": True}
+
+
+# ==================== Usage metrics ====================
+
+@router.get("/usage/summary")
+async def api_usage_summary():
+    return await get_usage_summary()
+
+
+@router.get("/usage/by-user")
+async def api_usage_by_user():
+    return await get_usage_by_user()
+
+
+@router.get("/usage/recent")
+async def api_usage_recent(limit: int = 50):
+    return await get_recent_llm_calls(limit)
 
 
 @router.get("/users/{user_id}/repos")

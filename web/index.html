@@ -29,13 +29,13 @@
                 <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
             </div>
 
-            <!-- Repos -->
-            <div class="skills-section">
-                <h3>Repositories</h3>
+            <!-- Repos: workspace picker -->
+            <div class="workspace-section">
+                <h3>Workspace</h3>
                 <div id="repos-list"></div>
             </div>
 
-            <!-- Skills -->
+            <!-- Skills: mode toggles -->
             <div class="skills-section">
                 <h3>Skills</h3>
                 <div id="skills-list"></div>
@@ -58,20 +58,31 @@
 
             <div id="messages">
                 <div class="welcome-message">
-                    <h1>Where should we start?</h1>
-                    <p>Choose a repo and a skill on the left, or just start typing.</p>
+                    <div class="welcome-eyebrow">my_agent · code-aware chat</div>
+                    <h1>从这里开始</h1>
+                    <p>选择左侧仓库和技能，或直接描述你要做的事。</p>
+                    <div class="welcome-examples">
+                        <button class="example-chip" onclick="fillExample(this)">这段代码逻辑是什么？帮我逐步讲解</button>
+                        <button class="example-chip" onclick="fillExample(this)">确认一下这个 bug 是否真的存在</button>
+                        <button class="example-chip" onclick="fillExample(this)">帮我起草一个 GitHub issue</button>
+                    </div>
                 </div>
             </div>
 
             <!-- Input Area -->
             <div id="input-area">
+                <div id="chat-notice"></div>
+                <div id="image-preview-strip"></div>
                 <div class="input-wrapper">
+                    <button id="attach-btn" onclick="document.getElementById('image-file-input').click()" title="Attach image" aria-label="Attach image">+</button>
+                    <input type="file" id="image-file-input" accept="image/jpeg,image/png,image/gif,image/webp" multiple style="display:none" onchange="handleImageFilesSelected(this.files)">
                     <textarea
                         id="message-input"
-                        placeholder="Type your message... (Enter to send, Shift+Enter for new line)"
+                        placeholder="Type your message... (Enter to send, Shift+Enter for new line, paste or attach an image)"
                         rows="1"
                         onkeydown="handleKeyDown(event)"
                         oninput="autoResize(this)"
+                        onpaste="handlePaste(event)"
                     ></textarea>
                     <button id="send-btn" onclick="sendMessage()">Send</button>
                 </div>

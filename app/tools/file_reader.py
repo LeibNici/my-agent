@@ -38,9 +38,9 @@ def _is_path_allowed(real_path: str, allowed_paths: list[str]) -> tuple[bool, st
     return False, f"Access denied: path is outside your assigned repositories"
 
 
-@tool("Read the contents of a file at the given path. Supports text files. Only files within your assigned repositories are accessible. Paths may be absolute or relative to a repository root (as returned by code_search).")
-def file_reader(path: str, max_lines: int = 200) -> str:
-    """Read a file and return its contents."""
+@tool("Read the contents of a file at the given path. Supports text files. Only files within your assigned repositories are accessible. Paths may be absolute or relative to a repository root (as returned by code_search). Use start_line together with max_lines to jump to a specific section of a large file (e.g. a line number found via code_search) instead of always reading from the top.")
+def file_reader(path: str, max_lines: int = 200, start_line: int = 1) -> str:
+    """Read a file and return its contents, starting at start_line (1-indexed)."""
     allowed_paths = get_allowed_paths()
     path = _resolve_path(os.path.expanduser(path), allowed_paths)
 
@@ -59,14 +59,19 @@ def file_reader(path: str, max_lines: int = 200) -> str:
     if size > 5 * 1024 * 1024:  # 5MB limit
         return f"Error: File too large ({size / 1024 / 1024:.1f}MB). Max 5MB."
 
+    start_index = max(start_line, 1) - 1
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = []
             for i, line in enumerate(f):
-                if i >= max_lines:
-                    lines.append(f"\n... (truncated at {max_lines} lines, file has more)")
+                if i < start_index:
+                    continue
+                if i >= start_index + max_lines:
+                    lines.append(f"\n... (truncated at {max_lines} lines from line {start_line}, file has more)")
                     break
                 lines.append(line)
+            if not lines:
+                return f"Error: start_line ({start_line}) is beyond the end of the file."
             return "".join(lines)
     except Exception as e:
         return f"Error reading file: {e}"

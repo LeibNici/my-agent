@@ -13,28 +13,35 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
-    /* --- Surface --- */
-    --ink-950: #14171a;
-    --ink-900: #1b1f23;
-    --ink-850: #21262b;
-    --ink-800: #282e34;
-    --line: #333a40;
-    --line-soft: #262b30;
+    /* --- Surface — tinted toward the moss accent instead of neutral
+       blue-gray, so the whole canvas feels like it belongs to this palette
+       rather than a generic dark-mode default. Wider tonal steps than
+       before give the sidebar/canvas/cards real depth instead of three
+       near-identical shades. --canvas is the deepest layer (message
+       stream); --ink-950 sits one step up for chrome (sidebar, input bar). --- */
+    --canvas: #0b0d0a;
+    --ink-950: #12150f;
+    --ink-900: #191d15;
+    --ink-850: #21261b;
+    --ink-800: #2a3022;
+    --line: #3a4230;
+    --line-soft: #262c1e;
 
     /* --- Text --- */
-    --paper: #eef1ee;
-    --mute: #8b9490;
-    --faint: #5c6469;
+    --paper: #eef1ea;
+    --mute: #93a08a;
+    --faint: #5f6b56;
 
-    /* --- Status vocabulary (shared everywhere) --- */
-    --moss: #6fc98a;
-    --moss-dim: #2c3a30;
-    --amber: #e0a94e;
-    --amber-dim: #3c3324;
-    --rust: #d17257;
-    --rust-dim: #3a2a26;
-    --wire: #6f9bd1;
-    --wire-dim: #26313e;
+    /* --- Status vocabulary (shared everywhere) — slightly more saturated
+       than a timid dark-mode default so they read as decisions, not tints. --- */
+    --moss: #6fd98a;
+    --moss-dim: #223a28;
+    --amber: #edb054;
+    --amber-dim: #40331c;
+    --rust: #e57c56;
+    --rust-dim: #402620;
+    --wire: #6fa8dd;
+    --wire-dim: #1f2e3c;
 
     /* --- Legacy aliases kept so nothing else has to change --- */
     --bg-primary: var(--ink-950);
@@ -43,7 +50,7 @@
     --text-primary: var(--paper);
     --text-secondary: var(--mute);
     --accent: var(--moss);
-    --accent-hover: #82d89b;
+    --accent-hover: #8be3a1;
     --user-bubble: var(--ink-800);
     --assistant-bubble: var(--ink-850);
     --tool-bg: var(--ink-850);
@@ -60,7 +67,7 @@
 
 body {
     font-family: var(--font-body);
-    background: var(--ink-950);
+    background: var(--canvas);
     color: var(--paper);
     height: 100vh;
     height: 100dvh; /* dynamic viewport for mobile browsers */
@@ -141,12 +148,16 @@ body {
     border-top: 1px solid var(--line-soft);
 }
 
-.skills-section, .sessions-section {
+.workspace-section, .skills-section, .sessions-section {
     padding: 16px;
     overflow-y: auto;
 }
 
-.skills-section h3, .sessions-section h3 {
+.workspace-section {
+    border-bottom: 1px solid var(--line-soft);
+}
+
+.workspace-section h3, .skills-section h3, .sessions-section h3 {
     font-family: var(--font-display);
     font-size: 11px;
     font-weight: 700;
@@ -154,6 +165,57 @@ body {
     margin-bottom: 10px;
     text-transform: uppercase;
     letter-spacing: 0.08em;
+}
+
+/* Repo picker — one active codebase at a time, so it reads as a workspace
+   switcher (full-width rows) rather than a bag of small toggle chips. */
+.repo-chip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    margin-bottom: 6px;
+    border-radius: 7px;
+    font-family: var(--font-body);
+    font-size: 13.5px;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid var(--line);
+    background: var(--ink-900);
+    color: var(--mute);
+    text-align: left;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.repo-chip:last-child { margin-bottom: 0; }
+
+.repo-chip:hover { border-color: var(--mute); color: var(--paper); }
+
+.repo-chip .repo-branch {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--faint);
+    background: var(--ink-950);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 2px 6px;
+    flex-shrink: 0;
+}
+
+.repo-chip .repo-branch::before { content: "⎇ "; }
+
+.repo-chip.active {
+    background: var(--moss-dim);
+    border-color: var(--moss);
+    color: var(--moss);
+}
+
+.repo-chip.active .repo-branch {
+    color: var(--moss);
+    border-color: var(--moss);
+    background: var(--ink-950);
 }
 
 .sessions-section {
@@ -214,9 +276,11 @@ body {
     max-width: 200px;
 }
 
-/* Session items */
+/* Session items — styled like a compact git log: hash first, message below.
+   Reinforces the same status vocabulary as everything else instead of
+   reading as an unrelated plain list. */
 .session-item {
-    padding: 10px 12px;
+    padding: 9px 12px;
     margin-bottom: 2px;
     border-radius: 6px;
     cursor: pointer;
@@ -225,10 +289,45 @@ body {
     justify-content: space-between;
     align-items: center;
     transition: background 0.15s;
+    border-left: 2px solid transparent;
+}
+
+.session-info {
+    display: flex;
+    flex-direction: column-reverse;
+    min-width: 0;
+    overflow: hidden;
+    gap: 2px;
+}
+
+.session-title {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    border-left: 2px solid transparent;
+    color: var(--mute);
+}
+
+.session-item:hover .session-title,
+.session-item.active .session-title { color: var(--paper); }
+
+.session-id {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--faint);
+    cursor: copy;
+    white-space: nowrap;
+}
+.session-id::before { content: "◆ "; font-size: 9px; }
+.session-id:hover { color: var(--moss); }
+.session-item.active .session-id { color: var(--moss); }
+
+/* Resolved sessions (an issue was filed from them) read as closed threads —
+   a small checkmark distinguishes them from ongoing conversations. */
+.session-item.resolved .session-title::before {
+    content: "✓ ";
+    color: var(--moss);
+    font-weight: 700;
 }
 
 .session-item:hover { background: var(--ink-850); }
@@ -268,20 +367,31 @@ body {
 
 .welcome-message {
     text-align: center;
-    padding: 100px 20px;
+    padding: 90px 20px 40px;
     color: var(--mute);
-    max-width: 480px;
+    max-width: 520px;
     margin: 0 auto;
+}
+
+.welcome-eyebrow {
+    font-family: var(--font-display);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--moss);
+    margin-bottom: 16px;
 }
 
 .welcome-message h1 {
     font-family: var(--font-serif);
     font-style: italic;
     font-weight: 500;
-    font-size: 30px;
+    font-size: clamp(28px, 4vw, 38px);
     color: var(--paper);
     margin-bottom: 12px;
     letter-spacing: -0.01em;
+    text-wrap: balance;
 }
 
 .welcome-message p {
@@ -289,7 +399,39 @@ body {
     font-style: italic;
     font-size: 16px;
     line-height: 1.6;
-    margin-bottom: 8px;
+    margin-bottom: 28px;
+}
+
+.welcome-examples {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    text-align: left;
+}
+
+.example-chip {
+    padding: 12px 16px;
+    background: var(--ink-900);
+    border: 1px solid var(--line);
+    border-left: 2px solid var(--wire);
+    border-radius: 0 8px 8px 0;
+    color: var(--paper);
+    font-family: var(--font-body);
+    font-size: 13.5px;
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 0.15s, background 0.15s, transform 0.1s;
+}
+
+.example-chip:hover {
+    background: var(--ink-850);
+    border-left-color: var(--moss);
+    transform: translateX(2px);
+}
+
+.example-chip::before {
+    content: "→ ";
+    color: var(--faint);
 }
 
 /* Message bubbles */
@@ -441,9 +583,99 @@ body {
     padding: 0;
 }
 
-/* Tool call blocks — collapsible diff-hunk styling.
-   Default state = pending (amber gutter); app.js adds .tool-block--ok once
-   the result lands, which flips the gutter to moss (see updateToolResult). */
+/* Tool group — consecutive tool calls collapse into one compact,
+   expandable summary row instead of a tall block per call. A real
+   investigation can run dozens of calls; the answer shouldn't be buried
+   under a wall of "done" rows. Collapsed by default; click to inspect. */
+.text-run + .tool-group,
+.tool-group + .text-run {
+    margin-top: 10px;
+}
+
+.tool-group {
+    margin: 10px 0;
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--amber);
+    border-radius: 0 8px 8px 0;
+    background: var(--ink-900);
+    overflow: hidden;
+    transition: border-left-color 0.3s;
+}
+
+.tool-group.tool-group--ok { border-left-color: var(--moss); }
+
+.tool-group-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--mute);
+}
+
+.tool-group-header:hover { color: var(--paper); }
+
+.tool-group-chevron {
+    color: var(--faint);
+    transition: transform 0.15s;
+    flex-shrink: 0;
+}
+
+.tool-group.open .tool-group-chevron { transform: rotate(90deg); }
+
+.tool-group-summary {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool-group-status {
+    flex-shrink: 0;
+    font-family: var(--font-display);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--amber);
+}
+
+.tool-group.tool-group--ok .tool-group-status { color: var(--moss); }
+
+.tool-group-body {
+    display: none;
+    padding: 4px 14px 10px;
+    border-top: 1px solid var(--line-soft);
+}
+
+.tool-group.open .tool-group-body { display: block; }
+
+/* Individual calls nested inside a group read as a compact list — the
+   group's own gutter already carries the status color, so each entry
+   just needs a quiet divider, not its own full card treatment. */
+.tool-group-body .tool-block {
+    margin: 6px 0 0;
+    border: none;
+    border-radius: 0;
+    background: none;
+}
+.tool-group-body .tool-block:first-child { margin-top: 6px; }
+.tool-group-body .tool-block + .tool-block { border-top: 1px solid var(--line-soft); padding-top: 6px; }
+.tool-group-body .tool-header { padding: 4px 0; }
+.tool-group-body .tool-body { padding: 6px 0 8px; background: none; }
+
+/* Legacy standalone tool-block styling — still used inside .tool-group-body
+   via the overrides above, and would apply as-is if a block were ever
+   rendered outside a group. Default state = pending (amber gutter); app.js
+   adds .tool-block--ok once the result lands. */
+.text-run + .tool-block,
+.tool-block + .text-run {
+    margin-top: 10px;
+}
+
 .tool-block {
     margin: 10px 0;
     border: 1px solid var(--line);
@@ -585,6 +817,95 @@ body {
 #message-input::placeholder { color: var(--faint); }
 #message-input:focus { border-color: var(--moss); }
 
+#attach-btn {
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--ink-950);
+    color: var(--mute);
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+}
+#attach-btn:hover { border-color: var(--moss); color: var(--moss); }
+
+#chat-notice {
+    max-width: 800px;
+    margin: 0 auto 8px;
+}
+#chat-notice:not(:empty) {
+    padding: 8px 14px;
+    border-radius: 6px;
+    background: var(--rust-dim);
+    color: var(--rust);
+    border: 1px solid var(--rust);
+    font-size: 13px;
+    font-family: var(--font-body);
+}
+
+#image-preview-strip {
+    max-width: 800px;
+    margin: 0 auto 8px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+#image-preview-strip:empty { display: none; }
+.image-preview-item {
+    position: relative;
+    width: 64px;
+    height: 64px;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+}
+.image-preview-item img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.image-preview-item .remove-btn {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0, 0, 0, 0.65);
+    color: #fff;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.msg-image {
+    max-width: 280px;
+    max-height: 280px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    display: block;
+    margin: 6px 0;
+    object-fit: contain;
+}
+
+.msg-image-error {
+    padding: 8px 12px;
+    margin: 6px 0;
+    border-radius: 6px;
+    border: 1px solid var(--rust);
+    background: var(--rust-dim);
+    color: var(--rust);
+    font-size: 13px;
+}
+
 #send-btn {
     padding: 12px 22px;
     background: var(--moss);
@@ -606,6 +927,11 @@ body {
     cursor: not-allowed;
     transform: none;
 }
+#send-btn.stop-state {
+    background: var(--rust);
+    color: var(--paper);
+}
+#send-btn.stop-state:hover { background: var(--rust); opacity: 0.85; }
 
 /* ===== Scrollbar ===== */
 ::-webkit-scrollbar { width: 6px; }
@@ -741,6 +1067,20 @@ body {
     border-radius: 0 10px 10px 0;
     overflow: hidden;
     background: var(--ink-900);
+}
+
+/* Shown once a thread's task is done (e.g. right after an issue is filed) —
+   signals that the next message will land in a fresh session. */
+.session-resolved-notice {
+    max-width: 800px;
+    margin: 4px auto 14px;
+    padding: 8px 14px;
+    border-radius: 6px;
+    background: var(--moss-dim);
+    color: var(--moss);
+    border: 1px solid var(--moss);
+    font-size: 13px;
+    text-align: center;
 }
 
 .issue-header {

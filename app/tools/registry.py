@@ -80,10 +80,21 @@ def get_tools_schema() -> list[dict]:
     return list(_TOOLS.values())
 
 
-async def execute_tool(name: str, input_data: dict) -> str:
-    """Execute a registered tool by name with the given input."""
+async def execute_tool(name: str, input_data: dict, available_tools: list[str] | None = None) -> str:
+    """Execute a registered tool by name with the given input.
+
+    available_tools, when given, is the exact tool list offered to the model
+    this turn (it may be a skill-restricted subset of every registered tool) —
+    echoing it back on an unknown-tool call lets the model self-correct (e.g.
+    stop trying to call a file-editing tool that was never offered) instead of
+    guessing again or silently giving up.
+    """
     if name not in _HANDLERS:
-        return json.dumps({"error": f"Unknown tool: {name}"})
+        offered = available_tools if available_tools is not None else list(_HANDLERS.keys())
+        return json.dumps({
+            "error": f"Unknown tool: {name}. This tool does not exist — it was never offered to you. "
+                     f"Tools actually available this turn: {', '.join(sorted(offered))}",
+        })
 
     handler = _HANDLERS[name]
     try:

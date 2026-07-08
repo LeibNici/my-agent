@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
-import re
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -32,6 +33,10 @@ from app.database import (
     get_user_by_username,
     create_user,
     get_user_repos,
+    mark_session_resolved,
+    record_issue_submission,
+    get_issue_submissions_for_session,
+    record_llm_call_metrics,
 )
 from app.models import (
     ChatRequest, SessionInfo, SkillInfo,
@@ -40,7 +45,8 @@ from app.models import (
 from pydantic import BaseModel
 from app.skills.base import list_skills
 from app.admin import router as admin_router
-from app.tools.github_issue import submit_github_issue
+from app.repo_sync import mask_url_credentials
+from app.tools.github_issue import submit_repo_issue
 
 # Import skills to trigger registration
 import app.skills.coder  # noqa: F401
@@ -55,6 +61,34 @@ import app.tools.code_search  # noqa: F401
 import app.tools.github_issue  # noqa: F401
 
 MAX_MESSAGE_LENGTH = 10000
+
+# Images: kept well under Anthropic's own 10MB (base64) / 20-image-per-request
+# limits — this app persists every message (with images) into SQLite on every
+# turn, so a conservative cap keeps history rows and DB growth reasonable.
+MAX_IMAGES_PER_MESSAGE = 5
+MAX_IMAGE_BASE64_CHARS = 6_000_000
+MAX_IMAGE_DECODED_MB = round(MAX_IMAGE_BASE64_CHARS * 3 / 4 / 1_000_000, 1)  # base64 -> raw bytes
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+def _validate_images(images: list) -> str | None:
+    """Return an error message if the image attachments are invalid, else None."""
+    if len(images) > MAX_IMAGES_PER_MESSAGE:
+        return f"Too many images ({len(images)}). Max {MAX_IMAGES_PER_MESSAGE} per message."
+    for img in images:
+        if img.media_type not in ALLOWED_IMAGE_TYPES:
+            return f"Unsupported image type: {img.media_type}. Allowed: {', '.join(sorted(ALLOWED_IMAGE_TYPES))}"
+        if len(img.data) > MAX_IMAGE_BASE64_CHARS:
+            return f"Image too large (max ~{MAX_IMAGE_DECODED_MB}MB decoded)."
+        # Reject anything that isn't well-formed base64 at the boundary — this
+        # data later gets interpolated into an `<img src="data:...">` string
+        # on the frontend, so malformed input here is a stored-XSS vector,
+        # not just a broken image.
+        try:
+            base64.b64decode(img.data, validate=True)
+        except (binascii.Error, ValueError):
+            return "Image data is not valid base64."
+    return None
 
 
 async def ensure_admin_user():
@@ -153,17 +187,12 @@ async def get_me(user: dict = Depends(get_current_user)):
 
 # ==================== User Repos ====================
 
-def _mask_url_credentials(url: str) -> str:
-    """Strip any embedded userinfo (user:token@) from a URL before exposing it to clients."""
-    return re.sub(r"://[^/@]+@", "://", url or "")
-
-
 def _public_repo(r: dict) -> dict:
     """Client-safe repo view — omits server filesystem path, masks credentials in the URL."""
     return {
         "id": r["id"],
         "name": r["name"],
-        "url": _mask_url_credentials(r.get("url", "")),
+        "url": mask_url_credentials(r.get("url", "")),
         "description": r.get("description", ""),
         "branch": r.get("branch"),
         "access_level": r.get("access_level"),
@@ -209,6 +238,13 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
         yield {"event": "end", "data": ""}
         return
 
+    image_error = _validate_images(req.images)
+    if image_error:
+        yield {"event": "error", "data": json.dumps({"message": image_error})}
+        yield {"event": "done", "data": json.dumps({"session_id": None, "text": ""})}
+        yield {"event": "end", "data": ""}
+        return
+
     session_id = req.session_id
     if not session_id:
         session_id = await create_session(title="New Chat", owner_id=current_user["id"])
@@ -221,13 +257,44 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
         yield {"event": "done", "data": json.dumps({"session_id": None, "text": ""})}
         yield {"event": "end", "data": ""}
         return
+    elif session.get("resolved_at"):
+        # This thread's task (e.g. an issue submission) is already done —
+        # transparently start a fresh session instead of tacking onto a
+        # closed one. The client picks up the new id below, the same as
+        # when it sends with session_id=None.
+        session_id = await create_session(title="New Chat", owner_id=current_user["id"])
+
+    # Tell the client the real session_id right away — not just in the final
+    # "done" event. A turn can render an issue-draft card (from a tool_result
+    # event) and the user can click "confirm submit" well before "done" ever
+    # fires, especially on the first message of a brand-new chat; without
+    # this, the client would still have session_id=null at that point and
+    # the submission would go out untracked (see submitIssue()/appendIssueCard
+    # in web/app.js).
+    yield {"event": "session", "data": json.dumps({"session_id": session_id})}
 
     full_text = ""
+    # Text streamed since the last fully-persisted tool exchange — used to save
+    # a partial answer if the connection drops before a normal "done" event.
+    current_text_buffer = ""
+    # Accumulated in memory and flushed in one batch (see record_llm_call_metrics)
+    # rather than opening a fresh DB connection per iteration — a turn can now
+    # run up to max_tool_iterations (30) LLM calls.
+    pending_llm_metrics = []
     async with _get_session_lock(session_id):
         history = await get_messages(session_id)
         messages = [{"role": m["role"], "content": m["content"]} for m in history]
-        messages.append({"role": "user", "content": req.message})
-        await add_message(session_id, "user", req.message)
+        if req.images:
+            user_content = [
+                {"type": "image", "source": {"type": "base64", "media_type": img.media_type, "data": img.data}}
+                for img in req.images
+            ]
+            if req.message:
+                user_content.append({"type": "text", "text": req.message})
+        else:
+            user_content = req.message
+        messages.append({"role": "user", "content": user_content})
+        await add_message(session_id, "user", user_content)
 
         # Build allowed repo paths — filter by repo_id if specified
         if current_user["role"] == "admin":
@@ -254,32 +321,67 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
             ):
                 if event.type == "text_delta":
                     full_text += event.data["text"]
+                    current_text_buffer += event.data["text"]
                     yield {"event": "text", "data": json.dumps(event.data, ensure_ascii=False)}
                 elif event.type == "tool_use":
                     yield {"event": "tool_use", "data": json.dumps(event.data, ensure_ascii=False)}
                 elif event.type == "tool_result":
                     yield {"event": "tool_result", "data": json.dumps(event.data, ensure_ascii=False)}
+                elif event.type == "tool_exchange":
+                    # Persist each completed exchange as soon as it happens (not
+                    # batched until the final "done") so it survives a later
+                    # cancellation or error in this same turn.
+                    await add_message(session_id, "assistant", event.data["assistant"])
+                    await add_message(session_id, "user", event.data["results"])
+                    current_text_buffer = ""
+                elif event.type == "llm_metrics":
+                    pending_llm_metrics.append({
+                        "session_id": session_id, "user_id": current_user["id"],
+                        "model": event.data["model"], "iteration": event.data["iteration"],
+                        "input_tokens": event.data["input_tokens"], "output_tokens": event.data["output_tokens"],
+                        "ttft_ms": event.data["ttft_ms"], "total_ms": event.data["total_ms"],
+                    })
                 elif event.type == "done":
-                    # Persist any tool exchanges that actually ran, even if the
-                    # turn ultimately failed (LLM error / max-iterations) — the
-                    # side effects already happened and shouldn't vanish from history.
-                    for exchange in event.data.get("tool_exchanges", []):
-                        await add_message(session_id, "assistant", exchange["assistant"])
-                        await add_message(session_id, "user", exchange["results"])
                     if event.data.get("success", True):
                         final_text = event.data.get("text", "")
                         if final_text:
                             await add_message(session_id, "assistant", final_text)
                         s = await get_session(session_id)
                         if s and s["title"] == "New Chat":
-                            await update_session_title(session_id, req.message[:50])
+                            title = req.message[:50] or (
+                                f"{len(req.images)} image(s)" if req.images else "New Chat"
+                            )
+                            await update_session_title(session_id, title)
+                    else:
+                        # LLM error / max-iterations: save whatever text had
+                        # already streamed for this turn instead of losing it.
+                        partial_text = event.data.get("text", "")
+                        if partial_text:
+                            await add_message(session_id, "assistant",
+                                               partial_text + "\n\n_（回复未完成：发生错误）_")
+                    await record_llm_call_metrics(pending_llm_metrics)
+                    pending_llm_metrics = []
                     yield {"event": "done", "data": json.dumps({
                         "session_id": session_id, "text": full_text,
                     }, ensure_ascii=False)}
                 elif event.type == "error":
                     yield {"event": "error", "data": json.dumps(event.data, ensure_ascii=False)}
+        except asyncio.CancelledError:
+            # Client disconnected (closed tab, hit Stop, network drop) mid-turn.
+            # Completed tool exchanges were already persisted above as they
+            # happened; save whatever text had streamed for the turn in
+            # progress too, so the session doesn't just silently end with nothing.
+            if current_text_buffer:
+                await add_message(session_id, "assistant",
+                                   current_text_buffer + "\n\n_（回复未完成：连接已中断）_")
+            await record_llm_call_metrics(pending_llm_metrics)
+            raise
         except Exception as e:
             traceback.print_exc()
+            if current_text_buffer:
+                await add_message(session_id, "assistant",
+                                   current_text_buffer + "\n\n_（回复未完成：发生错误）_")
+            await record_llm_call_metrics(pending_llm_metrics)
             yield {"event": "error", "data": json.dumps({
                 "message": f"Internal error: {type(e).__name__}: {str(e)}"
             }, ensure_ascii=False)}
@@ -316,7 +418,8 @@ async def get_owned_session(session_id: str, user: dict = Depends(get_current_us
 @app.get("/api/sessions/{session_id}")
 async def api_get_session(session_id: str, session: dict = Depends(get_owned_session)):
     messages = await get_messages(session_id)
-    return {"session": session, "messages": messages}
+    issue_submissions = await get_issue_submissions_for_session(session_id)
+    return {"session": session, "messages": messages, "issue_submissions": issue_submissions}
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -343,15 +446,16 @@ class IssueSubmitRequest(BaseModel):
     title: str
     body: str
     labels: list[str] = []
+    session_id: str | None = None
+    draft_tool_use_id: str | None = None
 
 
 @app.post("/api/issues/submit")
 async def submit_issue(req: IssueSubmitRequest, user: dict = Depends(get_current_user)):
-    """Submit a confirmed issue to GitHub."""
+    """Submit a confirmed issue — to GitHub if the repo is on github.com, or to
+    the repo's own self-hosted GitLab-compatible instance otherwise (see
+    app.tools.github_issue.submit_repo_issue for the host-based dispatch)."""
     from app.database import get_repo
-
-    if not app_settings.github_token:
-        raise HTTPException(status_code=500, detail="GitHub token not configured (set APP_GITHUB_TOKEN)")
 
     # Verify repo exists and user has at least write access
     repo = await get_repo(req.repo_id)
@@ -366,10 +470,40 @@ async def submit_issue(req: IssueSubmitRequest, user: dict = Depends(get_current
         if perm.get("access_level") not in ("write", "admin"):
             raise HTTPException(status_code=403, detail="Write access required to submit issues")
 
-    # Submits against the stored repo URL (not client-supplied) via the shared tool implementation
-    result = await submit_github_issue(repo["url"], req.title, req.body, req.labels)
+    if req.session_id:
+        session = await get_session(req.session_id)
+        if not session or not _user_owns_session(session, user):
+            raise HTTPException(status_code=403, detail="Access denied to this session")
+        if session.get("resolved_at"):
+            raise HTTPException(status_code=409, detail="This session has already been resolved — an issue was already filed from it. Start a new session to submit another.")
+
+    # The tracker records the issue author as the owner of the stored API
+    # token, not the platform user who confirmed submission — so stamp the
+    # actual reporter into the body where the dev team can see it.
+    body = f"{req.body}\n\n---\n\n**提报人**: {user['username']}（经内部代码助手确认后提交）"
+
+    # Submits against the stored repo URL/credentials (not client-supplied)
+    # via the shared tool implementation
+    result = await submit_repo_issue(repo, req.title, body, req.labels)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
+
+    if req.session_id:
+        # This is the only place the real submission outcome (issue number,
+        # URL, who filed it) is durably recorded — chat history only ever
+        # showed the draft card live, and never remembered whether it was
+        # actually filed. Persist the SAME `body` that was actually posted
+        # (with the reporter stamp), not the unstamped draft, so this record
+        # can't drift from what's really on the tracker. Also close out the
+        # session: its task is done, so the next message on it should start
+        # fresh rather than pile on.
+        await record_issue_submission(
+            req.session_id, req.repo_id, user["id"],
+            req.title, body, req.labels,
+            result["number"], result["url"],
+            req.draft_tool_use_id,
+        )
+        await mark_session_resolved(req.session_id)
 
     return {
         "ok": True,
