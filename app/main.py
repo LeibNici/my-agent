@@ -139,7 +139,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="My Agent", lifespan=lifespan)
+app = FastAPI(title="CodeAxis", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in app_settings.cors_origins.split(",") if o.strip()],

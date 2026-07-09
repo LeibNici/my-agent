@@ -337,7 +337,7 @@ async function openSession(sessionId) {
 // first load; this copy is used whenever the view resets (new chat, delete).
 const WELCOME_HTML = `
     <div class="welcome-message">
-        <div class="welcome-eyebrow">my_agent · code-aware chat</div>
+        <div class="welcome-eyebrow">CodeAxis · code-aware chat</div>
         <h1>从这里开始</h1>
         <p>选择左侧仓库和技能，或直接描述你要做的事。</p>
         <div class="welcome-examples">
