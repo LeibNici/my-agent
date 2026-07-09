@@ -38,6 +38,8 @@ from app.database import (
     mark_session_resolved,
     record_issue_submission,
     get_issue_submissions_for_session,
+    record_issue_action,
+    get_issue_actions_for_session,
     record_llm_call_metrics,
     get_message_session_id,
     set_message_feedback,
@@ -52,7 +54,7 @@ from app.skills.base import list_skills
 from app.admin import router as admin_router
 from app.repo_sync import mask_url_credentials
 from app.tools.access import is_within_allowed_paths
-from app.tools.github_issue import submit_repo_issue, search_repo_issues
+from app.tools.github_issue import submit_repo_issue, search_repo_issues, apply_repo_issue_action
 
 # Import skills to trigger registration
 import app.skills.coder  # noqa: F401
@@ -62,6 +64,7 @@ import app.skills.issue_agent  # noqa: F401
 import app.tools.calculator  # noqa: F401
 import app.tools.file_reader  # noqa: F401
 import app.tools.code_search  # noqa: F401
+import app.tools.symbol_index  # noqa: F401
 import app.tools.github_issue  # noqa: F401
 
 MAX_MESSAGE_LENGTH = 10000
@@ -309,12 +312,22 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
         return
 
     session_id = req.session_id
+    # Distinguishes, for the client, WHY session_id might differ from what it
+    # sent — "new" (no id was sent, not actually a switch), "not_found" (the
+    # id it sent no longer exists — e.g. deleted concurrently), or "resolved"
+    # (that thread's task, like an issue submission, is already done). Left
+    # None when the returned id is exactly what was sent. web/app.js uses
+    # this to word (or skip) its session-switch notice accurately instead of
+    # assuming "resolved" just because the id changed — see insertSessionSwitchNotice.
+    switch_reason = None
     if not session_id:
         session_id = await create_session(title="New Chat", owner_id=current_user["id"])
+        switch_reason = "new"
 
     session = await get_session(session_id)
     if not session:
         session_id = await create_session(title="New Chat", owner_id=current_user["id"])
+        switch_reason = "not_found"
     elif not _user_owns_session(session, current_user):
         async for e in _sse_reject("Access denied"):
             yield e
@@ -325,6 +338,7 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
         # closed one. The client picks up the new id below, the same as
         # when it sends with session_id=None.
         session_id = await create_session(title="New Chat", owner_id=current_user["id"])
+        switch_reason = "resolved"
 
     # Tell the client the real session_id right away — not just in the final
     # "done" event. A turn can render an issue-draft card (from a tool_result
@@ -333,7 +347,7 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
     # this, the client would still have session_id=null at that point and
     # the submission would go out untracked (see submitIssue()/appendIssueCard
     # in web/app.js).
-    yield {"event": "session", "data": json.dumps({"session_id": session_id})}
+    yield {"event": "session", "data": json.dumps({"session_id": session_id, "reason": switch_reason})}
 
     full_text = ""
     # Text streamed since the last fully-persisted tool exchange — used to save
@@ -413,9 +427,19 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
                             final_message_id = await add_message(session_id, "assistant", final_text)
                         s = await get_session(session_id)
                         if s and s["title"] == "New Chat":
-                            title = req.message[:50] or (
-                                f"{len(req.images)} image(s)" if req.images else "New Chat"
-                            )
+                            if req.message.strip():
+                                title = req.message[:50]
+                            elif final_text.strip():
+                                # Image-only turn (no user text) — derive the
+                                # title from the model's own read of the
+                                # image instead of a generic "N image(s)"
+                                # label, so it's recognizable in history the
+                                # same way a text-led session is.
+                                title = final_text.strip()[:50]
+                            elif req.images:
+                                title = f"{len(req.images)} image(s)"
+                            else:
+                                title = "New Chat"
                             await update_session_title(session_id, title)
                     else:
                         # LLM error / max-iterations: save whatever text had
@@ -490,14 +514,16 @@ async def api_get_session(
 ):
     # Independent reads (each opens its own DB connection) — run concurrently
     # instead of paying sequential round-trips.
-    messages, issue_submissions, feedback = await asyncio.gather(
+    messages, issue_submissions, issue_actions, feedback = await asyncio.gather(
         get_messages(session_id),
         get_issue_submissions_for_session(session_id),
+        get_issue_actions_for_session(session_id),
         get_feedback_for_session(session_id, user["id"]),
     )
     return {
         "session": session, "messages": messages,
         "issue_submissions": issue_submissions,
+        "issue_actions": issue_actions,
         "feedback": feedback,  # {message_id: rating} for the current user
     }
 
@@ -596,9 +622,46 @@ async def api_view_code(path: str, user: dict = Depends(get_current_user)):
 
 # ==================== Issues ====================
 
+async def _require_repo_write_access(repo_id: int, user: dict) -> dict:
+    """Fetch the repo and verify `user` has write/admin access to it — shared
+    by submit_issue and submit_issue_action, the two endpoints that write to
+    an external issue tracker (as opposed to the read-only repo browsing
+    every other tool goes through)."""
+    from app.database import get_repo
+    repo = await get_repo(repo_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+    if user["role"] != "admin":
+        user_repos = await get_user_repos(user["id"])
+        perm = next((r for r in user_repos if r["id"] == repo_id), None)
+        if not perm:
+            raise HTTPException(status_code=403, detail="Access denied to this repository")
+        if perm.get("access_level") not in ("write", "admin"):
+            raise HTTPException(status_code=403, detail="Write access required")
+    return repo
+
+
+async def _require_open_session(session_id: str | None, user: dict) -> None:
+    """If session_id is given, verify the caller owns it and it isn't already
+    resolved. Shared by submit_issue and submit_issue_action — both close out
+    the session once their tracker write succeeds, so both must refuse to
+    write again against a session that's already been closed out that way."""
+    if not session_id:
+        return
+    session = await get_session(session_id)
+    if not session or not _user_owns_session(session, user):
+        raise HTTPException(status_code=403, detail="Access denied to this session")
+    if session.get("resolved_at"):
+        raise HTTPException(
+            status_code=409,
+            detail="This session has already been resolved. Start a new session to submit another issue-tracker action.",
+        )
+
+
 class IssueSubmitRequest(BaseModel):
     repo_id: int
     title: str
+    expected_behavior: str = ""
     body: str
     labels: list[str] = []
     session_id: str | None = None
@@ -610,32 +673,18 @@ async def submit_issue(req: IssueSubmitRequest, user: dict = Depends(get_current
     """Submit a confirmed issue — to GitHub if the repo is on github.com, or to
     the repo's own self-hosted GitLab-compatible instance otherwise (see
     app.tools.github_issue.submit_repo_issue for the host-based dispatch)."""
-    from app.database import get_repo
+    repo = await _require_repo_write_access(req.repo_id, user)
+    await _require_open_session(req.session_id, user)
 
-    # Verify repo exists and user has at least write access
-    repo = await get_repo(req.repo_id)
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repo not found")
-
-    if user["role"] != "admin":
-        user_repos = await get_user_repos(user["id"])
-        perm = next((r for r in user_repos if r["id"] == req.repo_id), None)
-        if not perm:
-            raise HTTPException(status_code=403, detail="Access denied to this repository")
-        if perm.get("access_level") not in ("write", "admin"):
-            raise HTTPException(status_code=403, detail="Write access required to submit issues")
-
-    if req.session_id:
-        session = await get_session(req.session_id)
-        if not session or not _user_owns_session(session, user):
-            raise HTTPException(status_code=403, detail="Access denied to this session")
-        if session.get("resolved_at"):
-            raise HTTPException(status_code=409, detail="This session has already been resolved — an issue was already filed from it. Start a new session to submit another.")
-
-    # The tracker records the issue author as the owner of the stored API
-    # token, not the platform user who confirmed submission — so stamp the
-    # actual reporter into the body where the dev team can see it.
-    body = f"{req.body}\n\n---\n\n**提报人**: {user['username']}（经内部代码助手确认后提交）"
+    # The tracker only takes one body string, so the structured
+    # expected_behavior field (shown as its own block on the confirmation
+    # card, separate from req.body — see draft_issue) gets folded back in as
+    # a leading section here. The tracker records the issue author as the
+    # owner of the stored API token, not the platform user who confirmed
+    # submission — so stamp the actual reporter into the body too, where the
+    # dev team can see it.
+    expected_section = f"## 期望行为\n\n{req.expected_behavior}\n\n" if req.expected_behavior.strip() else ""
+    body = f"{expected_section}{req.body}\n\n---\n\n**提报人**: {user['username']}（经内部代码助手确认后提交）"
 
     # Submits against the stored repo URL/credentials (not client-supplied)
     # via the shared tool implementation
@@ -656,6 +705,51 @@ async def submit_issue(req: IssueSubmitRequest, user: dict = Depends(get_current
             req.session_id, req.repo_id, user["id"],
             req.title, body, req.labels,
             result["number"], result["url"],
+            req.draft_tool_use_id,
+        )
+        await mark_session_resolved(req.session_id)
+
+    return {
+        "ok": True,
+        "issue_number": result["number"],
+        "issue_url": result["url"],
+    }
+
+
+class IssueActionRequest(BaseModel):
+    repo_id: int
+    issue_number: int
+    action: str  # "comment" | "close" | "reopen"
+    comment: str
+    session_id: str | None = None
+    draft_tool_use_id: str | None = None
+
+
+@app.post("/api/issues/action")
+async def submit_issue_action(req: IssueActionRequest, user: dict = Depends(get_current_user)):
+    """Apply a confirmed comment/close/reopen to an ALREADY-FILED issue — the
+    correction path for when a submitted issue turns out wrong at the
+    business level (not an LLM misread), instead of always spawning an
+    unrelated new issue. See app.tools.github_issue.apply_repo_issue_action
+    for the host-based dispatch."""
+    if req.action not in ("comment", "close", "reopen"):
+        raise HTTPException(status_code=400, detail="action must be one of: comment, close, reopen")
+    if not req.comment.strip():
+        raise HTTPException(status_code=400, detail="comment is required")
+
+    # Same access rules as filing a new issue — this is a write to the
+    # tracker just like submit_issue is.
+    repo = await _require_repo_write_access(req.repo_id, user)
+    await _require_open_session(req.session_id, user)
+
+    result = await apply_repo_issue_action(repo, req.issue_number, req.action, req.comment)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    if req.session_id:
+        await record_issue_action(
+            req.session_id, req.repo_id, user["id"],
+            req.issue_number, req.action, req.comment, result.get("url"),
             req.draft_tool_use_id,
         )
         await mark_session_resolved(req.session_id)

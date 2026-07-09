@@ -58,11 +58,93 @@
     --success: var(--moss);
     --error: var(--rust);
 
+    /* --- Code syntax highlighting (kept as variables, not hardcoded hex,
+       so the light theme below can repick contrast-safe values instead of
+       inheriting pale colors picked for a dark background) --- */
+    --code-string: #a9d9a2;
+    --code-attr: #9fc4e8;
+
     /* --- Type --- */
     --font-display: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
     --font-body: 'Public Sans', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
     --font-serif: 'Source Serif 4', Georgia, 'Songti SC', serif;
     --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', ui-monospace, monospace;
+}
+
+/* =========================================================================
+   Light theme — same moss/amber/rust/wire status vocabulary re-tuned for a
+   white canvas (darker/more saturated for AA text contrast; "-dim" tints
+   turn from dark washes into pale ones). Dark stays the default/base :root
+   above; this block only overrides the surface/text/status tokens.
+
+   Two ways in, so both the OS-level preference and an explicit in-app
+   choice work and the explicit choice always wins:
+   - `@media (prefers-color-scheme: light)` is the passive default — applies
+     automatically when the OS is light AND the user hasn't picked a theme
+     in this app yet (no `data-theme` attribute set).
+   - `:root[data-theme="light"]` is the explicit override, written by the
+     toggle button (shared.js) and persisted to localStorage — it has higher
+     specificity than the bare `:root` above, so it wins regardless of OS
+     preference. There's no matching `[data-theme="dark"]` block: dark is
+     already what the base `:root` holds, so an explicit dark choice just
+     falls through to it once `:not([data-theme])` above stops matching.
+   ========================================================================= */
+@media (prefers-color-scheme: light) {
+    :root:not([data-theme]) {
+        --canvas: #f5f6f0;
+        --ink-950: #ffffff;
+        --ink-900: #eef0e7;
+        --ink-850: #e5e8dc;
+        --ink-800: #dbdfcd;
+        --line: #c7cdb5;
+        --line-soft: #dde1d0;
+
+        --paper: #1b1e15;
+        --mute: #5b6350;
+        --faint: #838a76;
+
+        --moss: #1f8a4c;
+        --moss-dim: #e1f3e5;
+        --amber: #a8690a;
+        --amber-dim: #faead0;
+        --rust: #b8492a;
+        --rust-dim: #fae2d8;
+        --wire: #2f6fb0;
+        --wire-dim: #e1ecf7;
+
+        --accent-hover: #166b3a;
+
+        --code-string: #1f7a3d;
+        --code-attr: #2f5f9e;
+    }
+}
+
+:root[data-theme="light"] {
+    --canvas: #f5f6f0;
+    --ink-950: #ffffff;
+    --ink-900: #eef0e7;
+    --ink-850: #e5e8dc;
+    --ink-800: #dbdfcd;
+    --line: #c7cdb5;
+    --line-soft: #dde1d0;
+
+    --paper: #1b1e15;
+    --mute: #5b6350;
+    --faint: #838a76;
+
+    --moss: #1f8a4c;
+    --moss-dim: #e1f3e5;
+    --amber: #a8690a;
+    --amber-dim: #faead0;
+    --rust: #b8492a;
+    --rust-dim: #fae2d8;
+    --wire: #2f6fb0;
+    --wire-dim: #e1ecf7;
+
+    --accent-hover: #166b3a;
+
+    --code-string: #1f7a3d;
+    --code-attr: #2f5f9e;
 }
 
 body {
@@ -146,6 +228,27 @@ body {
     margin-top: 12px;
     padding-top: 12px;
     border-top: 1px solid var(--line-soft);
+}
+
+/* Theme toggle — built by shared.js, dropped into the user-info row (index)
+   or the admin header actions row (admin.html). Deliberately a plain glyph
+   button matching #menu-btn's understatement, not a decorative icon. */
+.theme-toggle-btn {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--paper);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-family: var(--font-display);
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.theme-toggle-btn:hover {
+    background: var(--ink-800);
+    border-color: var(--moss);
 }
 
 .workspace-section, .skills-section, .sessions-section {
@@ -648,12 +751,12 @@ body {
 .hljs { color: var(--paper); background: transparent; }
 .hljs-comment, .hljs-quote { color: var(--faint); font-style: italic; }
 .hljs-keyword, .hljs-selector-tag, .hljs-tag, .hljs-name { color: var(--wire); }
-.hljs-string, .hljs-regexp, .hljs-addition { color: #a9d9a2; }
+.hljs-string, .hljs-regexp, .hljs-addition { color: var(--code-string); }
 .hljs-number, .hljs-literal, .hljs-symbol, .hljs-bullet,
 .hljs-type, .hljs-class .hljs-title, .hljs-title.class_ { color: var(--amber); }
 .hljs-title, .hljs-title.function_, .hljs-section { color: var(--paper); font-weight: 700; }
 .hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable,
-.hljs-selector-attr, .hljs-selector-class, .hljs-selector-id { color: #9fc4e8; }
+.hljs-selector-attr, .hljs-selector-class, .hljs-selector-id { color: var(--code-attr); }
 .hljs-built_in, .hljs-builtin-name, .hljs-meta { color: var(--wire); }
 .hljs-deletion { color: var(--rust); }
 .hljs-emphasis { font-style: italic; }
@@ -1109,6 +1212,22 @@ body {
     text-align: center;
 }
 
+/* Inserted mid-transcript, right before the message that silently landed in
+   a new session (a resolved session's next message never reuses the old
+   id) — wire (info), not moss (success/resolved) or amber (pending), since
+   this is neither: it's just telling the user their message went somewhere
+   different than the thread they were looking at. */
+.session-switch-notice {
+    margin: 14px auto 10px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    background: var(--wire-dim);
+    color: var(--wire);
+    border: 1px solid var(--wire);
+    font-size: 13px;
+    text-align: center;
+}
+
 .issue-header {
     display: flex;
     align-items: center;
@@ -1138,6 +1257,18 @@ body {
     color: var(--paper);
 }
 
+/* Action on an EXISTING issue (comment/close/reopen) — reuses the draft
+   card shell, same amber accent as .issue-card: per .impeccable.md's status
+   vocabulary, amber means "pending" and wire means "read-only/passive" —
+   this card is a pending WRITE to the tracker awaiting confirmation (same
+   category as a new-issue draft), not a read-only view, so wire would
+   misapply the vocabulary. The "ISSUE ACTION" badge text plus the
+   action-specific title line ("关闭 issue · #1207" vs. a bug title) already
+   distinguish it from .issue-card without needing a different color too. */
+.issue-action-card .issue-header::before {
+    content: "ISSUE ACTION";
+}
+
 .issue-body {
     padding: 14px 16px;
     font-size: 14px;
@@ -1145,6 +1276,32 @@ body {
     color: var(--mute);
     max-height: 300px;
     overflow-y: auto;
+}
+
+/* Expected behavior — pulled out of the body into its own block (a
+   dedicated draft_issue field, not a markdown section) specifically so it's
+   the first thing a reviewing eye lands on, not something buried a few
+   paragraphs into a long technical body. Wire (read/verify) rather than
+   amber (matches the header's "draft/pending" badge already) so it reads as
+   its own distinct callout. */
+.issue-expected {
+    margin: 12px 16px 0;
+    padding: 10px 12px;
+    border: 1px solid var(--wire);
+    border-radius: 8px;
+    background: var(--wire-dim);
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--paper);
+}
+
+.issue-expected-label {
+    font-family: var(--font-display);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: var(--wire);
+    margin-bottom: 4px;
 }
 
 .issue-labels {

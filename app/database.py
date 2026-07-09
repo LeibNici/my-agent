@@ -121,6 +121,26 @@ async def init_db():
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             )
         """)
+        # Issue actions — comment/close/reopen applied to an ALREADY-FILED
+        # issue (distinct from issue_submissions, which is only ever a create).
+        # Exists for the same reason issue_submissions does: the chat message
+        # history only ever shows the confirmation card live, never persists
+        # what actually happened on the tracker.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS issue_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                repo_id INTEGER,
+                user_id INTEGER,
+                issue_number INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                comment TEXT NOT NULL,
+                issue_url TEXT,
+                draft_tool_use_id TEXT,
+                applied_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            )
+        """)
         # Per-LLM-call timing/usage — one row per iteration of the agent's
         # tool-use loop, so slow sessions can be diagnosed from real numbers
         # (time-to-first-token vs. total call time, token counts) instead of
@@ -161,6 +181,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_llm_metrics_session ON llm_call_metrics(session_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_issue_submissions_session ON issue_submissions(session_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_issue_actions_session ON issue_actions(session_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id)")
         await db.commit()
 
@@ -589,6 +610,41 @@ async def get_issue_submissions_for_session(session_id: str) -> list[dict]:
             except (json.JSONDecodeError, TypeError):
                 r["labels"] = []
         return rows
+
+
+# ==================== Issue actions (comment/close/reopen an existing issue) ====================
+
+async def record_issue_action(
+    session_id: str, repo_id: int, user_id: int,
+    issue_number: int, action: str, comment: str, issue_url: str | None,
+    draft_tool_use_id: str | None = None,
+) -> int:
+    """Record the authoritative outcome of an issue comment/close/reopen —
+    same rationale as record_issue_submission: the chat history only ever
+    shows the confirmation card live, never the real tracker outcome."""
+    now = datetime.now().isoformat()
+    async with _connect() as db:
+        cursor = await db.execute(
+            "INSERT INTO issue_actions "
+            "(session_id, repo_id, user_id, issue_number, action, comment, issue_url, draft_tool_use_id, applied_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, repo_id, user_id, issue_number, action, comment, issue_url, draft_tool_use_id, now),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_issue_actions_for_session(session_id: str) -> list[dict]:
+    """All issue actions actually applied from a session, used to reconcile
+    historical action cards to their real final state on replay."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, repo_id, user_id, issue_number, action, comment, issue_url, draft_tool_use_id, applied_at "
+            "FROM issue_actions WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
 
 
 # ==================== LLM call metrics ====================

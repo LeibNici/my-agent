@@ -60,14 +60,23 @@ document.addEventListener("DOMContentLoaded", () => {
         const nameSpan = document.createElement("span");
         nameSpan.textContent = _user.username;
 
+        const actions = document.createElement("div");
+        actions.style.cssText = "display:flex;align-items:center;gap:8px;";
+
         const logoutBtn = document.createElement("button");
         logoutBtn.textContent = "退出";
         logoutBtn.style.cssText = "background:none;border:none;color:var(--text-secondary);cursor:pointer;font-size:12px;";
         logoutBtn.onclick = logout;
 
         userInfo.appendChild(nameSpan);
-        userInfo.appendChild(logoutBtn);
+        userInfo.appendChild(actions);
+        actions.appendChild(logoutBtn);
         header.insertBefore(userInfo, header.querySelector("#new-chat-btn"));
+        // Only call this once `actions` is attached to the live document —
+        // initThemeToggle looks itself up via document.getElementById right
+        // after creating the button, which returns nothing (and leaves the
+        // button's label unset) if the subtree is still detached.
+        initThemeToggle(actions);
     }
     loadConfig();
     loadRepos();
@@ -298,6 +307,14 @@ async function openSession(sessionId) {
         else submissionsByTitle[s.title] = s;
     });
 
+    // manage_issue drafts always carry a draft_tool_use_id (no legacy rows
+    // predate this feature), so unlike issue_submissions there's no title
+    // fallback key needed here.
+    const actionsById = {};
+    (data.issue_actions || []).forEach(a => {
+        if (a.draft_tool_use_id) actionsById[a.draft_tool_use_id] = a;
+    });
+
     const feedbackMap = data.feedback || {}; // {message_id: rating} for me
     data.messages.forEach(msg => {
         if (msg.role === "user") {
@@ -307,7 +324,7 @@ async function openSession(sessionId) {
             appendUserMessage(msg.content);
         } else if (msg.role === "assistant") {
             appendAssistantMessage(msg.content, toolResults, submissionsById, submissionsByTitle,
-                                   msg.id, feedbackMap[msg.id]);
+                                   actionsById, msg.id, feedbackMap[msg.id]);
         }
     });
 
@@ -395,7 +412,8 @@ async function sendMessage() {
             ...(text ? [{ type: "text", text }] : []),
           ]
         : text;
-    appendUserMessage(userContent);
+    const userMsgEl = appendUserMessage(userContent);
+    const sessionIdAtStart = currentSessionId;
     input.value = "";
     input.style.height = "auto";
     clearPendingImages();
@@ -474,7 +492,21 @@ async function sendMessage() {
                         // real session_id well before "done", so an issue-draft
                         // card rendered mid-turn can be submitted against the
                         // right session even if the user confirms immediately.
-                        if (data.session_id) currentSessionId = data.session_id;
+                        if (data.session_id) {
+                            // sessionIdAtStart is only set (non-null) when we opened an
+                            // existing session before sending. data.reason (set by
+                            // chat_event_stream in main.py) says WHY the id might differ
+                            // from that — "resolved" (task already done) or "not_found"
+                            // (the session was deleted/is gone) both deserve a notice,
+                            // with different wording; "new"/null do not, since those
+                            // aren't actually a switch away from a thread the user was
+                            // looking at.
+                            if (sessionIdAtStart && data.session_id !== sessionIdAtStart &&
+                                (data.reason === "resolved" || data.reason === "not_found")) {
+                                insertSessionSwitchNotice(userMsgEl, sessionIdAtStart, data.reason);
+                            }
+                            currentSessionId = data.session_id;
+                        }
                     } else if (eventType === "text") {
                         if (!activeRun) {
                             hideThinking(contentEl);
@@ -519,6 +551,13 @@ async function sendMessage() {
                                 const draft = JSON.parse(data.result);
                                 if (draft.type === "issue_draft") {
                                     appendIssueCard(contentEl, draft, null, data.id);
+                                }
+                            } catch {}
+                        } else if (data.name === "manage_issue") {
+                            try {
+                                const draft = JSON.parse(data.result);
+                                if (draft.type === "issue_action_draft") {
+                                    appendIssueActionCard(contentEl, draft, null, data.id);
                                 }
                             } catch {}
                         }
@@ -695,6 +734,28 @@ function appendUserMessage(content) {
     `;
     messagesDiv.appendChild(div);
     scrollToBottom();
+    return div;
+}
+
+// A message sent into a resolved session (issue already submitted) silently
+// lands in a brand-new session server-side (see chat_event_stream in
+// main.py) — the thread otherwise looks unbroken, so the user has no way to
+// tell their follow-up didn't attach to the session/issue they were just
+// looking at. This makes that jump visible right in the transcript.
+const SESSION_SWITCH_MESSAGES = {
+    resolved: (id) => `↳ 原会话（${id}）已提交 issue 并结束，从这条消息开始已自动切换到新会话`,
+    not_found: (id) => `↳ 原会话（${id}）已不存在（可能已被删除），从这条消息开始已自动切换到新会话`,
+};
+
+function insertSessionSwitchNotice(beforeEl, oldSessionId, reason) {
+    const messagesDiv = document.getElementById("messages");
+    if (!beforeEl || !messagesDiv.contains(beforeEl)) return;
+    const buildText = SESSION_SWITCH_MESSAGES[reason];
+    if (!buildText) return;
+    const notice = document.createElement("div");
+    notice.className = "session-switch-notice";
+    notice.textContent = buildText(oldSessionId);
+    messagesDiv.insertBefore(notice, beforeEl);
 }
 
 function appendAssistantBubble() {
@@ -731,7 +792,7 @@ function hideThinking(container) {
     if (typing) typing.remove();
 }
 
-function appendAssistantMessage(content, toolResults = {}, submissionsById = {}, submissionsByTitle = {}, messageId = null, myRating = null) {
+function appendAssistantMessage(content, toolResults = {}, submissionsById = {}, submissionsByTitle = {}, actionsById = {}, messageId = null, myRating = null) {
     const messagesDiv = document.getElementById("messages");
     const div = document.createElement("div");
     div.className = "message assistant";
@@ -754,6 +815,13 @@ function appendAssistantMessage(content, toolResults = {}, submissionsById = {},
                         if (draft.type === "issue_draft") {
                             const submission = submissionsById[block.id] || submissionsByTitle[draft.title] || null;
                             appendIssueCard(contentEl, draft, submission, block.id);
+                        }
+                    } catch {}
+                } else if (block.name === "manage_issue" && result !== undefined) {
+                    try {
+                        const draft = JSON.parse(result);
+                        if (draft.type === "issue_action_draft") {
+                            appendIssueActionCard(contentEl, draft, actionsById[block.id] || null, block.id);
                         }
                     } catch {}
                 }
@@ -902,37 +970,132 @@ function scrollToBottom() {
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
 
-// ===== Issue Draft Card =====
-function appendIssueCard(container, draft, submission = null, toolUseId = null) {
-    const card = document.createElement("div");
-    card.className = "issue-card";
-    if (toolUseId) card.dataset.toolUseId = toolUseId;
+// ===== Shared by both issue-card types (draft + action) =====
 
-    // The repo this issue targets, pinned at DRAFT time (stamped by the
-    // draft_issue tool) so a later sidebar selection change can't redirect
-    // the submission. Legacy drafts without a stamp fall back to the repo
-    // selected at submit time.
-    const repoId = draft.repo_id || (submission && submission.repo_id) || null;
+// The repo a card targets, pinned at DRAFT time (stamped by draft_issue /
+// manage_issue) so a later sidebar selection change can't redirect the
+// submission. Legacy drafts without a stamp fall back to the outcome
+// record's repo_id, and finally to whatever repo is selected at submit time.
+function resolveIssueCardRepo(card, draft, outcome) {
+    const repoId = draft.repo_id || (outcome && outcome.repo_id) || null;
     let repoName = draft.repo_name || null;
     if (!repoName && repoId) {
         repoName = (reposCache.find(r => r.id === repoId) || {}).name || `#${repoId}`;
     }
     if (repoId) card.dataset.repoId = repoId;
+    return { repoId, repoName };
+}
+
+function renderIssueStatusLink(statusEl, label, url, number) {
+    statusEl.textContent = `${label} `;
+    const link = document.createElement("a");
+    link.href = url || "#";
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = `#${number}`;
+    statusEl.appendChild(link);
+    statusEl.style.color = "var(--success)";
+}
+
+function cancelIssueCard(btn) {
+    const card = btn.closest(".issue-card");
+    card.querySelector(".issue-status").textContent = "已取消";
+    btn.disabled = true;
+    btn.previousElementSibling.disabled = true;
+}
+
+// Shared submit flow for both confirmation-card types: disable buttons, POST
+// to `endpoint`, render the resulting link or an error, and (on success)
+// reflect that the session got closed out server-side. `buildBody(repoId)`
+// returns the request payload; `successLabel` is the Chinese verb shown next
+// to the resulting issue link ("已提交" / "已处理").
+async function submitIssueCardRequest(card, endpoint, buildBody, successLabel) {
+    const statusEl = card.querySelector(".issue-status");
+    const confirmBtn = card.querySelector(".btn-confirm");
+    const cancelBtn = card.querySelector(".btn-cancel");
+
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    statusEl.textContent = "提交中...";
+
+    const targetRepoId = parseInt(card.dataset.repoId) || selectedRepoId;
+    if (!targetRepoId) {
+        statusEl.textContent = "请先在左侧选择一个仓库";
+        statusEl.style.color = "var(--error)";
+        confirmBtn.disabled = false;
+        cancelBtn.disabled = false;
+        return;
+    }
+
+    try {
+        const resp = await authFetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildBody(targetRepoId)),
+        });
+
+        const result = await resp.json();
+        if (!resp.ok) {
+            statusEl.textContent = result.detail || "提交失败";
+            statusEl.style.color = "var(--error)";
+            confirmBtn.disabled = false;
+            cancelBtn.disabled = false;
+            return;
+        }
+
+        renderIssueStatusLink(statusEl, successLabel, result.issue_url, result.issue_number);
+
+        // Submitting closes out this thread's task server-side (resolved_at) —
+        // reflect that here so the user isn't surprised when their next
+        // message lands in a brand new session.
+        appendResolvedNotice();
+        loadSessions();
+    } catch (err) {
+        statusEl.textContent = `网络错误: ${escapeHtml(err.message)}`;
+        statusEl.style.color = "var(--error)";
+        confirmBtn.disabled = false;
+        cancelBtn.disabled = false;
+    }
+}
+
+function appendResolvedNotice() {
+    const messagesDiv = document.getElementById("messages");
+    const div = document.createElement("div");
+    div.className = "session-resolved-notice";
+    div.textContent = "✅ 本次任务已完结 — 发送新消息将开始一个新会话";
+    messagesDiv.appendChild(div);
+    scrollToBottom();
+}
+
+// ===== Issue Draft Card (draft_issue — files a NEW issue) =====
+function appendIssueCard(container, draft, submission = null, toolUseId = null) {
+    const card = document.createElement("div");
+    card.className = "issue-card";
+    if (toolUseId) card.dataset.toolUseId = toolUseId;
+
+    const { repoId, repoName } = resolveIssueCardRepo(card, draft, submission);
 
     const labelsHtml = (draft.labels || [])
         .map(l => `<span class="issue-label">${escapeHtml(l)}</span>`)
         .join(" ");
+
+    // Older drafts persisted before this field existed have none — skip the
+    // block entirely rather than show it empty.
+    const expectedHtml = draft.expected_behavior
+        ? `<div class="issue-expected"><div class="issue-expected-label">期望行为</div>${renderMarkdown(draft.expected_behavior)}</div>`
+        : "";
 
     card.innerHTML = `
         <div class="issue-header">
             <span class="issue-title">${escapeHtml(draft.title)}</span>
             <span class="issue-repo" title="提交目标仓库">${repoName ? "→ " + escapeHtml(repoName) : "→ 提交时选择的仓库"}</span>
         </div>
+        ${expectedHtml}
         <div class="issue-body">${renderMarkdown(draft.body)}</div>
         <div class="issue-labels">${labelsHtml}</div>
         <div class="issue-actions">
             <button class="btn-confirm" onclick="submitIssue(this)" ${submission ? "disabled" : ""}>确认提交</button>
-            <button class="btn-cancel" onclick="this.parentElement.parentElement.querySelector('.issue-status').textContent='已取消'; this.disabled=true; this.previousElementSibling.disabled=true;" ${submission ? "disabled" : ""}>取消</button>
+            <button class="btn-cancel" onclick="cancelIssueCard(this)" ${submission ? "disabled" : ""}>取消</button>
             <span class="issue-status"></span>
         </div>
     `;
@@ -949,95 +1112,74 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
     // Reconciled against the real outcome (issue_submissions) — reflect the
     // actual filed issue instead of showing an active, re-clickable draft.
     if (submission) {
-        const statusEl = card.querySelector(".issue-status");
-        statusEl.textContent = "已提交 ";
-        const link = document.createElement("a");
-        link.href = submission.issue_url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = `#${submission.issue_number}`;
-        statusEl.appendChild(link);
-        statusEl.style.color = "var(--success)";
+        renderIssueStatusLink(card.querySelector(".issue-status"), "已提交", submission.issue_url, submission.issue_number);
     }
 
-    scrollToBottom();
-}
-
-function appendResolvedNotice() {
-    const messagesDiv = document.getElementById("messages");
-    const div = document.createElement("div");
-    div.className = "session-resolved-notice";
-    div.textContent = "✅ 本次任务已完结 — 发送新消息将开始一个新会话";
-    messagesDiv.appendChild(div);
     scrollToBottom();
 }
 
 async function submitIssue(btn) {
     const card = btn.closest(".issue-card");
     const draft = JSON.parse(card.dataset.draft);
-    const statusEl = card.querySelector(".issue-status");
-    const confirmBtn = card.querySelector(".btn-confirm");
-    const cancelBtn = card.querySelector(".btn-cancel");
+    await submitIssueCardRequest(card, "/api/issues/submit", (targetRepoId) => ({
+        repo_id: targetRepoId,
+        title: draft.title,
+        expected_behavior: draft.expected_behavior || "",
+        body: draft.body,
+        labels: draft.labels || [],
+        session_id: currentSessionId,
+        draft_tool_use_id: card.dataset.toolUseId || null,
+    }), "已提交");
+}
 
-    confirmBtn.disabled = true;
-    cancelBtn.disabled = true;
-    statusEl.textContent = "提交中...";
+// ===== Issue Action Card (manage_issue — comment/close/reopen an EXISTING issue) =====
+const ISSUE_ACTION_LABELS = { comment: "追加评论", close: "关闭 issue", reopen: "重新打开 issue" };
 
-    // Prefer the repo pinned on the card at draft time; fall back to the
-    // current sidebar selection for legacy drafts without a stamp.
-    const targetRepoId = parseInt(card.dataset.repoId) || selectedRepoId;
-    if (!targetRepoId) {
-        statusEl.textContent = "请先在左侧选择一个仓库";
-        statusEl.style.color = "var(--error)";
-        confirmBtn.disabled = false;
-        cancelBtn.disabled = false;
-        return;
+function appendIssueActionCard(container, draft, action = null, toolUseId = null) {
+    const card = document.createElement("div");
+    card.className = "issue-card issue-action-card";
+    if (toolUseId) card.dataset.toolUseId = toolUseId;
+
+    const { repoName } = resolveIssueCardRepo(card, draft, action);
+    const actionLabel = ISSUE_ACTION_LABELS[draft.action] || draft.action;
+
+    card.innerHTML = `
+        <div class="issue-header">
+            <span class="issue-title">${actionLabel} · #${escapeHtml(String(draft.issue_number))}</span>
+            <span class="issue-repo" title="目标仓库">${repoName ? "→ " + escapeHtml(repoName) : "→ 提交时选择的仓库"}</span>
+        </div>
+        <div class="issue-body">${renderMarkdown(draft.comment)}</div>
+        <div class="issue-actions">
+            <button class="btn-confirm" onclick="submitIssueAction(this)" ${action ? "disabled" : ""}>确认${escapeHtml(actionLabel)}</button>
+            <button class="btn-cancel" onclick="cancelIssueCard(this)" ${action ? "disabled" : ""}>取消</button>
+            <span class="issue-status"></span>
+        </div>
+    `;
+
+    card.dataset.draft = JSON.stringify(draft);
+    container.appendChild(card);
+    highlightCode(card);
+    linkifyCodeRefs(card.querySelector(".issue-body"));
+
+    // Reconciled against the real outcome (issue_actions) on replay.
+    if (action) {
+        renderIssueStatusLink(card.querySelector(".issue-status"), "已处理", action.issue_url, action.issue_number);
     }
 
-    try {
-        const resp = await authFetch("/api/issues/submit", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                repo_id: targetRepoId,
-                title: draft.title,
-                body: draft.body,
-                labels: draft.labels || [],
-                session_id: currentSessionId,
-                draft_tool_use_id: card.dataset.toolUseId || null,
-            }),
-        });
+    scrollToBottom();
+}
 
-        const result = await resp.json();
-        if (!resp.ok) {
-            statusEl.textContent = result.detail || "提交失败";
-            statusEl.style.color = "var(--error)";
-            confirmBtn.disabled = false;
-            cancelBtn.disabled = false;
-            return;
-        }
-
-        // Use textContent for safety, build link element manually
-        statusEl.textContent = "已提交 ";
-        const link = document.createElement("a");
-        link.href = result.issue_url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = `#${result.issue_number}`;
-        statusEl.appendChild(link);
-        statusEl.style.color = "var(--success)";
-
-        // Submitting closes out this thread's task server-side (resolved_at) —
-        // reflect that here so the user isn't surprised when their next
-        // message lands in a brand new session.
-        appendResolvedNotice();
-        loadSessions();
-    } catch (err) {
-        statusEl.textContent = `网络错误: ${escapeHtml(err.message)}`;
-        statusEl.style.color = "var(--error)";
-        confirmBtn.disabled = false;
-        cancelBtn.disabled = false;
-    }
+async function submitIssueAction(btn) {
+    const card = btn.closest(".issue-card");
+    const draft = JSON.parse(card.dataset.draft);
+    await submitIssueCardRequest(card, "/api/issues/action", (targetRepoId) => ({
+        repo_id: targetRepoId,
+        issue_number: draft.issue_number,
+        action: draft.action,
+        comment: draft.comment,
+        session_id: currentSessionId,
+        draft_tool_use_id: card.dataset.toolUseId || null,
+    }), "已处理");
 }
 
 // ===== Issue duplicate lookup =====

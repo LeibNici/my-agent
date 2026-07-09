@@ -191,19 +191,23 @@ async def sync_repo(
     self-heals by falling back to a fresh clone — safe because these clones
     are read-only (no tool ever writes into them), so there's no local state
     to lose.
+
+    Not lock-protected itself — its only caller, sync_and_persist, holds
+    _get_repo_lock(repo_id) for its entire body (clone/pull AND the index
+    rebuild that follows), so a second sync of the same repo can never
+    observe or race a half-written checkout.
     """
-    async with _get_repo_lock(repo_id):
-        local_path = get_repo_local_path(repo_id)
-        already_cloned = os.path.isdir(os.path.join(local_path, ".git"))
+    local_path = get_repo_local_path(repo_id)
+    already_cloned = os.path.isdir(os.path.join(local_path, ".git"))
 
-        if already_cloned and not force_reclone:
-            success, msg = await pull_repo(repo_id, cred_username, cred_token)
-            if not success:
-                success, msg = await clone_repo(url, repo_id, branch, cred_username, cred_token)
-        else:
+    if already_cloned and not force_reclone:
+        success, msg = await pull_repo(repo_id, cred_username, cred_token)
+        if not success:
             success, msg = await clone_repo(url, repo_id, branch, cred_username, cred_token)
+    else:
+        success, msg = await clone_repo(url, repo_id, branch, cred_username, cred_token)
 
-        return success, msg, local_path
+    return success, msg, local_path
 
 
 async def sync_and_persist(
@@ -213,12 +217,36 @@ async def sync_and_persist(
     """Sync a repo and persist its local_path on success. The single place
     that implements "sync then save the result" — startup, the periodic
     loop, and every admin-triggered sync all call this instead of each
-    hand-rolling the sync-then-maybe-persist sequence."""
+    hand-rolling the sync-then-maybe-persist sequence.
+
+    The index rebuild is kicked off as a background task rather than awaited
+    here, so an admin's create/update/manual-sync API call returns as soon as
+    git is done instead of also blocking on ctags (up to
+    symbol_index._BUILD_TIMEOUT_SECONDS more). It re-acquires the same
+    per-repo lock itself (see _background_build_index) so it still can't race
+    a second sync_and_persist's clone_repo rmtree+rename against the checkout
+    it's scanning — it just does its waiting in the background instead of on
+    this request."""
     from app.database import update_repo
-    success, msg, local_path = await sync_repo(url, repo_id, branch, force_reclone, cred_username, cred_token)
+    async with _get_repo_lock(repo_id):
+        success, msg, local_path = await sync_repo(url, repo_id, branch, force_reclone, cred_username, cred_token)
+        if success:
+            await update_repo(repo_id, local_path=local_path)
     if success:
-        await update_repo(repo_id, local_path=local_path)
+        asyncio.create_task(_background_build_index(repo_id, local_path))
     return success, msg
+
+
+async def _background_build_index(repo_id: int, local_path: str) -> None:
+    """Rebuild the ctags index for one repo, holding that repo's sync lock
+    for the duration — run as a fire-and-forget task by sync_and_persist so
+    the triggering request doesn't wait on it, while still serializing
+    against a concurrent sync_and_persist's clone_repo (which rmtree+renames
+    the same checkout this reads). Best-effort: build_index() swallows its
+    own errors, so this never has anything to propagate."""
+    from app.tools.symbol_index import build_index
+    async with _get_repo_lock(repo_id):
+        await build_index(local_path)
 
 
 async def sync_all_repos(repos: list[dict]):

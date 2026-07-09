@@ -67,7 +67,11 @@ async def _search_one_repo(repo_path: str, keyword: str, file_pattern: str) -> l
         return [f"(search error: {e})"]
 
 
-@tool("Search for a keyword in repository code. Returns matching file paths, line numbers, and content lines. Use this to find relevant code for the user's question.")
+@tool("Search for a literal keyword or substring in repository code (fixed-string match, NOT regex — "
+      "characters like .*, (), [] are matched literally and will not act as wildcards). Returns matching "
+      "file paths, line numbers, and content lines. Use exact identifiers, field names, or short literal "
+      "phrases copied from the code/UI text. If a search returns no matches, try a different literal "
+      "substring (e.g. a shorter fragment or a related term) rather than a regex-style pattern.")
 async def code_search(keyword: str, file_pattern: str = "*", max_results: int = 20) -> str:
     """Search repository code for a keyword using grep."""
     allowed_paths = get_allowed_paths()

@@ -5,6 +5,7 @@ const isAuthorizedAdmin = !!token && user.role === "admin";
 if (!isAuthorizedAdmin) { window.location.href = "/login"; }
 
 document.getElementById("admin-user").textContent = user.username || "";
+initThemeToggle(document.getElementById("admin-header-actions"));
 
 // escapeHtml is defined in shared.js (loaded before this file) — aliased as
 // `esc` here since every call site in this file already uses that name.

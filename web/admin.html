@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Admin — My Agent</title>
+    <!-- Applied before first paint so an explicit theme choice (localStorage,
+         set by shared.js's toggle) never flashes the wrong theme on load. -->
+    <script>(function(){var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);})();</script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Public+Sans:wght@400;500;600;700&family=Source+Serif+4:ital,wght@1,400;1,500&display=swap">
@@ -131,7 +134,7 @@
     <div class="admin-layout">
         <div class="admin-header">
             <h1>admin</h1>
-            <div style="display:flex;gap:12px;align-items:center;">
+            <div id="admin-header-actions" style="display:flex;gap:12px;align-items:center;">
                 <span id="admin-user" style="font-family:var(--font-mono);font-size:13px;color:var(--mute)"></span>
                 <button class="logout-btn" onclick="logout()">退出</button>
             </div>

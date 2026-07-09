@@ -8,7 +8,7 @@ An internal AI coding-assistant chat tool for engineers at 信川机械工业 (X
 Machinery) — lets them browse/search their own repos, confirm bugs, walk
 through code, and draft GitHub/GitLab issues from a chat UI. Chinese-primary
 UI copy, English technical identifiers. See `.impeccable.md` for the product's
-design language (color vocabulary, typography, dark-only theme) — read it
+design language (color vocabulary, typography, dark + light theme) — read it
 before touching `web/style.css` or making other visual/UI decisions.
 
 The assistant is deliberately **read-only over the tracked repos**: no tool
@@ -64,7 +64,31 @@ truncated. Prompt caching (`cache_control` breakpoints, applied in
 `agent.py`) is governed by `ANTHROPIC_PROMPT_CACHE` = auto|on|off — "auto"
 enables it only against the official Anthropic API, since third-party
 Anthropic-compatible endpoints may reject the field. `code_search` uses
-ripgrep when installed, falling back to `grep -F`.
+ripgrep when installed, falling back to `grep -F` — either way it's a fixed-
+string match, not regex.
+
+**Symbol index** (`app/tools/symbol_index.py`): `find_symbol`/`list_file_symbols`
+answer "where is X defined" / "what's in this file" directly from a ctags
+index instead of `code_search` guesswork — added after observing real chat
+transcripts where the model tried regex-shaped `code_search` keywords
+(`Foo.*bar`) against the fixed-string grep and silently got nothing back.
+ctags is an optional OS package (`apt install universal-ctags`); everything
+degrades to "no index, fall back to code_search/file_reader" if it's absent.
+The index is a sidecar file next to each checkout (`<local_path>.tags.json`,
+outside the git working tree so `git pull`/reclone never touch it — its path
+is always derived via `os.path.realpath`, since the writer (`sync_and_persist`)
+and the readers (`find_symbol`/`list_file_symbols`, via
+`access.get_allowed_paths`) start from differently-normalized inputs and must
+agree on one canonical path). Rebuilt by `build_index()` after every
+successful sync as a background task (see Repo sync below), not awaited by
+the request that triggered the sync — it re-acquires that repo's own sync
+lock so it still can't race a concurrent reclone. `_load_tags` caches the
+parsed file in-process keyed by mtime, so a turn calling these tools
+repeatedly (as the `issue_agent` prompt encourages) doesn't re-parse a
+multi-MB file every time. `.vue` files are indexed by forcing ctags'
+TypeScript parser onto them (`--langmap=TypeScript:+.vue`) — it ignores the
+surrounding template/style markup it can't parse and still extracts every
+top-level function/interface/type declared in `<script>`.
 
 **Permission model**: repos are admin-managed (`app/admin.py`) and users are
 granted per-repo `read`/`write`/`admin` access (`permissions` table in
@@ -78,13 +102,22 @@ context set means no access, not "everything."
 
 **Repo sync** (`app/repo_sync.py`): repos are shallow-cloned into
 `APP_REPOS_DIR` (default `/tmp/agent-repos`) on creation, on a periodic
-background loop, and on manual admin trigger — never written to by any tool.
-Clone/pull both run through `_run_git` with a hard timeout; credentials are
+background loop, and on manual admin trigger — the checkout itself (the git
+working tree at `local_path`) is never written to by any tool. The one
+deliberate exception is the ctags symbol index (see below), which is a
+sibling *file* next to the checkout, not inside it — the tracked repo content
+stays untouched either way. Clone/pull both run through `_run_git` with a
+hard timeout; credentials are
 passed per-invocation via a git `-c http.extraheader` config value (never
 persisted into the on-disk remote URL or exposed back to clients — see
 `mask_url_credentials`). `_validate_url`/`_is_disallowed_host` block
 loopback/private/link-local hosts as an SSRF guard, reused by both git sync
 and the GitLab issue-submission API call in `app/tools/github_issue.py`.
+`sync_and_persist` also kicks off a rebuild of that repo's ctags symbol index
+(`app/tools/symbol_index.py`) as a background task on every successful
+clone/pull, best-effort — an indexing failure never fails the sync itself,
+and the triggering request (including admin create/update/manual-sync API
+calls) doesn't block on ctags.
 
 **Issue submission** (`app/tools/github_issue.py`, wired into
 `POST /api/issues/submit` in `main.py`): the `draft_issue` tool only returns
