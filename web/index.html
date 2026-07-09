@@ -16,6 +16,10 @@
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"
             integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a"
             crossorigin="anonymous"></script>
+    <!-- highlight.js for code syntax highlighting (pinned version + SRI; theme colors live in style.css) -->
+    <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"
+            integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp"
+            crossorigin="anonymous"></script>
 </head>
 <body>
     <div id="app">
@@ -26,7 +30,7 @@
         <aside id="sidebar">
             <div class="sidebar-header">
                 <h2>my_agent</h2>
-                <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
+                <button id="new-chat-btn" onclick="newChat()">+ 新建会话</button>
             </div>
 
             <!-- Repos: workspace picker -->
@@ -44,6 +48,7 @@
             <!-- Sessions -->
             <div class="sessions-section">
                 <h3>History</h3>
+                <input id="session-search" type="search" placeholder="搜索会话标题 / ID…" oninput="filterSessions()" autocomplete="off">
                 <div id="sessions-list"></div>
             </div>
         </aside>
@@ -74,18 +79,33 @@
                 <div id="chat-notice"></div>
                 <div id="image-preview-strip"></div>
                 <div class="input-wrapper">
-                    <button id="attach-btn" onclick="document.getElementById('image-file-input').click()" title="Attach image" aria-label="Attach image">+</button>
+                    <button id="attach-btn" onclick="document.getElementById('image-file-input').click()" title="添加截图" aria-label="添加截图">+</button>
                     <input type="file" id="image-file-input" accept="image/jpeg,image/png,image/gif,image/webp" multiple style="display:none" onchange="handleImageFilesSelected(this.files)">
                     <textarea
                         id="message-input"
-                        placeholder="Type your message... (Enter to send, Shift+Enter for new line, paste or attach an image)"
+                        placeholder="描述问题，或直接粘贴系统截图…"
                         rows="1"
                         onkeydown="handleKeyDown(event)"
                         oninput="autoResize(this)"
                         onpaste="handlePaste(event)"
                     ></textarea>
-                    <button id="send-btn" onclick="sendMessage()">Send</button>
+                    <button id="send-btn" onclick="sendMessage()">发送</button>
                 </div>
+                <div class="input-hint"><kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · 支持粘贴/拖入截图</div>
+
+            <!-- Read-only code viewer, opened by clicking a file:line reference -->
+            <div id="code-viewer" hidden>
+                <div class="cv-header">
+                    <span class="cv-eyebrow">READ-ONLY</span>
+                    <span class="cv-title"></span>
+                    <button class="cv-close" onclick="closeCodeViewer()" title="关闭 (Esc)" aria-label="关闭代码查看器">×</button>
+                </div>
+                <div class="cv-scroll">
+                    <div class="cv-hl"></div>
+                    <div class="cv-gutter"></div>
+                    <pre class="cv-pre"><code></code></pre>
+                </div>
+            </div>
             </div>
         </main>
     </div>

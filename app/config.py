@@ -42,7 +42,11 @@ class AnthropicSettings(BaseSettings):
     """Anthropic/LLM provider settings."""
     api_key: str = ""
     base_url: str = "https://api.anthropic.com"
-    model: str = "claude-sonnet-4-20250514"
+    # claude-sonnet-4-20250514 (the old default) was retired 2026-06-15 and
+    # now 404s on the Anthropic API — claude-sonnet-5 is its official
+    # replacement. Deployments that point base_url at another provider's
+    # Anthropic-compatible endpoint set ANTHROPIC_MODEL explicitly anyway.
+    model: str = "claude-sonnet-5"
     max_tokens: int = 4096
     system_prompt: str = (
         "You are an internal code assistant for engineers browsing their team's repositories. "
@@ -71,6 +75,24 @@ class AnthropicSettings(BaseSettings):
     # confirming a genuine case that used all 10 legitimately and still needed
     # more. Configurable via ANTHROPIC_MAX_TOOL_ITERATIONS if this needs tuning.
     max_tool_iterations: int = 30
+
+    # Prompt caching (cache_control breakpoints): "auto" enables it only when
+    # base_url is the official Anthropic API — third-party Anthropic-compatible
+    # endpoints (e.g. DashScope) may reject the field. "on"/"off" force it.
+    prompt_cache: str = "auto"
+
+    # History sent to the model is windowed to this many most-recent messages
+    # (persisted history in SQLite is never truncated). 0 disables windowing.
+    # Cuts are adjusted so a tool_use/tool_result pair is never split.
+    max_history_messages: int = 60
+
+    @property
+    def prompt_cache_enabled(self) -> bool:
+        if self.prompt_cache == "on":
+            return True
+        if self.prompt_cache == "off":
+            return False
+        return "api.anthropic.com" in self.base_url
 
     model_config = {
         "env_file": ".env",

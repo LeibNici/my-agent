@@ -329,14 +329,16 @@ function formatMs(n) {
 }
 
 async function loadUsage() {
-    const [summaryResp, byUserResp, recentResp] = await Promise.all([
+    const [summaryResp, byUserResp, recentResp, feedbackResp] = await Promise.all([
         fetch("/api/admin/usage/summary", { headers: authHeaders() }),
         fetch("/api/admin/usage/by-user", { headers: authHeaders() }),
         fetch("/api/admin/usage/recent?limit=50", { headers: authHeaders() }),
+        fetch("/api/admin/feedback/summary", { headers: authHeaders() }),
     ]);
     const summary = await summaryResp.json();
     const byUser = await byUserResp.json();
     const recent = await recentResp.json();
+    const feedback = await feedbackResp.json();
 
     const cards = document.getElementById("usage-summary-cards");
     cards.innerHTML = `
@@ -389,6 +391,31 @@ async function loadUsage() {
             <td>${formatMs(r.total_ms)}</td>
         </tr>
     `).join("") || `<tr><td colspan="8" style="color:var(--faint);">暂无数据</td></tr>`;
+
+    const up = Number(feedback.up_count || 0), down = Number(feedback.down_count || 0);
+    const total = up + down;
+    document.getElementById("feedback-summary-cards").innerHTML = `
+        <div class="stat-card">
+            <div class="stat-label">👍 有帮助</div>
+            <div class="stat-value" style="color:var(--moss)">${formatNumber(up)}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">👎 不准确</div>
+            <div class="stat-value" style="color:var(--rust)">${formatNumber(down)}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">好评率</div>
+            <div class="stat-value">${total ? Math.round(up / total * 100) + "%" : "—"}</div>
+            <div class="stat-sub">共 ${formatNumber(total)} 次评价</div>
+        </div>
+    `;
+    document.getElementById("feedback-negative-table").innerHTML = (feedback.recent_negative || []).map(f => `
+        <tr>
+            <td>${esc((f.created_at || "").replace("T", " ").slice(0, 19))}</td>
+            <td title="${esc(f.session_title || "")}">${esc(f.session_id)} ${esc(f.session_title || "")}</td>
+            <td>${esc(f.username || "-")}</td>
+        </tr>
+    `).join("") || `<tr><td colspan="3" style="color:var(--faint);">暂无差评</td></tr>`;
 }
 
 // ===== Init =====

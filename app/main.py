@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import json
+import os
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -20,7 +21,7 @@ from app.agent import Agent
 from app.auth import (
     create_token, hash_password, verify_password, get_current_user,
 )
-from app.config import app_settings
+from app.config import settings, app_settings
 from app.database import (
     init_db,
     create_session,
@@ -38,6 +39,9 @@ from app.database import (
     record_issue_submission,
     get_issue_submissions_for_session,
     record_llm_call_metrics,
+    get_message_session_id,
+    set_message_feedback,
+    get_feedback_for_session,
 )
 from app.models import (
     ChatRequest, SessionInfo, SkillInfo,
@@ -47,16 +51,15 @@ from pydantic import BaseModel
 from app.skills.base import list_skills
 from app.admin import router as admin_router
 from app.repo_sync import mask_url_credentials
-from app.tools.github_issue import submit_repo_issue
+from app.tools.access import is_within_allowed_paths
+from app.tools.github_issue import submit_repo_issue, search_repo_issues
 
 # Import skills to trigger registration
 import app.skills.coder  # noqa: F401
-import app.skills.researcher  # noqa: F401
 import app.skills.issue_agent  # noqa: F401
 
 # Import tools to trigger registration
 import app.tools.calculator  # noqa: F401
-import app.tools.web_search  # noqa: F401
 import app.tools.file_reader  # noqa: F401
 import app.tools.code_search  # noqa: F401
 import app.tools.github_issue  # noqa: F401
@@ -253,6 +256,45 @@ async def _sse_reject(message: str):
     yield {"event": "end", "data": ""}
 
 
+_HISTORY_IMAGE_PLACEHOLDER = "[历史消息中的截图已省略；如需模型重看，请让用户重新发送图片]"
+
+
+def _prepare_model_messages(history: list[dict]) -> list[dict]:
+    """Shape persisted history into what gets SENT to the model this turn.
+    The DB copy is never modified.
+
+    - Image blocks from past turns are replaced with a text placeholder:
+      every base64 screenshot would otherwise be re-uploaded on every LLM
+      call of every later turn, dominating input cost for image-heavy
+      sessions long after the image stopped mattering.
+    - History is windowed to the most recent max_history_messages, cutting
+      only at safe points: the first kept message must be a plain user turn,
+      never an orphaned tool_result relay (the API rejects a tool_result
+      whose tool_use was trimmed away) or an assistant message.
+    """
+    msgs = []
+    for m in history:
+        content = m["content"]
+        if isinstance(content, list):
+            content = [
+                {"type": "text", "text": _HISTORY_IMAGE_PLACEHOLDER}
+                if isinstance(b, dict) and b.get("type") == "image" else b
+                for b in content
+            ]
+        msgs.append({"role": m["role"], "content": content})
+
+    limit = settings.max_history_messages
+    if limit and len(msgs) > limit:
+        msgs = msgs[-limit:]
+        def _is_tool_relay(m: dict) -> bool:
+            return isinstance(m["content"], list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"]
+            )
+        while msgs and (msgs[0]["role"] != "user" or _is_tool_relay(msgs[0])):
+            msgs.pop(0)
+    return msgs
+
+
 async def chat_event_stream(req: ChatRequest, current_user: dict):
     """Generate SSE events for a chat message."""
     if len(req.message) > MAX_MESSAGE_LENGTH:
@@ -303,7 +345,7 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
     pending_llm_metrics = []
     async with _get_session_lock(session_id):
         history = await get_messages(session_id)
-        messages = [{"role": m["role"], "content": m["content"]} for m in history]
+        messages = _prepare_model_messages(history)
         if req.images:
             user_content = [
                 {"type": "image", "source": {"type": "base64", "media_type": img.media_type, "data": img.data}}
@@ -327,6 +369,11 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
         # Repos the user is granted but that have never synced successfully —
         # distinct from "no permission" so tools can report the real cause.
         unsynced_repo_names = [r["name"] for r in granted_repos if not r.get("local_path")]
+        # The repo this turn is unambiguously about — stamped into issue
+        # drafts. Explicit selection wins; a single granted repo also counts.
+        active_repo = None
+        if len(granted_repos) == 1:
+            active_repo = {"id": granted_repos[0]["id"], "name": granted_repos[0]["name"]}
 
         try:
             async for event in agent.run(
@@ -334,6 +381,7 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
                 active_skills=req.active_skills,
                 allowed_repo_paths=allowed_repo_paths,
                 unsynced_repo_names=unsynced_repo_names,
+                active_repo=active_repo,
             ):
                 if event.type == "text_delta":
                     full_text += event.data["text"]
@@ -358,10 +406,11 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
                         "ttft_ms": event.data["ttft_ms"], "total_ms": event.data["total_ms"],
                     })
                 elif event.type == "done":
+                    final_message_id = None
                     if event.data.get("success", True):
                         final_text = event.data.get("text", "")
                         if final_text:
-                            await add_message(session_id, "assistant", final_text)
+                            final_message_id = await add_message(session_id, "assistant", final_text)
                         s = await get_session(session_id)
                         if s and s["title"] == "New Chat":
                             title = req.message[:50] or (
@@ -377,8 +426,10 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
                                                partial_text + "\n\n_（回复未完成：发生错误）_")
                     await record_llm_call_metrics(pending_llm_metrics)
                     pending_llm_metrics = []
+                    # message_id lets the client attach 👍/👎 to this answer
                     yield {"event": "done", "data": json.dumps({
                         "session_id": session_id, "text": full_text,
+                        "message_id": final_message_id,
                     }, ensure_ascii=False)}
                 elif event.type == "error":
                     yield {"event": "error", "data": json.dumps(event.data, ensure_ascii=False)}
@@ -432,14 +483,23 @@ async def get_owned_session(session_id: str, user: dict = Depends(get_current_us
 
 
 @app.get("/api/sessions/{session_id}")
-async def api_get_session(session_id: str, session: dict = Depends(get_owned_session)):
+async def api_get_session(
+    session_id: str,
+    session: dict = Depends(get_owned_session),
+    user: dict = Depends(get_current_user),
+):
     # Independent reads (each opens its own DB connection) — run concurrently
-    # instead of paying two sequential round-trips.
-    messages, issue_submissions = await asyncio.gather(
+    # instead of paying sequential round-trips.
+    messages, issue_submissions, feedback = await asyncio.gather(
         get_messages(session_id),
         get_issue_submissions_for_session(session_id),
+        get_feedback_for_session(session_id, user["id"]),
     )
-    return {"session": session, "messages": messages, "issue_submissions": issue_submissions}
+    return {
+        "session": session, "messages": messages,
+        "issue_submissions": issue_submissions,
+        "feedback": feedback,  # {message_id: rating} for the current user
+    }
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -461,6 +521,77 @@ async def api_list_skills(user: dict = Depends(get_current_user)) -> list[SkillI
         SkillInfo(name=s.name, description=s.description, tools=s.tool_names, active=False)
         for s in skills.values()
     ]
+
+
+# ==================== Message feedback ====================
+
+class FeedbackRequest(BaseModel):
+    session_id: str
+    message_id: int
+    rating: int  # 1 = 👍, -1 = 👎
+
+
+@app.post("/api/feedback")
+async def api_set_feedback(req: FeedbackRequest, user: dict = Depends(get_current_user)):
+    if req.rating not in (1, -1):
+        raise HTTPException(status_code=400, detail="rating must be 1 or -1")
+    session = await get_session(req.session_id)
+    if not session or not _user_owns_session(session, user):
+        raise HTTPException(status_code=403, detail="Access denied")
+    # The message must actually belong to the claimed session — otherwise a
+    # crafted request could rate arbitrary messages across sessions.
+    if await get_message_session_id(req.message_id) != req.session_id:
+        raise HTTPException(status_code=404, detail="Message not found in this session")
+    await set_message_feedback(req.message_id, req.session_id, user["id"], req.rating)
+    return {"ok": True}
+
+
+# ==================== Code viewing ====================
+
+CODE_VIEW_MAX_BYTES = 2 * 1024 * 1024
+CODE_VIEW_MAX_LINES = 3000
+
+
+@app.get("/api/code/file")
+async def api_view_code(path: str, user: dict = Depends(get_current_user)):
+    """Read a file for the in-chat code viewer. The path is repo-relative
+    (as the agent cites it, e.g. `wms/scan/ScanService.java`); it is resolved
+    against each repo the user is granted, with the same containment and
+    dotfile rules as the file_reader tool."""
+    if not path or len(path) > 500:
+        raise HTTPException(status_code=400, detail="Invalid path")
+    for part in path.split("/"):
+        if part.startswith(".") and part not in (".", ".."):
+            raise HTTPException(status_code=403, detail="Dotfiles are not viewable")
+
+    repos = await _get_visible_repos(user)
+    for repo in repos:
+        root = repo.get("local_path")
+        if not root:
+            continue
+        root = os.path.realpath(root)
+        candidate = os.path.realpath(os.path.join(root, path))
+        if not is_within_allowed_paths(candidate, [root]):
+            continue
+        if not os.path.isfile(candidate):
+            continue
+        if os.path.getsize(candidate) > CODE_VIEW_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="File too large to view")
+        with open(candidate, "r", encoding="utf-8", errors="replace") as f:
+            lines = []
+            truncated = False
+            for i, line in enumerate(f):
+                if i >= CODE_VIEW_MAX_LINES:
+                    truncated = True
+                    break
+                lines.append(line)
+        return {
+            "repo": repo["name"],
+            "path": path,
+            "content": "".join(lines),
+            "truncated": truncated,
+        }
+    raise HTTPException(status_code=404, detail="File not found in your repositories")
 
 
 # ==================== Issues ====================
@@ -534,6 +665,26 @@ async def submit_issue(req: IssueSubmitRequest, user: dict = Depends(get_current
         "issue_number": result["number"],
         "issue_url": result["url"],
     }
+
+
+class IssueDupCheckRequest(BaseModel):
+    repo_id: int
+    title: str
+
+
+@app.post("/api/issues/check-duplicates")
+async def check_duplicate_issues(req: IssueDupCheckRequest, user: dict = Depends(get_current_user)):
+    """Search the repo's tracker for issues with a similar title, so the
+    draft card can warn before a duplicate gets filed. Best-effort: tracker
+    errors surface as an empty list, never as a failed request."""
+    repos = await _get_visible_repos(user)
+    repo = next((r for r in repos if r["id"] == req.repo_id), None)
+    if not repo:
+        raise HTTPException(status_code=403, detail="Access denied to this repository")
+    query = req.title.strip()[:100]
+    if not query:
+        return {"issues": []}
+    return {"issues": await search_repo_issues(repo, query)}
 
 
 # ==================== Serve frontend ====================

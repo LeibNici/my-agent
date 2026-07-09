@@ -2,9 +2,15 @@
 
 import asyncio
 import os
+import shutil
 
 from app.tools.registry import tool
 from app.tools.access import get_allowed_paths, no_access_reason, is_within_allowed_paths
+
+# ripgrep is an order of magnitude faster than grep on large Java/Vue repos
+# and skips .gitignore'd + hidden files by default. Resolved once at import;
+# falls back to grep where rg isn't installed.
+_RG_BIN = shutil.which("rg")
 
 
 def _validate_repo_path(path: str, allowed_paths: list[str]) -> tuple[bool, str, str]:
@@ -15,15 +21,29 @@ def _validate_repo_path(path: str, allowed_paths: list[str]) -> tuple[bool, str,
     return False, real_path, "Access denied: path is outside your assigned repositories"
 
 
+def _search_argv(keyword: str, file_pattern: str, repo_path: str) -> list[str]:
+    """Build the search command. The keyword is always treated as a FIXED
+    string (-F): users search for identifiers like `deduct(` or `a[0]`, and
+    treating those as regex (the old grep -P) made them hard errors."""
+    if _RG_BIN:
+        argv = [_RG_BIN, "--line-number", "--no-heading", "--fixed-strings",
+                "--max-columns", "300", "--max-columns-preview"]
+        if file_pattern and file_pattern != "*":
+            argv += ["--glob", file_pattern]
+        argv += ["--", keyword, repo_path]
+        return argv
+    return ["grep", "-rn", "-F", "--include", file_pattern,
+            "--exclude-dir=.*", "--exclude=.*",  # never search into dotfiles/dotdirs (.env, .git, .ssh, ...)
+            "--", keyword, repo_path]
+
+
 async def _search_one_repo(repo_path: str, keyword: str, file_pattern: str) -> list[str]:
     if not os.path.isdir(repo_path):
         return []
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "grep", "-rn", "-P", "--include", file_pattern,
-            "--exclude-dir=.*", "--exclude=.*",  # never search into dotfiles/dotdirs (.env, .git, .ssh, ...)
-            "--", keyword, repo_path,  # -- prevents flag injection
+            *_search_argv(keyword, file_pattern, repo_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -38,7 +58,7 @@ async def _search_one_repo(repo_path: str, keyword: str, file_pattern: str) -> l
         return [f"(search timed out for {os.path.basename(repo_path)})"]
     except asyncio.CancelledError:
         # The chat request itself was cancelled (e.g. user hit stop) — kill
-        # the grep child instead of leaving it running as an orphan.
+        # the search child instead of leaving it running as an orphan.
         if proc is not None:
             proc.kill()
             await proc.wait()
@@ -61,7 +81,7 @@ async def code_search(keyword: str, file_pattern: str = "*", max_results: int = 
     # immediately, but once the cap is hit we stop waiting and cancel the rest
     # instead of blocking on every repo's grep.
     tasks = [
-        asyncio.ensure_task(_search_one_repo(repo_path, keyword, file_pattern))
+        asyncio.create_task(_search_one_repo(repo_path, keyword, file_pattern))
         for repo_path in allowed_paths
     ]
     results = []

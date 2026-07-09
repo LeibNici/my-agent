@@ -140,6 +140,28 @@ async def init_db():
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             )
         """)
+        # Per-answer user feedback (👍/👎) — one row per (message, user),
+        # re-rating overwrites. message_id points at the assistant message
+        # that closed the turn.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS message_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                user_id INTEGER,
+                rating INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                UNIQUE(message_id, user_id)
+            )
+        """)
+        # SQLite does not auto-index foreign keys — without these, every
+        # session open / usage query walks the whole table.
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_llm_metrics_session ON llm_call_metrics(session_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_issue_submissions_session ON issue_submissions(session_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id)")
         await db.commit()
 
         # Migration: add owner_id to existing sessions table if missing
@@ -472,12 +494,12 @@ async def delete_session(session_id: str):
         await db.commit()
 
 
-async def add_message(session_id: str, role: str, content: str | list):
-    """Add a message to a session."""
+async def add_message(session_id: str, role: str, content: str | list) -> int:
+    """Add a message to a session. Returns the new message's row id."""
     now = datetime.now().isoformat()
     content_str = json.dumps(content, ensure_ascii=False) if isinstance(content, list) else content
     async with _connect() as db:
-        await db.execute(
+        cursor = await db.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
             (session_id, role, content_str, now),
         )
@@ -486,6 +508,7 @@ async def add_message(session_id: str, role: str, content: str | list):
             (now, session_id),
         )
         await db.commit()
+        return cursor.lastrowid
 
 
 async def get_messages(session_id: str) -> list[dict]:
@@ -493,7 +516,7 @@ async def get_messages(session_id: str) -> list[dict]:
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT role, content, timestamp FROM messages WHERE session_id = ? ORDER BY id",
+            "SELECT id, role, content, timestamp FROM messages WHERE session_id = ? ORDER BY id",
             (session_id,),
         )
         rows = await cursor.fetchall()
@@ -635,6 +658,71 @@ async def get_usage_by_user() -> list[dict]:
             GROUP BY m.user_id
             ORDER BY (total_input_tokens + total_output_tokens) DESC
         """)
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+# ==================== Message feedback ====================
+
+async def get_message_session_id(message_id: int) -> str | None:
+    """Which session a message belongs to — used to validate feedback targets."""
+    async with _connect() as db:
+        cursor = await db.execute("SELECT session_id FROM messages WHERE id = ?", (message_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_message_feedback(message_id: int, session_id: str, user_id: int, rating: int) -> None:
+    """Record a 👍(+1)/👎(-1) on an assistant message; re-rating overwrites."""
+    now = datetime.now().isoformat()
+    async with _connect() as db:
+        await db.execute(
+            "INSERT INTO message_feedback (message_id, session_id, user_id, rating, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(message_id, user_id) DO UPDATE SET rating = ?, created_at = ?",
+            (message_id, session_id, user_id, rating, now, rating, now),
+        )
+        await db.commit()
+
+
+async def get_feedback_for_session(session_id: str, user_id: int) -> dict[int, int]:
+    """This user's ratings in a session, as {message_id: rating} — used to
+    restore button state when a session is replayed."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            "SELECT message_id, rating FROM message_feedback WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        )
+        return {row[0]: row[1] for row in await cursor.fetchall()}
+
+
+async def get_feedback_summary() -> dict:
+    """Overall 👍/👎 totals for the admin usage dashboard."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT
+                COALESCE(SUM(CASE WHEN rating > 0 THEN 1 ELSE 0 END), 0) as up_count,
+                COALESCE(SUM(CASE WHEN rating < 0 THEN 1 ELSE 0 END), 0) as down_count
+            FROM message_feedback
+        """)
+        return dict(await cursor.fetchone())
+
+
+async def get_recent_negative_feedback(limit: int = 20) -> list[dict]:
+    """Most recent 👎 with session context — the admin's review queue for
+    answers that missed."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT f.message_id, f.session_id, s.title as session_title,
+                   f.user_id, u.username, f.created_at
+            FROM message_feedback f
+            LEFT JOIN users u ON u.id = f.user_id
+            LEFT JOIN sessions s ON s.id = f.session_id
+            WHERE f.rating < 0
+            ORDER BY f.id DESC
+            LIMIT ?
+        """, (limit,))
         return [dict(r) for r in await cursor.fetchall()]
 
 

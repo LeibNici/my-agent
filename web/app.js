@@ -85,15 +85,18 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 });
 
-// ===== Escape key to cancel stream =====
+// ===== Escape key: cancel stream / close panels =====
 document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && isStreaming && currentAbortController) {
+    if (e.key !== "Escape") return;
+    const viewer = document.getElementById("code-viewer");
+    if (viewer && !viewer.hidden) {
+        viewer.hidden = true;
+        return; // one Escape = one action; don't also cancel the stream
+    }
+    if (isStreaming && currentAbortController) {
         currentAbortController.abort();
     }
-    // Close sidebar on Escape (mobile)
-    if (e.key === "Escape") {
-        closeSidebar();
-    }
+    closeSidebar(); // close mobile sidebar
 });
 
 // ===== Mobile sidebar toggle =====
@@ -112,9 +115,12 @@ function closeSidebar() {
 }
 
 // ===== Repos =====
+let reposCache = []; // visible repos — used to resolve names for issue cards
+
 async function loadRepos() {
     const resp = await authFetch("/api/repos");
     const repos = await resp.json();
+    reposCache = repos;
     const container = document.getElementById("repos-list");
     if (!container) return;
     container.innerHTML = "";
@@ -174,13 +180,45 @@ function toggleSkill(chip, name) {
 }
 
 // ===== Sessions =====
+let sessionsCache = [];
+
 async function loadSessions() {
     const resp = await authFetch("/api/sessions");
-    const sessions = await resp.json();
+    sessionsCache = await resp.json();
+    renderSessions();
+}
+
+function filterSessions() { renderSessions(); }
+
+// Bucket a session by its last activity for the git-log-style history list.
+function sessionGroup(updatedAt) {
+    const d = new Date(updatedAt);
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    if (d >= today) return "今天";
+    if (d >= new Date(today.getTime() - 86400e3)) return "昨天";
+    if (d >= new Date(today.getTime() - 7 * 86400e3)) return "近 7 天";
+    return "更早";
+}
+
+function renderSessions() {
     const container = document.getElementById("sessions-list");
     container.innerHTML = "";
+    const q = (document.getElementById("session-search")?.value || "").trim().toLowerCase();
+    const sessions = q
+        ? sessionsCache.filter(s => (s.title || "").toLowerCase().includes(q) || s.id.includes(q))
+        : sessionsCache;
 
+    let lastGroup = null;
     sessions.forEach(s => {
+        const group = sessionGroup(s.updated_at);
+        if (group !== lastGroup) {
+            lastGroup = group;
+            const label = document.createElement("div");
+            label.className = "session-group-label";
+            label.textContent = group;
+            container.appendChild(label);
+        }
         const item = document.createElement("div");
         item.className = "session-item"
             + (s.id === currentSessionId ? " active" : "")
@@ -260,6 +298,7 @@ async function openSession(sessionId) {
         else submissionsByTitle[s.title] = s;
     });
 
+    const feedbackMap = data.feedback || {}; // {message_id: rating} for me
     data.messages.forEach(msg => {
         if (msg.role === "user") {
             // Pure tool-result relay messages have no standalone bubble —
@@ -267,7 +306,8 @@ async function openSession(sessionId) {
             if (Array.isArray(msg.content) && msg.content.length && msg.content.every(b => b.type === "tool_result")) return;
             appendUserMessage(msg.content);
         } else if (msg.role === "assistant") {
-            appendAssistantMessage(msg.content, toolResults, submissionsById, submissionsByTitle);
+            appendAssistantMessage(msg.content, toolResults, submissionsById, submissionsByTitle,
+                                   msg.id, feedbackMap[msg.id]);
         }
     });
 
@@ -276,16 +316,26 @@ async function openSession(sessionId) {
     loadSessions(); // refresh active highlight
 }
 
+// Single source for the empty state — index.html ships the same markup for
+// first load; this copy is used whenever the view resets (new chat, delete).
+const WELCOME_HTML = `
+    <div class="welcome-message">
+        <div class="welcome-eyebrow">my_agent · code-aware chat</div>
+        <h1>从这里开始</h1>
+        <p>选择左侧仓库和技能，或直接描述你要做的事。</p>
+        <div class="welcome-examples">
+            <button class="example-chip" onclick="fillExample(this)">这段代码逻辑是什么？帮我逐步讲解</button>
+            <button class="example-chip" onclick="fillExample(this)">确认一下这个 bug 是否真的存在</button>
+            <button class="example-chip" onclick="fillExample(this)">帮我起草一个 GitHub issue</button>
+        </div>
+    </div>
+`;
+
 async function deleteSession(sessionId) {
     await authFetch(`/api/sessions/${sessionId}`, { method: "DELETE" });
     if (currentSessionId === sessionId) {
         currentSessionId = null;
-        document.getElementById("messages").innerHTML = `
-            <div class="welcome-message">
-                <h1>Where should we start?</h1>
-                <p>Choose a repo and a skill on the left, or just start typing.</p>
-            </div>
-        `;
+        document.getElementById("messages").innerHTML = WELCOME_HTML;
     }
     loadSessions();
 }
@@ -296,12 +346,7 @@ function newChat() {
     }
     closeSidebar(); // close mobile sidebar
     currentSessionId = null;
-    document.getElementById("messages").innerHTML = `
-        <div class="welcome-message">
-            <h1>Where should we start?</h1>
-            <p>Choose a repo and a skill on the left, or just start typing.</p>
-        </div>
-    `;
+    document.getElementById("messages").innerHTML = WELCOME_HTML;
     loadSessions();
 }
 
@@ -490,6 +535,11 @@ async function sendMessage() {
                         // Now render each text run as complete markdown, in place
                         for (const run of textRuns) {
                             run.el.innerHTML = renderMarkdown(run.text);
+                            highlightCode(run.el);
+                            linkifyCodeRefs(run.el);
+                        }
+                        if (data.message_id) {
+                            appendFeedbackBar(bubble, data.message_id, null);
                         }
                     } else if (eventType === "error") {
                         hideThinking(contentEl);
@@ -521,12 +571,12 @@ async function sendMessage() {
 function setSendButtonState(state) {
     const btn = document.getElementById("send-btn");
     if (state === "stop") {
-        btn.textContent = "■ Stop";
+        btn.textContent = "■ 停止";
         btn.classList.add("stop-state");
         btn.onclick = stopStreaming;
         btn.disabled = false;
     } else {
-        btn.textContent = "Send";
+        btn.textContent = "发送";
         btn.classList.remove("stop-state");
         btn.onclick = sendMessage;
         btn.disabled = false;
@@ -681,7 +731,7 @@ function hideThinking(container) {
     if (typing) typing.remove();
 }
 
-function appendAssistantMessage(content, toolResults = {}, submissionsById = {}, submissionsByTitle = {}) {
+function appendAssistantMessage(content, toolResults = {}, submissionsById = {}, submissionsByTitle = {}, messageId = null, myRating = null) {
     const messagesDiv = document.getElementById("messages");
     const div = document.createElement("div");
     div.className = "message assistant";
@@ -714,6 +764,13 @@ function appendAssistantMessage(content, toolResults = {}, submissionsById = {},
     div.innerHTML = `<div class="message-header">Agent</div>`;
     div.appendChild(contentEl);
     messagesDiv.appendChild(div);
+    highlightCode(contentEl);
+    linkifyCodeRefs(contentEl);
+    // Final answers are persisted as plain strings; tool exchanges as arrays.
+    // Feedback attaches to answers only.
+    if (typeof content === "string" && messageId) {
+        appendFeedbackBar(div, messageId, myRating);
+    }
     scrollToBottom();
 }
 
@@ -825,6 +882,16 @@ function renderMarkdown(text) {
     return escapeHtml(text).replace(/\n/g, "<br>");
 }
 
+// Syntax-highlight all code fences inside a rendered container. Runs AFTER
+// DOMPurify sanitization (hljs only adds <span class="hljs-*"> wrappers), and
+// only on final rendered markdown — never on streaming plain-text runs.
+function highlightCode(container) {
+    if (typeof hljs === "undefined" || !container) return;
+    container.querySelectorAll("pre code:not(.hljs)").forEach(el => {
+        try { hljs.highlightElement(el); } catch {}
+    });
+}
+
 function truncate(str, maxLen) {
     if (str.length <= maxLen) return str;
     return str.slice(0, maxLen) + `\n... (truncated, ${str.length} chars total)`;
@@ -841,6 +908,17 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
     card.className = "issue-card";
     if (toolUseId) card.dataset.toolUseId = toolUseId;
 
+    // The repo this issue targets, pinned at DRAFT time (stamped by the
+    // draft_issue tool) so a later sidebar selection change can't redirect
+    // the submission. Legacy drafts without a stamp fall back to the repo
+    // selected at submit time.
+    const repoId = draft.repo_id || (submission && submission.repo_id) || null;
+    let repoName = draft.repo_name || null;
+    if (!repoName && repoId) {
+        repoName = (reposCache.find(r => r.id === repoId) || {}).name || `#${repoId}`;
+    }
+    if (repoId) card.dataset.repoId = repoId;
+
     const labelsHtml = (draft.labels || [])
         .map(l => `<span class="issue-label">${escapeHtml(l)}</span>`)
         .join(" ");
@@ -848,6 +926,7 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
     card.innerHTML = `
         <div class="issue-header">
             <span class="issue-title">${escapeHtml(draft.title)}</span>
+            <span class="issue-repo" title="提交目标仓库">${repoName ? "→ " + escapeHtml(repoName) : "→ 提交时选择的仓库"}</span>
         </div>
         <div class="issue-body">${renderMarkdown(draft.body)}</div>
         <div class="issue-labels">${labelsHtml}</div>
@@ -861,6 +940,11 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
     // Store draft data on the card element
     card.dataset.draft = JSON.stringify(draft);
     container.appendChild(card);
+    highlightCode(card);
+    linkifyCodeRefs(card.querySelector(".issue-body"));
+
+    // Duplicate lookup — best-effort, card works fine without it
+    if (!submission) checkIssueDuplicates(card, repoId || selectedRepoId, draft.title);
 
     // Reconciled against the real outcome (issue_submissions) — reflect the
     // actual filed issue instead of showing an active, re-clickable draft.
@@ -899,8 +983,11 @@ async function submitIssue(btn) {
     cancelBtn.disabled = true;
     statusEl.textContent = "提交中...";
 
-    if (!selectedRepoId) {
-        statusEl.textContent = "请先选择一个仓库";
+    // Prefer the repo pinned on the card at draft time; fall back to the
+    // current sidebar selection for legacy drafts without a stamp.
+    const targetRepoId = parseInt(card.dataset.repoId) || selectedRepoId;
+    if (!targetRepoId) {
+        statusEl.textContent = "请先在左侧选择一个仓库";
         statusEl.style.color = "var(--error)";
         confirmBtn.disabled = false;
         cancelBtn.disabled = false;
@@ -912,7 +999,7 @@ async function submitIssue(btn) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                repo_id: selectedRepoId,
+                repo_id: targetRepoId,
                 title: draft.title,
                 body: draft.body,
                 labels: draft.labels || [],
@@ -951,4 +1038,150 @@ async function submitIssue(btn) {
         confirmBtn.disabled = false;
         cancelBtn.disabled = false;
     }
+}
+
+// ===== Issue duplicate lookup =====
+async function checkIssueDuplicates(card, repoId, title) {
+    if (!repoId || !title) return;
+    try {
+        const resp = await authFetch("/api/issues/check-duplicates", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ repo_id: repoId, title }),
+        });
+        if (!resp.ok) return;
+        const { issues } = await resp.json();
+        if (!issues || !issues.length) return;
+
+        const box = document.createElement("div");
+        box.className = "issue-dupes";
+        const head = document.createElement("div");
+        head.className = "issue-dupes-head";
+        head.textContent = `发现 ${issues.length} 个相似 issue，提交前请确认不是重复：`;
+        box.appendChild(head);
+        issues.slice(0, 5).forEach(i => {
+            const row = document.createElement("a");
+            row.className = "issue-dupe";
+            row.href = i.url;
+            row.target = "_blank";
+            row.rel = "noopener noreferrer";
+            row.textContent = `#${i.number} ${i.title}`;
+            const state = document.createElement("span");
+            state.className = "issue-dupe-state" + (i.state === "closed" ? " closed" : "");
+            state.textContent = i.state === "closed" ? "已关闭" : "开放中";
+            row.appendChild(state);
+            box.appendChild(row);
+        });
+        card.insertBefore(box, card.querySelector(".issue-actions"));
+    } catch {}
+}
+
+// ===== Clickable code references =====
+// Matches inline-code refs the agent cites, e.g. `wms/scan/ScanService.java:88-92`
+// or `src/api/order.vue` — needs at least one "/" so bare identifiers stay plain.
+const CODE_REF_RE = /^((?:[\w.-]+\/)+[\w.-]+\.[A-Za-z]{1,10})(?::(\d+)(?:-(\d+))?)?$/;
+
+function linkifyCodeRefs(container) {
+    if (!container) return;
+    container.querySelectorAll("code").forEach(el => {
+        if (el.closest("pre") || el.classList.contains("code-ref")) return;
+        const m = el.textContent.trim().match(CODE_REF_RE);
+        if (!m) return;
+        el.classList.add("code-ref");
+        el.title = "点击查看源码";
+        el.addEventListener("click", () => {
+            openCodeViewer(m[1], m[2] ? parseInt(m[2]) : null, m[3] ? parseInt(m[3]) : null);
+        });
+    });
+}
+
+// ===== Code viewer panel =====
+const CV_LINE_HEIGHT = 20;
+
+function closeCodeViewer() {
+    document.getElementById("code-viewer").hidden = true;
+}
+
+async function openCodeViewer(path, startLine = null, endLine = null) {
+    const panel = document.getElementById("code-viewer");
+    const titleEl = panel.querySelector(".cv-title");
+    const gutterEl = panel.querySelector(".cv-gutter");
+    const codeEl = panel.querySelector(".cv-pre code");
+    const hlEl = panel.querySelector(".cv-hl");
+    const scrollEl = panel.querySelector(".cv-scroll");
+
+    panel.hidden = false;
+    titleEl.textContent = path;
+    gutterEl.innerHTML = "";
+    hlEl.style.display = "none";
+    codeEl.textContent = "加载中…";
+    codeEl.className = "";
+
+    let data;
+    try {
+        const resp = await authFetch(`/api/code/file?path=${encodeURIComponent(path)}`);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            codeEl.textContent = err.detail || `无法读取文件（${resp.status}）`;
+            return;
+        }
+        data = await resp.json();
+    } catch (e) {
+        codeEl.textContent = `网络错误：${e.message}`;
+        return;
+    }
+
+    titleEl.textContent = `${data.repo} · ${data.path}`;
+    const lineCount = data.content.split("\n").length;
+    gutterEl.textContent = Array.from({ length: lineCount }, (_, i) => i + 1).join("\n");
+    codeEl.textContent = data.content + (data.truncated ? "\n… (文件过长，已截断)" : "");
+    if (typeof hljs !== "undefined") {
+        try { hljs.highlightElement(codeEl); } catch {}
+    }
+
+    if (startLine) {
+        const end = endLine || startLine;
+        hlEl.style.display = "block";
+        hlEl.style.top = (startLine - 1) * CV_LINE_HEIGHT + "px";
+        hlEl.style.height = (end - startLine + 1) * CV_LINE_HEIGHT + "px";
+        scrollEl.scrollTop = Math.max(0, (startLine - 1) * CV_LINE_HEIGHT - 120);
+    } else {
+        scrollEl.scrollTop = 0;
+    }
+}
+
+// ===== Answer feedback (👍/👎) =====
+function appendFeedbackBar(messageDiv, messageId, myRating) {
+    const bar = document.createElement("div");
+    bar.className = "feedback-bar";
+    bar.dataset.messageId = messageId;
+    bar.dataset.sessionId = currentSessionId || "";
+
+    const mk = (rating, symbol, label) => {
+        const b = document.createElement("button");
+        b.className = "fb-btn" + (myRating === rating ? " active" : "");
+        b.innerHTML = `<span class="fb-icon">${symbol}</span>${label}`;
+        b.onclick = () => rateMessage(bar, rating);
+        return b;
+    };
+    bar.appendChild(mk(1, "▲", "有帮助"));
+    bar.appendChild(mk(-1, "▼", "不准确"));
+    messageDiv.appendChild(bar);
+}
+
+async function rateMessage(bar, rating) {
+    const messageId = parseInt(bar.dataset.messageId);
+    const sessionId = bar.dataset.sessionId || currentSessionId;
+    if (!messageId || !sessionId) return;
+    try {
+        const resp = await authFetch("/api/feedback", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, message_id: messageId, rating }),
+        });
+        if (!resp.ok) return;
+        const [up, down] = bar.querySelectorAll(".fb-btn");
+        up.classList.toggle("active", rating === 1);
+        down.classList.toggle("active", rating === -1);
+    } catch {}
 }

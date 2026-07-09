@@ -21,6 +21,32 @@ class AgentEvent:
     data: dict = field(default_factory=dict)
 
 
+def _apply_cache_control(messages: list[dict]) -> None:
+    """Move the conversation cache breakpoint to the last content block.
+
+    Prompt caching is a prefix match: marking the newest block lets every
+    LLM call in the tool loop (and the next user turn) reuse the whole prior
+    conversation at cache-read prices. Old markers are stripped first so the
+    request never exceeds the 4-breakpoint API limit as the loop appends
+    messages. Mutates `messages` in place; string contents are converted to
+    a single text block so they can carry the marker.
+    """
+    for msg in messages:
+        if isinstance(msg.get("content"), list):
+            for block in msg["content"]:
+                if isinstance(block, dict):
+                    block.pop("cache_control", None)
+    if not messages:
+        return
+    last = messages[-1]
+    if isinstance(last.get("content"), str):
+        last["content"] = [{"type": "text", "text": last["content"]}]
+    if isinstance(last.get("content"), list) and last["content"]:
+        block = last["content"][-1]
+        if isinstance(block, dict) and block.get("type") in ("text", "tool_result", "image"):
+            block["cache_control"] = {"type": "ephemeral"}
+
+
 class Agent:
     """Core agent that runs the tool-use loop with streaming."""
 
@@ -33,6 +59,7 @@ class Agent:
         active_skills: list[str] | None = None,
         allowed_repo_paths: list[str] | None = None,
         unsynced_repo_names: list[str] | None = None,
+        active_repo: dict | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent loop, yielding events as they occur.
 
@@ -43,6 +70,11 @@ class Agent:
         """
         # Build system prompt with active skills
         system = build_system_prompt(settings.system_prompt, active_skills or [])
+        # With caching on, the system prompt becomes a cached prefix block —
+        # tools render before system, so this one breakpoint covers both.
+        cache_enabled = settings.prompt_cache_enabled
+        if cache_enabled:
+            system = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
 
         # Set tool context for permission-aware tools
         tool_context.set({
@@ -50,6 +82,9 @@ class Agent:
             # Granted but never-synced repos — lets tools report the real
             # cause instead of a blanket "no permissions" when paths are empty.
             "unsynced_repo_names": unsynced_repo_names or [],
+            # The repo this chat turn is scoped to ({id, name}) — draft_issue
+            # stamps it into drafts so submission can't target the wrong repo.
+            "active_repo": active_repo,
         })
 
         # Collect available tools (all tools if no skills, or skill-specific tools)
@@ -74,6 +109,9 @@ class Agent:
             t_first_token = None
             input_tokens = 0
             output_tokens = 0
+
+            if cache_enabled:
+                _apply_cache_control(messages)
 
             try:
                 async with self.llm.client.messages.stream(

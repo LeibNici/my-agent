@@ -9,6 +9,7 @@ from app.database import (
     create_repo, list_repos, get_repo, update_repo, delete_repo,
     grant_permission, revoke_permission, list_permissions, get_user_repos,
     get_usage_summary, get_usage_by_user, get_recent_llm_calls,
+    get_feedback_summary, get_recent_negative_feedback,
 )
 from app.repo_sync import mask_url_credentials
 from app.models import (
@@ -202,6 +203,13 @@ async def api_usage_by_user():
 @router.get("/usage/recent")
 async def api_usage_recent(limit: int = 50):
     return await get_recent_llm_calls(limit)
+
+
+@router.get("/feedback/summary")
+async def api_feedback_summary():
+    summary = await get_feedback_summary()
+    summary["recent_negative"] = await get_recent_negative_feedback(20)
+    return summary
 
 
 @router.get("/users/{user_id}/repos")
