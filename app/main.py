@@ -905,6 +905,15 @@ async def check_duplicate_issues(req: IssueDupCheckRequest, user: dict = Depends
     return {"issues": await search_repo_issues(repo, query)}
 
 
+@app.get("/api/issues/mine")
+async def my_issue_submissions(user: dict = Depends(get_current_user)):
+    """The submitter's own filed issues + fix progress — powers the 我的提报
+    drawer. Data is kept fresh by the admin-side tracking poller; this is a
+    plain read."""
+    from app.database import get_my_issue_submissions
+    return await get_my_issue_submissions(user["id"])
+
+
 # ==================== Serve frontend ====================
 
 app.mount("/static", StaticFiles(directory="web"), name="static")

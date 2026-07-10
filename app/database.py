@@ -258,6 +258,9 @@ async def init_db():
         await _add_column_if_missing(db, "issue_submissions", "closed_at", "TEXT", issue_submissions_columns)
         await _add_column_if_missing(db, "issue_submissions", "last_checked_at", "TEXT", issue_submissions_columns)
         await _add_column_if_missing(db, "issue_submissions", "track_error", "TEXT", issue_submissions_columns)
+        # When track_status last CHANGED (not last polled) — drives the
+        # submitter-side "有新进展" unread badge.
+        await _add_column_if_missing(db, "issue_submissions", "status_changed_at", "TEXT", issue_submissions_columns)
 
         # Migration: add branch and separate username/token credential columns
         # to existing repositories table if missing
@@ -678,7 +681,8 @@ async def get_issue_submissions_for_session(session_id: str) -> list[dict]:
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, repo_id, user_id, title, body, labels, issue_number, issue_url, draft_tool_use_id, submitted_at "
+            "SELECT id, repo_id, user_id, title, body, labels, issue_number, issue_url, draft_tool_use_id, submitted_at, "
+            "COALESCE(track_status, 'submitted') as track_status, reopen_count "
             "FROM issue_submissions WHERE session_id = ? ORDER BY id",
             (session_id,),
         )
@@ -724,6 +728,11 @@ async def update_issue_tracking(submission_id: int, track_status: str = None,
     poll ATTEMPT, success or failure (track_error carries the failure)."""
     fields, values = ["last_checked_at = ?"], [datetime.now().isoformat()]
     if track_status is not None:
+        # Stamp status_changed_at only on a real transition — a poll that
+        # re-observes the same status must not re-trigger unread badges.
+        fields.append("status_changed_at = CASE WHEN COALESCE(track_status, 'submitted') != ? "
+                      "THEN ? ELSE status_changed_at END")
+        values.extend([track_status, datetime.now().isoformat()])
         fields.append("track_status = ?"); values.append(track_status)
     if remote_state is not None:
         fields.append("remote_state = ?"); values.append(remote_state)
@@ -811,6 +820,32 @@ async def get_fix_reports_for_submissions(submission_ids: list[int]) -> dict[int
                 d["files"] = []
             out.setdefault(d["submission_id"], []).append(d)
         return out
+
+
+async def get_my_issue_submissions(user_id: int, limit: int = 50) -> list[dict]:
+    """The submitter's own filed issues with tracking state — powers the
+    我的提报 drawer. Own submissions only; no bodies (the drawer doesn't
+    need N×KB of markdown)."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT s.id, s.repo_id, r.name as repo_name, s.title, s.issue_number, s.issue_url,
+                   s.submitted_at, COALESCE(s.track_status, 'submitted') as track_status,
+                   s.reopen_count, s.closed_at, s.status_changed_at
+            FROM issue_submissions s
+            LEFT JOIN repositories r ON r.id = s.repo_id
+            WHERE s.user_id = ? AND s.issue_number IS NOT NULL
+            ORDER BY s.id DESC
+            LIMIT ?
+        """, (user_id, limit))
+        rows = [dict(r) for r in await cursor.fetchall()]
+        reports = await get_fix_reports_for_submissions([r["id"] for r in rows])
+        for r in rows:
+            verified = [rep for rep in reports.get(r["id"], []) if rep.get("verified") == 1]
+            r["fix_verified"] = bool(verified)
+            r["fix_files_count"] = len(verified[-1]["files"]) if verified else None
+            r["fix_commit"] = (verified[-1].get("commit_sha") or "")[:10] if verified else None
+        return rows
 
 
 async def get_issue_tracking_overview(limit: int = 100) -> dict:

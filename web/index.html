@@ -48,6 +48,12 @@
                 <div id="skills-list"></div>
             </div>
 
+            <!-- My filed issues: entry to the tracking drawer -->
+            <button id="my-issues-btn" onclick="openMyIssues()">
+                <span>我的提报</span>
+                <span id="my-issues-badge" hidden></span>
+            </button>
+
             <!-- Sessions -->
             <div class="sessions-section">
                 <h3>History</h3>
@@ -112,6 +118,18 @@
             </div>
         </main>
     </div>
+
+    <!-- My filed issues drawer -->
+    <div id="my-issues-overlay" hidden onclick="closeMyIssues()"></div>
+    <aside id="my-issues-drawer" hidden aria-label="我的提报">
+        <div class="mi-header">
+            <span class="mi-eyebrow">ISSUE TRACKING</span>
+            <h2>我的提报</h2>
+            <button class="mi-close" onclick="closeMyIssues()" title="关闭 (Esc)" aria-label="关闭">×</button>
+        </div>
+        <div class="mi-hint">状态每 10 分钟自动同步；「可验证」表示修复已合入 test 分支，可到测试环境复验。</div>
+        <div id="my-issues-list"></div>
+    </aside>
 
     <script src="/static/shared.js"></script>
     <script src="/static/app.js"></script>

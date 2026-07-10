@@ -82,6 +82,7 @@ document.addEventListener("DOMContentLoaded", () => {
     loadRepos();
     loadSkills();
     loadSessions();
+    if (_isAuthenticated) refreshMyIssuesBadge();
 
     const inputArea = document.getElementById("input-area");
     if (inputArea) {
@@ -102,11 +103,106 @@ document.addEventListener("keydown", (e) => {
         viewer.hidden = true;
         return; // one Escape = one action; don't also cancel the stream
     }
+    const drawer = document.getElementById("my-issues-drawer");
+    if (drawer && !drawer.hidden) {
+        closeMyIssues();
+        return;
+    }
     if (isStreaming && currentAbortController) {
         currentAbortController.abort();
     }
     closeSidebar(); // close mobile sidebar
 });
+
+// ===== My filed issues (我的提报) drawer =====
+// Submitter-facing view of issue_submissions + tracking state. The admin
+// poller keeps the data fresh; this is read-only. Status vocabulary is
+// translated from tracker jargon into "what should I do now" terms — the
+// load-bearing one is 可验证 (merged to test): the submitter can go
+// re-verify on the test environment.
+const MI_STEPS = ["提报", "修复中", "可验证", "完成"];
+const MI_STATUS = {
+    submitted: { step: 0, label: "待处理" },
+    claimed:   { step: 1, label: "修复中" },
+    merged:    { step: 2, label: "可验证" },
+    closed:    { step: 3, label: "完成" },
+    reopened:  { step: 1, label: "重新处理中" },
+};
+
+async function fetchMyIssues() {
+    const resp = await fetch("/api/issues/mine", { headers: authHeaders() });
+    if (!resp.ok) return [];
+    return await resp.json();
+}
+
+// Server timestamps are naive LOCAL time; `new Date(naive)` parses them as
+// local, matching a stored epoch — never compare them to toISOString() (UTC
+// string) lexicographically, that's off by the timezone offset.
+function miSeenAt() { return Number(localStorage.getItem("myIssuesSeenAt") || 0); }
+function miIsFresh(s, seen) {
+    return s.status_changed_at && new Date(s.status_changed_at).getTime() > seen;
+}
+
+async function refreshMyIssuesBadge() {
+    const items = await fetchMyIssues();
+    const seen = miSeenAt();
+    const fresh = items.filter(s => miIsFresh(s, seen)).length;
+    const badge = document.getElementById("my-issues-badge");
+    if (badge) {
+        badge.textContent = fresh;
+        badge.hidden = fresh === 0;
+    }
+}
+
+async function openMyIssues() {
+    const drawer = document.getElementById("my-issues-drawer");
+    const overlay = document.getElementById("my-issues-overlay");
+    const list = document.getElementById("my-issues-list");
+    drawer.hidden = false;
+    overlay.hidden = false;
+    list.innerHTML = `<div class="mi-empty">加载中…</div>`;
+    const items = await fetchMyIssues();
+    const seen = miSeenAt();
+    if (!items.length) {
+        list.innerHTML = `<div class="mi-empty">还没有提报过工单。<br>在会话里确认一个 bug 后即可一键提报。</div>`;
+    } else {
+        list.innerHTML = items.map(s => {
+            const st = MI_STATUS[s.track_status] || MI_STATUS.submitted;
+            const reopened = s.track_status === "reopened";
+            const isFresh = miIsFresh(s, seen);
+            const steps = MI_STEPS.map((name, i) => {
+                let cls = "mi-step";
+                if (i < st.step) cls += " done";
+                if (i === st.step) cls += " current" + (s.track_status === "merged" ? " mi-verify" : "");
+                const label = (i === st.step && reopened) ? st.label : name;
+                return `<span class="${cls}">${label}</span>`;
+            }).join("");
+            return `
+            <div class="mi-item">
+                <div class="mi-item-top">
+                    <span class="mi-item-iid">#${s.issue_number}</span>
+                    <a class="mi-item-title" href="${escapeHtml(s.issue_url || "#")}" target="_blank" rel="noopener" title="${escapeHtml(s.title)}">${escapeHtml(s.title)}</a>
+                </div>
+                <div class="mi-item-meta">
+                    ${escapeHtml(s.repo_name || "")} · 提报于 ${escapeHtml((s.submitted_at || "").slice(0, 16).replace("T", " "))}
+                    ${s.reopen_count ? ` · <span style="color:var(--rust)">被打回 ×${s.reopen_count}</span>` : ""}
+                    ${isFresh ? ` · <span class="mi-item-fresh">有新进展</span>` : ""}
+                </div>
+                <div class="mi-steps${reopened ? " reopened" : ""}">${steps}</div>
+                ${s.fix_verified ? `<div class="mi-fix-detail">✓ 修复已验证 · commit ${escapeHtml(s.fix_commit || "")} · ${s.fix_files_count} 个文件</div>` : ""}
+            </div>`;
+        }).join("");
+    }
+    // Opening the drawer marks everything as seen (epoch ms — see miSeenAt).
+    localStorage.setItem("myIssuesSeenAt", String(Date.now()));
+    const badge = document.getElementById("my-issues-badge");
+    if (badge) badge.hidden = true;
+}
+
+function closeMyIssues() {
+    document.getElementById("my-issues-drawer").hidden = true;
+    document.getElementById("my-issues-overlay").hidden = true;
+}
 
 // ===== Mobile sidebar toggle =====
 function toggleSidebar() {
@@ -1115,8 +1211,12 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
 
     // Reconciled against the real outcome (issue_submissions) — reflect the
     // actual filed issue instead of showing an active, re-clickable draft.
+    // The label carries the LIVE tracking status (kept fresh by the admin
+    // poller), so a replayed session shows "上次报的那个修好了" in place.
     if (submission) {
-        renderIssueStatusLink(card.querySelector(".issue-status"), "已提交", submission.issue_url, submission.issue_number);
+        const live = (MI_STATUS[submission.track_status] || {}).label;
+        const label = live && submission.track_status !== "submitted" ? `已提交 · ${live}` : "已提交";
+        renderIssueStatusLink(card.querySelector(".issue-status"), label, submission.issue_url, submission.issue_number);
     }
 
     scrollToBottom();
