@@ -1106,8 +1106,12 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
     highlightCode(card);
     linkifyCodeRefs(card.querySelector(".issue-body"));
 
-    // Duplicate lookup — best-effort, card works fine without it
-    if (!submission) checkIssueDuplicates(card, repoId || selectedRepoId, draft.title);
+    // Duplicate lookup — best-effort, card works fine without it. Only when
+    // the draft is stamped with its repo: falling back to the sidebar
+    // selection could query a DIFFERENT project's tracker and show duplicate
+    // warnings that are about the wrong repo entirely. (New drafts are always
+    // stamped — draft_issue refuses to produce unstamped ones.)
+    if (!submission && repoId) checkIssueDuplicates(card, repoId, draft.title);
 
     // Reconciled against the real outcome (issue_submissions) — reflect the
     // actual filed issue instead of showing an active, re-clickable draft.

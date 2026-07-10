@@ -20,6 +20,6 @@ register_skill(
             "- You have NO tool that edits or writes files. Never call a tool named like file_editor, "
             "write, edit, str_replace, or similar — it does not exist and the call will fail."
         ),
-        tool_names=["file_reader", "calculator"],
+        tool_names=["file_reader", "semantic_search", "find_symbol", "list_file_symbols", "calculator"],
     )
 )

@@ -36,7 +36,7 @@
         .tab-btn:hover { color: var(--paper); }
         .tab-btn.active { color: var(--moss); border-bottom-color: var(--moss); }
 
-        .admin-content { flex: 1; overflow-y: auto; padding: 24px; max-width: 1080px; }
+        .admin-content { flex: 1; overflow-y: auto; padding: 24px 32px; }
         .panel { display: none; }
         .panel.active { display: block; }
 
@@ -181,8 +181,8 @@
                     </div>
                 </div>
                 <div class="card">
-                    <h3>仓库列表</h3>
-                    <table><thead><tr><th>ID</th><th>名称</th><th>URL</th><th>分支</th><th>描述</th><th>凭证</th><th>操作</th></tr></thead>
+                    <h3>仓库列表 <span id="sync-interval-note" style="font-weight:normal;font-size:12px;color:var(--mute);margin-left:8px"></span></h3>
+                    <table><thead><tr><th>ID</th><th>名称</th><th>URL</th><th>分支</th><th>描述</th><th>凭证</th><th>同步状态</th><th>操作</th></tr></thead>
                     <tbody id="repos-table"></tbody></table>
                 </div>
                 <div class="card" id="edit-repo-card" style="display:none;">

@@ -2,6 +2,7 @@
 hosts the repo (GitHub's REST API for github.com repos; a self-hosted
 GitLab-compatible API for everything else, e.g. internal git servers)."""
 
+import time
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -9,6 +10,92 @@ import httpx
 from app.config import app_settings
 from app.repo_sync import _validate_url
 from app.tools.registry import tool, tool_context
+
+# ==================== Label vocabulary (per-repo, tracker-sourced) ====================
+# The tracker's own label list is the canonical vocabulary — after the
+# 2026-07 cleanup it holds a deliberate scoped taxonomy (type::/module::/
+# priority::/...), and free-form model-invented labels were what degraded it.
+# Cached in-process per repo; on fetch failure the stale cache (if any) is
+# served so a tracker blip degrades to slightly-old vocabulary, not to
+# "no validation".
+
+_LABELS_CACHE: dict[int, tuple[float, list[str]]] = {}
+_LABELS_TTL_SECONDS = 600
+
+
+async def get_repo_labels(repo: dict) -> list[str] | None:
+    """Project's current label names, cached. None = vocabulary unavailable
+    (GitHub-hosted, fetch failed with no cache, or the fetch came back with
+    ZERO labels) — callers should then skip validation rather than reject
+    everything. A genuinely empty result is deliberately NOT cached as "the
+    real vocabulary is empty": a real GitLab project having zero labels is
+    almost always transient (labels not configured yet, a scope/permission
+    hiccup on the token) rather than the intended steady state, and caching
+    it for the full TTL would silently reject every label on every draft/
+    submit for the next 10 minutes even after the underlying cause is fixed."""
+    if is_github_hosted(repo):
+        return None
+    repo_id = repo.get("id")
+    cached = _LABELS_CACHE.get(repo_id)
+    if cached and time.time() - cached[0] < _LABELS_TTL_SECONDS:
+        return cached[1]
+
+    error, base = _gitlab_project_api_base(repo["url"], repo.get("cred_token"))
+    if error:
+        return cached[1] if cached else None
+    names: list[str] = []
+    try:
+        async with httpx.AsyncClient() as client:
+            page = 1
+            while True:
+                resp = await client.get(
+                    f"{base}/labels",
+                    params={"per_page": 100, "page": page},
+                    headers={"PRIVATE-TOKEN": repo.get("cred_token")},
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    return cached[1] if cached else None
+                batch = resp.json()
+                names.extend(l["name"] for l in batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+    except Exception:
+        return cached[1] if cached else None
+    if not names:
+        return cached[1] if cached else None
+    _LABELS_CACHE[repo_id] = (time.time(), names)
+    return names
+
+
+def normalize_labels(requested: list[str], available: list[str]) -> tuple[list[str], list[str]]:
+    """Map requested labels onto the project's real vocabulary.
+    Case-insensitive exact match first; then a unique scoped-suffix match
+    ('bug' -> 'type::bug', 'MES' -> 'module::MES') so the model's natural
+    shorthand still lands on the canonical name. Anything ambiguous or
+    unknown is rejected, not invented. Returns (accepted, rejected)."""
+    by_lower = {a.lower(): a for a in available}
+    suffix_map: dict[str, list[str]] = {}
+    for a in available:
+        if "::" in a:
+            suffix_map.setdefault(a.split("::", 1)[1].strip().lower(), []).append(a)
+
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for r in requested:
+        key = r.strip().lower()
+        if not key:
+            continue
+        hit = by_lower.get(key)
+        if hit is None:
+            candidates = suffix_map.get(key, [])
+            hit = candidates[0] if len(candidates) == 1 else None
+        if hit is None:
+            rejected.append(r)
+        elif hit not in accepted:
+            accepted.append(hit)
+    return accepted, rejected
 
 
 @tool("Generate an issue draft with title, expected_behavior, body (markdown), and labels. This creates "
@@ -19,10 +106,15 @@ from app.tools.registry import tool, tool_context
       "it rather than restating something the user said explicitly, say so (e.g. '推测：...，请确认') so the "
       "user knows to double-check it rather than rubber-stamp it. Structure body (markdown) for the "
       "development team with these sections: 问题描述 (what is wrong and how it manifests — the actual/current "
-      "behavior), 代码位置 (the specific file/function/line, from your investigation), 影响 (who/what is "
+      "behavior), 复现步骤 (preconditions/data state + steps + any具体单号 the user mentioned — include them "
+      "verbatim), 代码位置 (the specific file/function/line, from your investigation), 影响 (who/what is "
       "affected), and 修复建议 (a concrete suggested fix — you already did the root-cause analysis, so state "
-      "where and how to change it in words or a few illustrative lines, never a full rewritten file).")
-def draft_issue(title: str, expected_behavior: str, body: str, labels: str = "bug") -> dict:
+      "where and how to change it in words or a few illustrative lines, never a full rewritten file). "
+      "labels must come from the project's EXISTING label vocabulary — pick one type:: label (type::bug / "
+      "type::feature / type::requirement) plus one module:: label (e.g. module::MES, module::APS, module::质量), "
+      "optionally priority::P0-P4. Never invent new labels: anything outside the project vocabulary is "
+      "dropped automatically (the result will carry a label_note telling you what was rejected).")
+async def draft_issue(title: str, expected_behavior: str, body: str, labels: str = "bug") -> dict:
     """Create an Issue draft. Returns a structured draft for the frontend confirmation card."""
     label_list = [l.strip() for l in labels.split(",") if l.strip()]
 
@@ -32,7 +124,34 @@ def draft_issue(title: str, expected_behavior: str, body: str, labels: str = "bu
     ctx = tool_context.get() or {}
     active_repo = ctx.get("active_repo") or {}
 
-    return {
+    # No unambiguous target repo (user has several repos visible and picked no
+    # workspace this turn) → refuse rather than emit an unstamped draft whose
+    # submission target would silently become "whatever the sidebar happens to
+    # be at click time" — which can differ from where the analysis actually
+    # found the code.
+    if not active_repo.get("id"):
+        return {"error": "无法确定 issue 的目标仓库：当前可见多个仓库且本轮未选择工作空间。"
+                         "请提醒用户先在左侧 Workspace 中选择目标仓库，然后重新描述问题或让你重新生成草稿。"}
+
+    # Validate labels against the tracker's own vocabulary at DRAFT time, so
+    # the confirmation card the user reviews already shows the canonical
+    # labels and the model gets immediate feedback on anything it invented —
+    # rather than the submit endpoint silently filing a degraded issue later.
+    label_note = None
+    try:
+        from app.database import get_repo
+        repo = await get_repo(active_repo["id"])
+        available = await get_repo_labels(repo) if repo else None
+        if available is not None:
+            accepted, rejected = normalize_labels(label_list, available)
+            label_list = accepted
+            if rejected:
+                label_note = (f"以下标签不在项目标签词表中，已忽略: {', '.join(rejected)}。"
+                              "如需分类请从项目现有标签中选（type::*/module::*/priority::* 等）。")
+    except Exception:
+        pass  # vocabulary unavailable — file with the labels as given
+
+    result = {
         "type": "issue_draft",
         "title": title,
         "expected_behavior": expected_behavior,
@@ -41,6 +160,9 @@ def draft_issue(title: str, expected_behavior: str, body: str, labels: str = "bu
         "repo_id": active_repo.get("id"),
         "repo_name": active_repo.get("name"),
     }
+    if label_note:
+        result["label_note"] = label_note
+    return result
 
 
 @tool("Preview an action on an ALREADY-FILED issue — add a comment, close it, or reopen it. Use this when a "
@@ -63,6 +185,13 @@ def manage_issue(issue_number: int, action: str, comment: str) -> dict:
 
     ctx = tool_context.get() or {}
     active_repo = ctx.get("active_repo") or {}
+
+    # Same guard as draft_issue: acting on issue N is only meaningful within
+    # one specific repo's tracker — an unstamped action card could fire at a
+    # same-numbered issue in a different project.
+    if not active_repo.get("id"):
+        return {"error": "无法确定目标仓库：当前可见多个仓库且本轮未选择工作空间。"
+                         "请提醒用户先在左侧 Workspace 中选择目标仓库，再执行该操作。"}
 
     return {
         "type": "issue_action_draft",
@@ -199,12 +328,36 @@ async def submit_gitlab_issue(repo_url: str, cred_token: str | None, title: str,
             }
 
 
+def is_github_hosted(repo: dict) -> bool:
+    host = (urlparse(repo["url"]).hostname or "").lower()
+    return host in ("github.com", "www.github.com")
+
+
 async def submit_repo_issue(repo: dict, title: str, body: str, labels: list[str]) -> dict:
     """Dispatch to the right issue tracker API based on the repo's host."""
-    host = (urlparse(repo["url"]).hostname or "").lower()
-    if host in ("github.com", "www.github.com"):
+    if is_github_hosted(repo):
         return await submit_github_issue(repo["url"], title, body, labels)
     return await submit_gitlab_issue(repo["url"], repo.get("cred_token"), title, body, labels)
+
+
+async def upload_gitlab_attachment(repo: dict, filename: str, content: bytes) -> dict:
+    """Upload a file to the repo's GitLab project (POST /projects/:id/uploads)
+    and return {"markdown": "![...](...)"} ready to embed in an issue body.
+    GitLab-only — GitHub has no equivalent anonymous-upload API, so callers
+    should skip attachment for github.com repos rather than call this."""
+    error, base = _gitlab_project_api_base(repo["url"], repo.get("cred_token"))
+    if error:
+        return {"error": error}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{base}/uploads",
+            headers={"PRIVATE-TOKEN": repo.get("cred_token")},
+            files={"file": (filename, content)},
+            timeout=60,
+        )
+        if resp.status_code == 201:
+            return {"markdown": resp.json().get("markdown")}
+        return {"error": f"GitLab upload API error ({resp.status_code}): {resp.text[:200]}"}
 
 
 # ==================== Actions on an already-filed issue ====================

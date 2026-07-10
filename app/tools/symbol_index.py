@@ -64,12 +64,14 @@ def _index_path(repo_path: str) -> str:
     return os.path.realpath(repo_path).rstrip(os.sep) + ".tags.json"
 
 
-async def build_index(repo_path: str) -> None:
+async def build_index(repo_path: str) -> bool:
     """(Re)build the symbol index for one repo checkout. Best-effort and
     silent: sync must never fail because indexing failed. Writes to a temp
-    file and renames into place so a reader never sees a half-written index."""
+    file and renames into place so a reader never sees a half-written index.
+    Returns True only when a fresh index was actually written — callers use
+    this to persist an index_status the admin UI can show."""
     if not _CTAGS_BIN or not os.path.isdir(repo_path):
-        return
+        return False
 
     index_path = _index_path(repo_path)
     tmp_path = index_path + ".tmp"
@@ -84,7 +86,8 @@ async def build_index(repo_path: str) -> None:
         await asyncio.wait_for(proc.communicate(), timeout=_BUILD_TIMEOUT_SECONDS)
         if proc.returncode == 0 and os.path.exists(tmp_path):
             os.replace(tmp_path, index_path)
-        elif os.path.exists(tmp_path):
+            return True
+        if os.path.exists(tmp_path):
             os.remove(tmp_path)
     except asyncio.TimeoutError:
         if proc is not None:
@@ -95,6 +98,7 @@ async def build_index(repo_path: str) -> None:
     except Exception:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+    return False
 
 
 # In-process cache keyed by index_path -> (mtime, parsed tags), so a turn

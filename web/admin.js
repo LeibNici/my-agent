@@ -105,6 +105,22 @@ async function toggleUser(userId, currentActive) {
 // ===== Repos =====
 let editingRepoId = null;
 
+// Sync/index state → one compact cell. Sync failures show the git error on
+// hover; index lag ("git synced but symbol index still building") gets its
+// own hint since a green sync doesn't mean code search is fresh yet.
+function syncStatusCell(r) {
+    if (!r.last_sync_at) return '<span style="color:var(--faint)">未同步</span>';
+    const t = esc(String(r.last_sync_at).slice(5, 16).replace('T', ' '));
+    const sync = r.last_sync_status === 'ok'
+        ? `<span style="color:var(--moss)" title="${esc(r.last_sync_message || '')}">✓ ${t}</span>`
+        : `<span style="color:var(--rust)" title="${esc(r.last_sync_message || '')}">✗ ${t}</span>`;
+    const sha = r.last_sync_sha
+        ? ` <code style="font-family:var(--font-mono);font-size:11.5px;color:var(--mute);background:var(--ink-850);padding:1px 5px;border-radius:4px" title="当前检出的 commit">${esc(r.last_sync_sha)}</code>`
+        : '';
+    const idxMap = { ready: '', building: ' <span style="color:var(--amber)" title="符号索引重建中">索引构建中</span>', failed: ' <span style="color:var(--rust)" title="ctags 索引构建失败，符号搜索可能过期">索引失败</span>' };
+    return sync + sha + (idxMap[r.index_status] ?? '');
+}
+
 async function loadRepos() {
     const resp = await fetch("/api/admin/repos", { headers: authHeaders() });
     const repos = await resp.json();
@@ -117,6 +133,7 @@ async function loadRepos() {
             <td>${esc(r.branch || '(default)')}</td>
             <td>${esc(r.description || '-')}</td>
             <td>${r.cred_username ? esc(r.cred_username) : '<span style="color:var(--faint)">—</span>'}${r.has_token ? ' <span class="badge badge-write">令牌</span>' : ''}</td>
+            <td>${syncStatusCell(r)}</td>
             <td>
                 <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="openRepoEdit(${r.id})">编辑</button>
                 <button class="btn btn-sm btn-primary" onclick="syncRepo(${r.id}, this)">同步</button>
@@ -128,6 +145,22 @@ async function loadRepos() {
     const sel = document.getElementById("perm-repo");
     sel.innerHTML = '<option value="">选择仓库</option>' + repos.map(r => `<option value="${r.id}">${esc(r.name)}</option>`).join("");
 }
+
+// Read-only display of the background sync cadence (changing it is an .env
+// edit + restart, by design).
+(async () => {
+    try {
+        const resp = await fetch("/api/config", { headers: authHeaders() });
+        if (!resp.ok) return;
+        const cfg = await resp.json();
+        const el = document.getElementById("sync-interval-note");
+        if (el && cfg.repo_sync_interval_minutes != null) {
+            el.textContent = cfg.repo_sync_interval_minutes > 0
+                ? `自动同步间隔：${cfg.repo_sync_interval_minutes} 分钟`
+                : "自动同步已禁用（仅手动）";
+        }
+    } catch {}
+})();
 
 async function createRepo() {
     const name = document.getElementById("new-repo-name").value.trim();

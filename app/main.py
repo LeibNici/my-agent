@@ -54,7 +54,11 @@ from app.skills.base import list_skills
 from app.admin import router as admin_router
 from app.repo_sync import mask_url_credentials
 from app.tools.access import is_within_allowed_paths
-from app.tools.github_issue import submit_repo_issue, search_repo_issues, apply_repo_issue_action
+from app.tools.github_issue import (
+    submit_repo_issue, search_repo_issues, apply_repo_issue_action,
+    upload_gitlab_attachment, is_github_hosted,
+    get_repo_labels, normalize_labels,
+)
 
 # Import skills to trigger registration
 import app.skills.coder  # noqa: F401
@@ -65,6 +69,7 @@ import app.tools.calculator  # noqa: F401
 import app.tools.file_reader  # noqa: F401
 import app.tools.code_search  # noqa: F401
 import app.tools.symbol_index  # noqa: F401
+import app.tools.semantic_index  # noqa: F401
 import app.tools.github_issue  # noqa: F401
 
 MAX_MESSAGE_LENGTH = 10000
@@ -199,6 +204,10 @@ async def get_config(user: dict = Depends(get_current_user)):
     return {
         "max_images_per_message": MAX_IMAGES_PER_MESSAGE,
         "max_image_bytes": int(MAX_IMAGE_BASE64_CHARS * 3 / 4),
+        # Shown read-only in the admin repos tab; changing it is still an
+        # .env edit + restart (deliberately — a runtime-mutable sync interval
+        # isn't worth the added state).
+        "repo_sync_interval_minutes": app_settings.repo_sync_interval_minutes,
     }
 
 
@@ -658,6 +667,94 @@ async def _require_open_session(session_id: str | None, user: dict) -> None:
         )
 
 
+async def _verify_draft_repo_id(session_id: str | None, draft_tool_use_id: str | None, repo_id: int) -> None:
+    """If a draft_tool_use_id is given, confirm `repo_id` is the SAME repo
+    draft_issue/manage_issue actually stamped on that draft when it was
+    created — without this, a caller with write access to two repos could
+    investigate repo A but submit the resulting issue against repo B (only
+    the target repo's write access is otherwise checked, not which repo the
+    draft was really about). Best-effort in the "can't verify" direction:
+    a missing session/tool_use_id/unparseable stored result never blocks a
+    legitimate submission — only an ACTUAL stamped-repo mismatch does."""
+    if not session_id or not draft_tool_use_id:
+        return
+    messages = await get_messages(session_id)
+    for msg in messages:
+        if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
+            continue
+        for block in msg["content"]:
+            if not (isinstance(block, dict) and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") == draft_tool_use_id):
+                continue
+            content = block.get("content")
+            if isinstance(content, str):
+                try:
+                    parsed = json.loads(content)
+                except json.JSONDecodeError:
+                    return
+                stamped_repo_id = parsed.get("repo_id") if isinstance(parsed, dict) else None
+                if stamped_repo_id is not None and stamped_repo_id != repo_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="提交的仓库与草稿时确认的仓库不一致，请重新生成草稿后再提交。",
+                    )
+            return
+    # tool_use_id not found in this session's history (e.g. very old/pruned
+    # data) — nothing to verify against, so don't block on it either.
+
+
+_ATTACHMENT_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
+_MAX_ISSUE_ATTACHMENTS = 5
+
+
+async def _upload_session_screenshots(repo: dict, session_id: str | None) -> str:
+    """Upload the screenshots the user pasted into this chat session to the
+    repo's GitLab project and return a markdown section embedding them ("" if
+    none). The DB copy of messages keeps full image data (only the copy sent
+    to the model gets placeholder-pruned), so this recovers the original
+    evidence the analysis was based on. Best-effort: any failure degrades to
+    fewer/no attachments, never a failed submission — the issue text stands
+    on its own. GitHub-hosted repos are skipped (no equivalent upload API)."""
+    if not session_id or is_github_hosted(repo):
+        return ""
+    try:
+        import base64
+        import hashlib
+        messages = await get_messages(session_id)
+        seen: set[str] = set()
+        markdowns: list[str] = []
+        for msg in messages:
+            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
+                continue
+            for block in msg["content"]:
+                if not (isinstance(block, dict) and block.get("type") == "image"):
+                    continue
+                source = block.get("source") or {}
+                data = source.get("data")
+                if not isinstance(data, str) or not data:
+                    continue
+                digest = hashlib.sha256(data.encode()).hexdigest()
+                if digest in seen:  # same screenshot pasted twice
+                    continue
+                seen.add(digest)
+                if len(markdowns) >= _MAX_ISSUE_ATTACHMENTS:
+                    break
+                ext = _ATTACHMENT_EXT.get(source.get("media_type", ""), "png")
+                try:
+                    content = base64.b64decode(data)
+                except Exception:
+                    continue
+                result = await upload_gitlab_attachment(
+                    repo, f"screenshot-{len(markdowns) + 1}.{ext}", content)
+                if result.get("markdown"):
+                    markdowns.append(result["markdown"])
+        if not markdowns:
+            return ""
+        return "\n\n## 相关截图\n\n" + "\n\n".join(markdowns)
+    except Exception:
+        return ""
+
+
 class IssueSubmitRequest(BaseModel):
     repo_id: int
     title: str
@@ -675,6 +772,24 @@ async def submit_issue(req: IssueSubmitRequest, user: dict = Depends(get_current
     app.tools.github_issue.submit_repo_issue for the host-based dispatch)."""
     repo = await _require_repo_write_access(req.repo_id, user)
     await _require_open_session(req.session_id, user)
+    await _verify_draft_repo_id(req.session_id, req.draft_tool_use_id, req.repo_id)
+
+    # Backstop for the draft-time validation in draft_issue: the client sends
+    # back the card's labels verbatim, so re-filter against the tracker's
+    # vocabulary here too — unknown labels are dropped, never auto-created on
+    # the tracker (free-form labels are how the 2026-07 mess accumulated).
+    labels = req.labels
+    vocabulary = await get_repo_labels(repo)
+    if vocabulary is not None:
+        labels, _ = normalize_labels(labels, vocabulary)
+    elif not is_github_hosted(repo):
+        # GitLab governance is unavailable right now (API outage/auth issue,
+        # not "no labels configured") — don't pass the model's un-validated
+        # free-form labels straight through, since that's exactly how the
+        # label vocabulary got messy before the 2026-07 cleanup. File the
+        # issue unlabeled rather than either blocking the submission
+        # entirely or bypassing governance during the one window it matters.
+        labels = []
 
     # The tracker only takes one body string, so the structured
     # expected_behavior field (shown as its own block on the confirmation
@@ -684,11 +799,15 @@ async def submit_issue(req: IssueSubmitRequest, user: dict = Depends(get_current
     # submission — so stamp the actual reporter into the body too, where the
     # dev team can see it.
     expected_section = f"## 期望行为\n\n{req.expected_behavior}\n\n" if req.expected_behavior.strip() else ""
-    body = f"{expected_section}{req.body}\n\n---\n\n**提报人**: {user['username']}（经内部代码助手确认后提交）"
+    # The screenshots the user pasted in chat are the evidence the analysis
+    # was based on — attach them to the tracker issue (GitLab-hosted repos
+    # only) instead of leaving them stranded in chat history.
+    screenshots_section = await _upload_session_screenshots(repo, req.session_id)
+    body = f"{expected_section}{req.body}{screenshots_section}\n\n---\n\n**提报人**: {user['username']}（经内部代码助手确认后提交）"
 
     # Submits against the stored repo URL/credentials (not client-supplied)
     # via the shared tool implementation
-    result = await submit_repo_issue(repo, req.title, body, req.labels)
+    result = await submit_repo_issue(repo, req.title, body, labels)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
 
@@ -703,7 +822,7 @@ async def submit_issue(req: IssueSubmitRequest, user: dict = Depends(get_current
         # fresh rather than pile on.
         await record_issue_submission(
             req.session_id, req.repo_id, user["id"],
-            req.title, body, req.labels,
+            req.title, body, labels,
             result["number"], result["url"],
             req.draft_tool_use_id,
         )
@@ -741,6 +860,7 @@ async def submit_issue_action(req: IssueActionRequest, user: dict = Depends(get_
     # tracker just like submit_issue is.
     repo = await _require_repo_write_access(req.repo_id, user)
     await _require_open_session(req.session_id, user)
+    await _verify_draft_repo_id(req.session_id, req.draft_tool_use_id, req.repo_id)
 
     result = await apply_repo_issue_action(repo, req.issue_number, req.action, req.comment)
     if "error" in result:

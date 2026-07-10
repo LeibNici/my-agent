@@ -1,0 +1,34 @@
+# CodeAxis systemd unit.
+#
+# One-time setup (run once, as root, on the target machine — see DEPLOY.md):
+#   useradd --system --home /home/my-agent --shell /usr/sbin/nologin codeaxis
+#   chown -R codeaxis:codeaxis /home/my-agent /tmp/agent-repos   # or wherever APP_REPOS_DIR points
+#
+# Then: cp deploy/codeaxis.service /etc/systemd/system/
+#       systemctl daemon-reload && systemctl enable --now codeaxis
+# Logs: journalctl -u codeaxis -f
+[Unit]
+Description=CodeAxis (internal AI code-walkthrough assistant)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as a dedicated, unprivileged account — never root. The app parses
+# admin-supplied git repo content (untrusted by design) and shells out to
+# git/ctags on it; a bug or a malicious repo should be contained to this
+# account, not able to touch the rest of the host.
+User=codeaxis
+Group=codeaxis
+WorkingDirectory=/home/my-agent
+ExecStart=/home/my-agent/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+# .env is read by the app itself from WorkingDirectory; nothing needed here.
+# Give the periodic sync/index work room before a forced kill on stop.
+TimeoutStopSec=30
+# Basic, low-risk hardening — never lets a setuid/setgid exec regain privilege.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -228,25 +228,62 @@ async def sync_and_persist(
     it's scanning — it just does its waiting in the background instead of on
     this request."""
     from app.database import update_repo
+    from datetime import datetime
     async with _get_repo_lock(repo_id):
         success, msg, local_path = await sync_repo(url, repo_id, branch, force_reclone, cred_username, cred_token)
+        # Persist the attempt outcome either way — this is the only place the
+        # admin UI can learn "when did this repo last sync, did it work" from;
+        # previously outcomes went to stdout only.
+        now = datetime.now().isoformat()
         if success:
-            await update_repo(repo_id, local_path=local_path)
+            # HEAD of the checkout that was just synced — surfaced in the
+            # admin repos tab so an admin can see at a glance exactly which
+            # commit the assistant's code analysis is currently based on.
+            # Left as None (not "") on a rev-parse failure so update_repo
+            # leaves the column untouched — a transient rev-parse hiccup
+            # right after a successful pull shouldn't erase a previously
+            # recorded good SHA and make the admin UI show "unknown" for a
+            # checkout that's actually fine.
+            sha = None
+            rc, out, _ = await _run_git(["rev-parse", "--short=10", "HEAD"], cwd=local_path)
+            if rc == 0:
+                sha = out.strip()
+            await update_repo(repo_id, local_path=local_path,
+                              last_sync_at=now, last_sync_status="ok", last_sync_message=msg,
+                              last_sync_sha=sha)
+        else:
+            await update_repo(repo_id,
+                              last_sync_at=now, last_sync_status="error", last_sync_message=msg)
     if success:
         asyncio.create_task(_background_build_index(repo_id, local_path))
     return success, msg
 
 
 async def _background_build_index(repo_id: int, local_path: str) -> None:
-    """Rebuild the ctags index for one repo, holding that repo's sync lock
-    for the duration — run as a fire-and-forget task by sync_and_persist so
-    the triggering request doesn't wait on it, while still serializing
-    against a concurrent sync_and_persist's clone_repo (which rmtree+renames
-    the same checkout this reads). Best-effort: build_index() swallows its
-    own errors, so this never has anything to propagate."""
+    """Rebuild the ctags + semantic indexes for one repo, run as a
+    fire-and-forget task by sync_and_persist so the triggering request
+    doesn't wait on it. Best-effort throughout: index_status is the only
+    trace of failure, shown separately from git sync status in the admin UI
+    (a green sync doesn't mean symbol/semantic search is fresh yet).
+
+    The per-repo sync lock is held only for the FAST file-reading work
+    (ctags build + chunking the checkout for the semantic index) — both
+    unsafe to run concurrently with a reclone that might rmtree the checkout
+    mid-read. The slow part (embedding API calls, which only touch
+    already-extracted text and the .emb.npz sidecar, never repo_path again)
+    runs AFTER the lock is released, so a cold multi-minute embedding build
+    no longer blocks the next sync attempt for this repo — it used to,
+    since the lock previously wrapped both phases."""
+    from app.database import update_repo
     from app.tools.symbol_index import build_index
+    from app.tools.semantic_index import collect_index_chunks, embed_and_save_index
+    await update_repo(repo_id, index_status="building")
     async with _get_repo_lock(repo_id):
-        await build_index(local_path)
+        ok = await build_index(local_path)
+        chunks = collect_index_chunks(local_path) if ok else []
+    if chunks:
+        await embed_and_save_index(local_path, chunks)
+    await update_repo(repo_id, index_status="ready" if ok else "failed")
 
 
 async def sync_all_repos(repos: list[dict]):

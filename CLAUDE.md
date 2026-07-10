@@ -90,6 +90,19 @@ TypeScript parser onto them (`--langmap=TypeScript:+.vue`) — it ignores the
 surrounding template/style markup it can't parse and still extracts every
 top-level function/interface/type declared in `<script>`.
 
+**Semantic search** (`app/tools/semantic_index.py`): `semantic_search` finds
+code by meaning — the bridge for business-Chinese queries (「不合格评审」) over
+English-identifier code, where fixed-string `code_search` and `find_symbol`
+both need a literal the user doesn't have. Chunks are derived from the ctags
+sidecar (function/method/class spans, plus fixed windows for MyBatis mapper
+XML), embedded via an OpenAI-compatible endpoint (DashScope in production —
+same key as the LLM, see `APP_EMBEDDING_*` in `.env.example`), stored in a
+`<local_path>.emb.npz` sidecar and matched by in-memory cosine (numpy, no
+vector DB — brute force is milliseconds at this scale). Rebuilt after the
+ctags index in the same post-sync background task, incrementally by chunk
+content hash: a no-change sync costs zero embedding calls. Degrades to
+"index not built / not configured, use code_search" the same way ctags does.
+
 **Permission model**: repos are admin-managed (`app/admin.py`) and users are
 granted per-repo `read`/`write`/`admin` access (`permissions` table in
 `app/database.py`). A chat turn resolves the caller's visible repos
@@ -117,7 +130,12 @@ and the GitLab issue-submission API call in `app/tools/github_issue.py`.
 (`app/tools/symbol_index.py`) as a background task on every successful
 clone/pull, best-effort — an indexing failure never fails the sync itself,
 and the triggering request (including admin create/update/manual-sync API
-calls) doesn't block on ctags.
+calls) doesn't block on ctags. Every sync attempt persists
+`last_sync_at`/`last_sync_status`/`last_sync_message` on the repo row, and
+the index rebuild tracks `index_status` (building/ready/failed) separately —
+both surfaced in the admin repos tab, since a green git sync doesn't mean
+symbol search is fresh yet. The sync interval shows there read-only
+(changing it is still an `.env` edit + restart).
 
 **Issue submission** (`app/tools/github_issue.py`, wired into
 `POST /api/issues/submit` in `main.py`): the `draft_issue` tool only returns
@@ -127,11 +145,23 @@ REST API (using the global `APP_GITHUB_TOKEN`) if the repo host is
 `github.com`, otherwise to a self-hosted GitLab-compatible API (using that
 specific repo's own stored `cred_token`). Drafts are stamped with the repo
 the turn was scoped to (`active_repo` in the tool context) so submission
-targets that repo even if the sidebar selection changes afterwards, and
+targets that repo even if the sidebar selection changes afterwards —
+`draft_issue`/`manage_issue` refuse to produce an UNstamped draft (multiple
+repos visible, no workspace picked), since its submission target would
+otherwise silently become the sidebar selection at click time.
 `POST /api/issues/check-duplicates` (→ `search_repo_issues`) warns about
-similar existing issues on the card. Submitting resolves/closes the chat
-session (`resolved_at`) — the next message against that `session_id`
-transparently starts a fresh session rather than tacking onto a closed one.
+similar existing issues on the card (stamped-repo only, same reason).
+Labels are validated against the tracker's own label list (`get_repo_labels`,
+cached 10 min per repo) at draft time — normalized case-insensitively and
+via unique scoped-suffix match ('bug' → 'type::bug'), unknown ones dropped
+with a `label_note` back to the model — and re-filtered at submit as a
+backstop; the model is never allowed to invent tracker labels. At submit,
+screenshots the user pasted into the session are uploaded to the GitLab
+project (`upload_gitlab_attachment`, `POST /projects/:id/uploads`) and
+embedded in the issue body (best-effort, GitLab-hosted repos only — GitHub
+has no equivalent API). Submitting resolves/closes the chat session
+(`resolved_at`) — the next message against that `session_id` transparently
+starts a fresh session rather than tacking onto a closed one.
 
 **Answer feedback & code viewing**: `POST /api/feedback` records 👍/👎 per
 assistant answer (`message_feedback` table; the `done` SSE event carries the
@@ -149,7 +179,5 @@ tool-use loop iteration) for the admin usage dashboard
 (`/api/admin/usage/*`); `issue_submissions` is the durable record of what was
 actually filed on a tracker, independent of chat message rendering.
 
-**Frontend** (`web/`): no framework, no build — `app.js` (main chat UI),
-`admin.js` (admin console), `shared.js` (small cross-page helpers), each
-paired with its own HTML entry point (`index.html`, `admin.html`,
-`login.html`) and a single shared `style.css`.
+**Frontend**: see `web/CLAUDE.md` (loads automatically when working with
+files under `web/`).

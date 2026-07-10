@@ -113,6 +113,21 @@ class AppSettings(BaseSettings):
     repo_sync_interval_minutes: int = 10  # 0 disables periodic background sync
     cors_origins: str = "http://localhost:8000,http://127.0.0.1:8000"  # comma-separated
 
+    # --- Semantic code search (embeddings) ---
+    # Defaults target DashScope's OpenAI-compatible endpoint, since production
+    # already runs its LLM through DashScope and the SAME api key works for
+    # embeddings there. embedding_api_key falls back to ANTHROPIC_API_KEY at
+    # runtime ONLY when ANTHROPIC_BASE_URL and embedding_base_url are the same
+    # host (see embedding_key_or_fallback in app/tools/semantic_index.py) —
+    # never blindly, since that would send the Anthropic credential to
+    # whichever host embedding_base_url names. A deployment on the official
+    # Anthropic API (or any other provider) must set APP_EMBEDDING_API_KEY
+    # explicitly; leaving it unset there just disables semantic search.
+    embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    embedding_api_key: str = ""
+    embedding_model: str = "text-embedding-v4"
+    embedding_dimensions: int = 1024
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",

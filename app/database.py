@@ -208,6 +208,16 @@ async def init_db():
         await _add_column_if_missing(db, "repositories", "cred_username", "TEXT", repositories_columns)
         await _add_column_if_missing(db, "repositories", "cred_token", "TEXT", repositories_columns)
 
+        # Migration: sync/index observability — last_sync_at is the time of
+        # the last ATTEMPT (success or failure, see last_sync_status);
+        # index_status tracks the ctags symbol index separately, since it's
+        # rebuilt as a background task after the git sync and can lag it.
+        await _add_column_if_missing(db, "repositories", "last_sync_at", "TEXT", repositories_columns)
+        await _add_column_if_missing(db, "repositories", "last_sync_status", "TEXT", repositories_columns)
+        await _add_column_if_missing(db, "repositories", "last_sync_message", "TEXT", repositories_columns)
+        await _add_column_if_missing(db, "repositories", "index_status", "TEXT", repositories_columns)
+        await _add_column_if_missing(db, "repositories", "last_sync_sha", "TEXT", repositories_columns)
+
         # Migration: split any legacy combined "credentials" column (a short-lived
         # earlier design) into cred_username/cred_token
         if "credentials" in repositories_columns:
@@ -342,7 +352,8 @@ async def get_repo(repo_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-async def update_repo(repo_id: int, name: str = None, url: str = None, description: str = None, local_path: str = None, branch: str = None, cred_username: str = None, cred_token: str = None):
+async def update_repo(repo_id: int, name: str = None, url: str = None, description: str = None, local_path: str = None, branch: str = None, cred_username: str = None, cred_token: str = None,
+                      last_sync_at: str = None, last_sync_status: str = None, last_sync_message: str = None, index_status: str = None, last_sync_sha: str = None):
     """Update repository fields."""
     fields = []
     values = []
@@ -360,6 +371,16 @@ async def update_repo(repo_id: int, name: str = None, url: str = None, descripti
         fields.append("description = ?"); values.append(description)
     if local_path is not None:
         fields.append("local_path = ?"); values.append(local_path)
+    if last_sync_at is not None:
+        fields.append("last_sync_at = ?"); values.append(last_sync_at)
+    if last_sync_status is not None:
+        fields.append("last_sync_status = ?"); values.append(last_sync_status)
+    if last_sync_message is not None:
+        fields.append("last_sync_message = ?"); values.append(last_sync_message)
+    if index_status is not None:
+        fields.append("index_status = ?"); values.append(index_status)
+    if last_sync_sha is not None:
+        fields.append("last_sync_sha = ?"); values.append(last_sync_sha)
     if not fields:
         return
     values.append(repo_id)
