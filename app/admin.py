@@ -218,7 +218,15 @@ async def api_feedback_summary():
 
 @router.get("/issues/tracking")
 async def api_issue_tracking(limit: int = 100):
-    return await get_issue_tracking_overview(limit)
+    from app.issue_tracker import compute_tracking_metrics
+    overview = await get_issue_tracking_overview(limit)
+    # Metrics need the issue bodies (path-reference extraction); the client
+    # doesn't — strip them after computing rather than shipping N×KB of
+    # markdown to the browser per refresh.
+    overview["metrics"] = compute_tracking_metrics(overview["submissions"])
+    for s in overview["submissions"]:
+        s.pop("body", None)
+    return overview
 
 
 @router.post("/issues/tracking/poll")

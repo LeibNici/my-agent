@@ -112,6 +112,7 @@ class AppSettings(BaseSettings):
     github_token: str = ""  # GitHub API token for issue submission
     repo_sync_interval_minutes: int = 10  # 0 disables periodic background sync
     issue_track_interval_minutes: int = 10  # 0 disables issue progress polling (工单 tab)
+    issue_fix_target_branch: str = "test"  # branch fix commits must be reachable from to count as verified
     cors_origins: str = "http://localhost:8000,http://127.0.0.1:8000"  # comma-separated
 
     # --- Semantic code search (embeddings) ---

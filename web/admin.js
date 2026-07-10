@@ -466,17 +466,41 @@ async function loadIssueTracking() {
     const data = await resp.json();
     const counts = data.counts || {};
 
+    const m = data.metrics || {};
     document.getElementById("issues-summary-cards").innerHTML =
         ["submitted", "claimed", "merged", "closed", "reopened"].map(key => `
         <div class="stat-card">
             <div class="stat-label">${TRACK_STATUS[key].label}</div>
             <div class="stat-value" style="color:${key === 'reopened' && counts[key] ? 'var(--rust)' : 'inherit'}">${formatNumber(counts[key] || 0)}</div>
         </div>
-    `).join("");
+    `).join("") + `
+        <div class="stat-card">
+            <div class="stat-label">已验证修复</div>
+            <div class="stat-value" style="color:${m.fixed_count ? 'var(--moss)' : 'var(--faint)'}">${formatNumber(m.fixed_count || 0)}</div>
+            <div class="stat-sub">平台校验 commit 已在 test</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">平均修复时长</div>
+            <div class="stat-value">${m.avg_fix_hours != null ? m.avg_fix_hours + "h" : "—"}</div>
+            <div class="stat-sub">${m.avg_fix_hours != null ? "提报 → 关闭" : "待结构化报告数据"}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">嫌疑位置命中率</div>
+            <div class="stat-value">${m.hit_rate != null ? Math.round(m.hit_rate * 100) + "%" : "—"}</div>
+            <div class="stat-sub">${m.hit_rate != null ? `样本 ${m.hit_sample} 条` : "待结构化报告数据"}</div>
+        </div>
+    `;
 
     document.getElementById("issues-tracking-table").innerHTML = (data.submissions || []).map(s => {
         const st = TRACK_STATUS[s.track_status] || TRACK_STATUS.submitted;
         const codexLabels = (s.remote_labels || []).filter(l => l.startsWith("codex:"));
+        const reports = s.fix_reports || [];
+        const verified = reports.filter(r => r.verified === 1);
+        const reportBadge = reports.length
+            ? `<span title="${esc(reports.map(r =>
+                  `${r.verified === 1 ? '✓已验证' : r.verified === 0 ? '✗验证失败' : '待验证'} ${(r.commit_sha || '').slice(0, 10)} (${(r.files || []).length} 文件)`
+              ).join('\n'))}" style="font-family:var(--font-mono);font-size:11px;color:${verified.length ? 'var(--moss)' : 'var(--mute)'};cursor:help;margin-left:4px;">${verified.length ? '✓' : '…'}${reports.length > 1 ? '×' + reports.length : ''}</span>`
+            : "";
         return `
         <tr>
             <td>${esc((s.submitted_at || "").replace("T", " ").slice(0, 16))}</td>
@@ -485,6 +509,7 @@ async function loadIssueTracking() {
             <td><a href="${esc(s.issue_url || '#')}" target="_blank" rel="noopener" title="${esc(s.title)}">#${s.issue_number} ${esc(s.title.length > 30 ? s.title.slice(0, 30) + "…" : s.title)}</a></td>
             <td>
                 <span class="badge" style="background:transparent;border:1px solid ${st.color};color:${st.color};">${st.label}</span>
+                ${reportBadge}
                 ${s.track_error ? `<span title="${esc(s.track_error)}" style="color:var(--rust);cursor:help;margin-left:4px;">⚠</span>` : ""}
                 ${codexLabels.length ? `<span style="font-family:var(--font-mono);font-size:11px;color:var(--faint);margin-left:4px;" title="${esc(codexLabels.join(', '))}">${codexLabels.length}🏷</span>` : ""}
             </td>

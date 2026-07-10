@@ -176,6 +176,28 @@ async def init_db():
                 UNIQUE(message_id, user_id)
             )
         """)
+        # Structured completion reports parsed from tracker comments
+        # (<!-- codex-report/v1 {...} --> posted by the fix fleet's
+        # finish-issue tool). 1:many with issue_submissions and keyed by the
+        # tracker's own note_id — an issue reopened and re-fixed gets a SECOND
+        # report, and evidence from the first fix must not be overwritten.
+        # `verified` is the PLATFORM's own check that commit_sha is really
+        # reachable from the target branch — never trusted from the worker.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS issue_fix_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                submission_id INTEGER NOT NULL,
+                note_id INTEGER NOT NULL,
+                worker_id TEXT,
+                commit_sha TEXT,
+                files_json TEXT NOT NULL DEFAULT '[]',
+                verified INTEGER,
+                reported_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(submission_id, note_id),
+                FOREIGN KEY (submission_id) REFERENCES issue_submissions(id) ON DELETE CASCADE
+            )
+        """)
         # One row per semantic_search tool call — recall-quality signal the
         # admin dashboard didn't have before: llm_call_metrics only knows
         # token/latency per LLM turn, not which tool ran or what it found.
@@ -721,6 +743,76 @@ async def update_issue_tracking(submission_id: int, track_status: str = None,
         await db.commit()
 
 
+async def upsert_fix_report(submission_id: int, note_id: int, worker_id: str | None,
+                            commit_sha: str | None, files: list[str],
+                            reported_at: str | None) -> int:
+    """Insert a completion report if this note hasn't been seen; on re-poll
+    of a known note, refresh the payload fields but PRESERVE `verified` —
+    verification is the platform's own conclusion and a re-parse of the same
+    comment must not reset it back to pending."""
+    now = datetime.now().isoformat()
+    async with _connect() as db:
+        cursor = await db.execute(
+            "INSERT INTO issue_fix_reports "
+            "(submission_id, note_id, worker_id, commit_sha, files_json, reported_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(submission_id, note_id) DO UPDATE SET "
+            "worker_id = excluded.worker_id, commit_sha = excluded.commit_sha, "
+            "files_json = excluded.files_json, reported_at = excluded.reported_at",
+            (submission_id, note_id, worker_id, commit_sha,
+             json.dumps(files, ensure_ascii=False), reported_at, now),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_unverified_fix_reports() -> list[dict]:
+    """Reports whose commit hasn't been platform-verified yet (verified IS
+    NULL). Verified 0 (checked, NOT on the branch) is a conclusion, not a
+    retry queue — a commit doesn't leave a branch it was merged to short of
+    history rewrites, but re-checking every such report forever would let one
+    bad worker report add a permanent API call to every poll round."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT f.id, f.submission_id, f.commit_sha, s.issue_url, s.repo_id
+            FROM issue_fix_reports f
+            JOIN issue_submissions s ON s.id = f.submission_id
+            WHERE f.verified IS NULL AND f.commit_sha IS NOT NULL
+        """)
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def set_fix_report_verified(report_id: int, verified: bool):
+    async with _connect() as db:
+        await db.execute("UPDATE issue_fix_reports SET verified = ? WHERE id = ?",
+                         (1 if verified else 0, report_id))
+        await db.commit()
+
+
+async def get_fix_reports_for_submissions(submission_ids: list[int]) -> dict[int, list[dict]]:
+    """{submission_id: [report, ...]} for the 工单 tab rows."""
+    if not submission_ids:
+        return {}
+    placeholders = ",".join("?" * len(submission_ids))
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"SELECT submission_id, note_id, worker_id, commit_sha, files_json, verified, reported_at "
+            f"FROM issue_fix_reports WHERE submission_id IN ({placeholders}) ORDER BY note_id",
+            submission_ids,
+        )
+        out: dict[int, list[dict]] = {}
+        for r in await cursor.fetchall():
+            d = dict(r)
+            try:
+                d["files"] = json.loads(d.pop("files_json"))
+            except (json.JSONDecodeError, TypeError):
+                d["files"] = []
+            out.setdefault(d["submission_id"], []).append(d)
+        return out
+
+
 async def get_issue_tracking_overview(limit: int = 100) -> dict:
     """The 工单 tab's data: status counts + the tracked-submission list.
     Counts are simple tallies, deliberately NOT dressed up as a 修复率 —
@@ -736,7 +828,7 @@ async def get_issue_tracking_overview(limit: int = 100) -> dict:
         """)
         counts = {r["status"]: r["n"] for r in await cursor.fetchall()}
         cursor = await db.execute("""
-            SELECT s.id, s.repo_id, r.name as repo_name, s.title, s.issue_number, s.issue_url,
+            SELECT s.id, s.repo_id, r.name as repo_name, s.title, s.body, s.issue_number, s.issue_url,
                    s.labels, s.submitted_at,
                    COALESCE(s.track_status, 'submitted') as track_status,
                    s.remote_state, s.remote_labels, s.reopen_count, s.closed_at,
@@ -756,6 +848,9 @@ async def get_issue_tracking_overview(limit: int = 100) -> dict:
                     r[key] = json.loads(r[key]) if r[key] else []
                 except (json.JSONDecodeError, TypeError):
                     r[key] = []
+        reports = await get_fix_reports_for_submissions([r["id"] for r in rows])
+        for r in rows:
+            r["fix_reports"] = reports.get(r["id"], [])
         return {"counts": counts, "submissions": rows}
 
 

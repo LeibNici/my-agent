@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""codex-issue — the fix fleet's issue-completion tool (CodeAxis contract v1).
+
+Runs on the fleet machine (NOT on the CodeAxis server). Replaces the prose
+"completion protocol" section of the fleet prompt with one idempotent
+command; CodeAxis's issue tracker parses the structured comment this posts
+(<!-- codex-report/v1 {...} -->) to close the feedback loop (progress
+tracking, fix-vs-suspect-location hit rate, retrieval eval ground truth).
+
+Usage:
+  codex-issue finish <issue_iid> --commit <sha> [--files f1,f2,... | --files-from-commit]
+
+Config (env file, e.g. ~/.codex/xinchuan-digital.env, or plain env vars):
+  GITLAB_URL      https://<host>/<group>/<project>   (project web URL)
+  GITLAB_TOKEN    API token
+  TARGET_BRANCH   default: test
+
+`finish` is idempotent — safe to re-run after a crash at any step:
+  1. verify <sha> is reachable from TARGET_BRANCH (refuses otherwise —
+     finish before merge is a protocol violation, not a soft warning)
+  2. find an existing codex-report comment for this sha, else post one
+     (files default to the commit's own diff file list)
+  3. ensure label codex:merged-to-test
+  4. close the issue if still open (label/comment survive even if this
+     step fails on permissions — CodeAxis tracks state independently)
+Branch/lock cleanup stays in the fleet prompt for now (phase 3 moves
+claim/block/release in here too).
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+
+def die(msg: str, code: int = 1):
+    print(f"codex-issue: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config() -> dict:
+    env_file = os.environ.get("CODEX_ISSUE_ENV", os.path.expanduser("~/.codex/xinchuan-digital.env"))
+    cfg = {}
+    if os.path.exists(env_file):
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip('"').strip("'")
+    for key in ("GITLAB_URL", "GITLAB_TOKEN", "TARGET_BRANCH"):
+        if os.environ.get(key):
+            cfg[key] = os.environ[key]
+    if not cfg.get("GITLAB_URL") or not cfg.get("GITLAB_TOKEN"):
+        die(f"GITLAB_URL / GITLAB_TOKEN not configured (checked {env_file} and env vars)")
+    cfg.setdefault("TARGET_BRANCH", "test")
+    return cfg
+
+
+def api(cfg: dict, method: str, path: str, params: dict | None = None, body: dict | None = None):
+    parsed = urllib.parse.urlparse(cfg["GITLAB_URL"])
+    project = urllib.parse.quote(parsed.path.strip("/"), safe="")
+    url = f"{parsed.scheme}://{parsed.netloc}/api/v4/projects/{project}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "PRIVATE-TOKEN": cfg["GITLAB_TOKEN"],
+        **({"Content-Type": "application/json"} if data else {}),
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode() or "null")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "null")
+
+
+def worker_id() -> str:
+    return os.environ.get("CODEX_WORKER_ID") or f"codex-{time.strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
+
+
+REPORT_RE = re.compile(r"<!--\s*codex-report/v1\s*(\{.*?\})\s*-->", re.DOTALL)
+
+
+def cmd_finish(args, cfg):
+    iid, sha = args.issue_iid, args.commit
+
+    # 1. commit must already be on the target branch — hard gate
+    status, refs = api(cfg, "GET", f"/repository/commits/{urllib.parse.quote(sha, safe='')}/refs",
+                       params={"type": "branch", "per_page": 100})
+    if status == 404:
+        die(f"commit {sha} not found on the remote — push first")
+    if status != 200:
+        die(f"GitLab API {status} checking commit refs")
+    branches = {b.get("name") for b in refs}
+    if cfg["TARGET_BRANCH"] not in branches:
+        die(f"commit {sha} is NOT reachable from '{cfg['TARGET_BRANCH']}' "
+            f"(found on: {', '.join(sorted(branches)) or 'no branches'}) — merge before finishing")
+
+    # 2. files list: explicit, or derived from the commit diff
+    if args.files:
+        files = [f.strip() for f in args.files.split(",") if f.strip()]
+    else:
+        status, diff = api(cfg, "GET", f"/repository/commits/{urllib.parse.quote(sha, safe='')}/diff",
+                           params={"per_page": 100})
+        if status != 200:
+            die(f"GitLab API {status} fetching commit diff for files list")
+        files = sorted({d.get("new_path") or d.get("old_path") for d in diff if d})
+
+    # 3. find-or-create the structured report comment (idempotent by sha)
+    existing = None
+    for page in range(1, 6):
+        status, notes = api(cfg, "GET", f"/issues/{iid}/notes", params={"per_page": 100, "page": page})
+        if status != 200:
+            die(f"GitLab API {status} listing notes")
+        for note in notes:
+            m = REPORT_RE.search(note.get("body") or "")
+            if m:
+                try:
+                    if json.loads(m.group(1)).get("commit_sha") == sha:
+                        existing = note
+                except json.JSONDecodeError:
+                    pass
+        if len(notes) < 100:
+            break
+    if existing:
+        print(f"report comment already present (note {existing['id']}) — skipping post")
+    else:
+        payload = {"worker_id": worker_id(), "commit_sha": sha, "files": files, "verified": True}
+        body_text = (f"✅ 修复完成并已合入 {cfg['TARGET_BRANCH']}（commit {sha[:10]}，"
+                     f"{len(files)} 个文件）\n\n<!-- codex-report/v1 {json.dumps(payload, ensure_ascii=False)} -->")
+        status, note = api(cfg, "POST", f"/issues/{iid}/notes", body={"body": body_text})
+        if status != 201:
+            die(f"GitLab API {status} posting report comment: {note}")
+        print(f"posted report comment (note {note['id']})")
+
+    # 4. ensure label, then close (each idempotent; close failure is non-fatal)
+    status, issue = api(cfg, "GET", f"/issues/{iid}")
+    if status != 200:
+        die(f"GitLab API {status} fetching issue")
+    labels = issue.get("labels") or []
+    if "codex:merged-to-test" not in labels:
+        api(cfg, "PUT", f"/issues/{iid}", body={"add_labels": "codex:merged-to-test"})
+        print("label codex:merged-to-test added")
+    if issue.get("state") != "closed":
+        status, _ = api(cfg, "PUT", f"/issues/{iid}", body={"state_event": "close"})
+        print("issue closed" if status == 200 else
+              f"WARNING: close failed (API {status}) — report+label are in place, safe to re-run")
+    else:
+        print("issue already closed")
+    print(f"finish complete: issue #{iid} / commit {sha[:10]}")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="codex-issue")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_finish = sub.add_parser("finish", help="report a merged fix and close the issue (idempotent)")
+    p_finish.add_argument("issue_iid", type=int)
+    p_finish.add_argument("--commit", required=True, help="fix commit sha (must already be on TARGET_BRANCH)")
+    p_finish.add_argument("--files", help="comma-separated changed files; default: derived from the commit diff")
+    args = parser.parse_args()
+    cfg = load_config()
+    if args.cmd == "finish":
+        cmd_finish(args, cfg)
+
+
+if __name__ == "__main__":
+    main()
