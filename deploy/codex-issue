@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""codex-issue — the fix fleet's issue-workflow tool (CodeAxis contract v2).
+"""codex-issue — the fix fleet's issue-workflow tool (CodeAxis contract v2.1).
 
 Runs on the fleet machine (NOT on the CodeAxis server). The fleet prompt's
 prose state machine (locking, reopen safety, skip rules, dependency rescan,
@@ -10,28 +10,40 @@ feedback loop (progress tracking, hit rate, retrieval eval ground truth).
 
 Subcommands:
   claim <iid> [--dry-run]   atomic claim: skip checks + reopen precheck +
-                            lock branch creation. Exit 0=claimed,
+                            lock branch creation + post-lock re-validation +
+                            ownership comment. Exit 0=claimed,
                             2=skip (reason on stdout), 1=real blocker.
-  release <iid>             drop this issue's lock branch (idempotent).
+  release <iid> [--force]   drop this issue's lock branch. Verifies the lock
+                            was claimed by THIS worker (via the claim
+                            comment) unless --force.
   block <iid> --by <iid> [--reason ...]
                             mark dependency-blocked: label
                             codex:blocked-by-<n> + audit comment + release.
+                            Fails loudly if neither label nor comment stuck.
   merge-lock / merge-unlock acquire/release the global test merge lock
                             (codex-lock/merge-test). Exit 2 = busy.
-  rescan                    dependency-unblock sweep over open issues:
-                            removes codex:blocked-by-* whose prerequisites
-                            are all satisfied, comments the release.
+  db-lock [--iid N --reason ...] / db-unlock
+                            acquire/release the global db-migration lock
+                            (codex-lock/db-migration); --iid posts the
+                            registration comment on that issue.
+  rescan                    dependency-unblock sweep over open issues.
+                            Exit 1 if any unblock mutation failed.
   finish <iid> --commit <sha> [--files f1,f2,...]
-                            idempotent completion: verify sha reachable
-                            from TARGET_BRANCH → find-or-post
+                            idempotent completion. Hard gates: sha reachable
+                            from TARGET_BRANCH, this issue's lock exists,
+                            and no reopen/foreign comment arrived after the
+                            completion report. Then find-or-post
                             codex-report/v1 comment → ensure label → close.
+
+Exit codes: 0 = proceed, 2 = skip/busy (reason on stdout), 1 = real blocker.
 
 Config (env file, default ~/.codex/xinchuan-digital.env, or env vars;
 override path with CODEX_ISSUE_ENV):
   GITLAB_URL      https://<host>/<group>/<project>   (project web URL)
   GITLAB_TOKEN    API token
   TARGET_BRANCH   default: test
-  CODEX_WORKER_ID recommended: export once per worker session
+  CODEX_WORKER_ID strongly recommended: export once per worker session —
+                  lock ownership checks compare against it.
 """
 
 import argparse
@@ -40,8 +52,10 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 
 
 def die(msg: str, code: int = 1):
@@ -65,10 +79,16 @@ def load_config() -> dict:
     if not cfg.get("GITLAB_URL") or not cfg.get("GITLAB_TOKEN"):
         die(f"GITLAB_URL / GITLAB_TOKEN not configured (checked {env_file} and env vars)")
     cfg.setdefault("TARGET_BRANCH", "test")
+    if cfg["GITLAB_URL"].startswith("http://"):
+        print("WARNING: GITLAB_URL is plain http — the API token travels unencrypted", file=sys.stderr)
     return cfg
 
 
 def api(cfg: dict, method: str, path: str, params: dict | None = None, body: dict | None = None):
+    """One API call → (status, parsed_json, headers). Network-level failures
+    (timeout, DNS, connection reset) die(1) — per protocol they're real
+    blockers, and letting them escape as tracebacks hid whether a mutation
+    landed."""
     parsed = urllib.parse.urlparse(cfg["GITLAB_URL"])
     project = urllib.parse.quote(parsed.path.strip("/"), safe="")
     url = f"{parsed.scheme}://{parsed.netloc}/api/v4/projects/{project}{path}"
@@ -81,17 +101,51 @@ def api(cfg: dict, method: str, path: str, params: dict | None = None, body: dic
     })
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, json.loads(resp.read().decode() or "null")
+            return resp.status, json.loads(resp.read().decode() or "null"), dict(resp.headers)
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode() or "null")
+        return e.code, json.loads(e.read().decode() or "null"), dict(e.headers or {})
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        die(f"network error calling GitLab ({method} {path}): {e} — "
+            f"if this was a mutation it may or may not have landed; re-check before retrying")
+
+
+def paged_get(cfg, path: str, params: dict | None = None):
+    """Yield items across ALL pages, following X-Next-Page — fixed page caps
+    silently truncated event/note histories, which inverts safety verdicts."""
+    params = dict(params or {})
+    params["per_page"] = 100
+    page = "1"
+    while page:
+        params["page"] = page
+        status, items, headers = api(cfg, "GET", path, params=params)
+        if status != 200:
+            die(f"GitLab API {status} listing {path}")
+        yield from items
+        page = headers.get("X-Next-Page") or headers.get("x-next-page") or ""
 
 
 def worker_id() -> str:
     return os.environ.get("CODEX_WORKER_ID") or f"codex-{time.strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
 
 
+def ts(raw: str | None) -> datetime | None:
+    """Parse a GitLab ISO timestamp to an aware datetime — string comparison
+    breaks the moment two endpoints emit different offsets."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 REPORT_RE = re.compile(r"<!--\s*codex-report/v1\s*(\{.*?\})\s*-->", re.DOTALL)
 LEGACY_DONE_RE = re.compile(r"已合并并推送到\s*origin/test")
+CLAIM_MARK = "🔐 codex-claim"
+WORKER_RE = re.compile(r"worker:\s*(\S+)")
+# Fleet-generated notes (claim/block/unblock/report audit trail) must not be
+# mistaken for human feedback that invalidates completion evidence.
+FLEET_NOTE_RE = re.compile(r"^(🔐|🔒|🔓|✅)|codex-report/v1")
 SKIP = 2  # exit code: not an error — this issue just isn't claimable now
 
 
@@ -100,106 +154,146 @@ def skip(msg: str):
     sys.exit(SKIP)
 
 
-def get_branch_head(cfg, branch: str) -> str:
-    status, data = api(cfg, "GET", f"/repository/branches/{urllib.parse.quote(branch, safe='')}")
+def is_fleet_note(note: dict) -> bool:
+    body = note.get("body") or ""
+    return bool(note.get("system")) or bool(FLEET_NOTE_RE.search(body)) or LEGACY_DONE_RE.search(body) is not None
+
+
+def get_branch(cfg, branch: str) -> dict | None:
+    status, data, _ = api(cfg, "GET", f"/repository/branches/{urllib.parse.quote(branch, safe='')}")
+    if status == 404:
+        return None
     if status != 200:
         die(f"GitLab API {status} reading branch {branch}")
+    return data
+
+
+def get_branch_head(cfg, branch: str) -> str:
+    data = get_branch(cfg, branch)
+    if not data:
+        die(f"branch {branch} not found")
     return data["commit"]["id"]
 
 
 def create_lock(cfg, name: str, ref_sha: str) -> str:
-    """Create-only lock via the branches API. Returns 'acquired' | 'busy';
-    anything else dies (401/403/network = real blocker, per fleet protocol)."""
-    status, data = api(cfg, "POST", "/repository/branches",
-                       params={"branch": name, "ref": ref_sha})
+    """Create-only lock via the branches API. Returns 'acquired' | 'busy'.
+    Busy is determined by re-reading the branch after a failed create — NOT
+    by matching error-message text, which varies across GitLab versions and
+    locales. 401/403 die (real blocker, per fleet protocol)."""
+    status, data, _ = api(cfg, "POST", "/repository/branches",
+                          params={"branch": name, "ref": ref_sha})
     if status == 201:
         return "acquired"
-    text = json.dumps(data, ensure_ascii=False)
-    if status in (400, 409) and ("exists" in text or "已存在" in text):
+    if status in (401, 403):
+        die(f"GitLab API {status} creating lock {name}: no permission")
+    if get_branch(cfg, name) is not None:
         return "busy"
-    die(f"GitLab API {status} creating lock {name}: {text[:200]}")
+    die(f"GitLab API {status} creating lock {name} and branch does not exist afterwards: "
+        f"{json.dumps(data, ensure_ascii=False)[:200]}")
 
 
 def delete_lock(cfg, name: str):
-    status, _ = api(cfg, "DELETE", f"/repository/branches/{urllib.parse.quote(name, safe='')}")
+    status, _, _ = api(cfg, "DELETE", f"/repository/branches/{urllib.parse.quote(name, safe='')}")
     if status in (204, 404):  # gone either way — idempotent
         return
     die(f"GitLab API {status} deleting lock {name}")
 
 
 def iter_notes(cfg, iid: int):
-    for page in range(1, 6):
-        status, notes = api(cfg, "GET", f"/issues/{iid}/notes",
-                            params={"per_page": 100, "page": page, "sort": "asc"})
-        if status != 200:
-            die(f"GitLab API {status} listing notes")
-        yield from notes
-        if len(notes) < 100:
-            return
+    yield from paged_get(cfg, f"/issues/{iid}/notes", params={"sort": "asc"})
 
 
-def completion_signal_time(cfg, iid: int) -> str | None:
+def lock_owner(cfg, iid: int) -> tuple[str | None, str | None]:
+    """(worker, claimed_at) from the most recent claim comment for this
+    issue's lock — the durable ownership record the lock branch itself
+    can't carry."""
+    owner, at = None, None
+    for note in iter_notes(cfg, iid):
+        body = note.get("body") or ""
+        if body.startswith(CLAIM_MARK) and f"codex-lock/issue-{iid}" in body:
+            m = WORKER_RE.search(body)
+            if m:
+                owner, at = m.group(1), note.get("created_at")
+    return owner, at
+
+
+def completion_signal_time(cfg, iid: int, notes: list[dict] | None = None) -> datetime | None:
     """Latest completion evidence: a codex-report/v1 (or legacy-format)
     comment, or the last add of the codex:merged-to-test label."""
     latest = None
-    for note in iter_notes(cfg, iid):
+    if notes is None:
+        notes = list(iter_notes(cfg, iid))
+    for note in notes:
         body = note.get("body") or ""
         if REPORT_RE.search(body) or LEGACY_DONE_RE.search(body):
-            t = note.get("created_at")
+            t = ts(note.get("created_at"))
             if t and (latest is None or t > latest):
                 latest = t
-    status, events = api(cfg, "GET", f"/issues/{iid}/resource_label_events",
-                         params={"per_page": 100})
-    if status == 200:
-        for ev in events:
-            if ev.get("action") == "add" and (ev.get("label") or {}).get("name") == "codex:merged-to-test":
-                t = ev.get("created_at")
-                if t and (latest is None or t > latest):
-                    latest = t
+    for ev in paged_get(cfg, f"/issues/{iid}/resource_label_events"):
+        if ev.get("action") == "add" and (ev.get("label") or {}).get("name") == "codex:merged-to-test":
+            t = ts(ev.get("created_at"))
+            if t and (latest is None or t > latest):
+                latest = t
     return latest
+
+
+def reopen_after(cfg, iid: int, when: datetime) -> datetime | None:
+    """Earliest reopen event after `when`, or None. GitLab versions disagree
+    on the reopen event's state value ("reopened" vs "opened"); accept both —
+    issue creation never emits a state event, so any opened/reopened entry
+    in this stream is a reopen."""
+    for ev in paged_get(cfg, f"/issues/{iid}/resource_state_events"):
+        if ev.get("state") in ("reopened", "opened"):
+            t = ts(ev.get("created_at"))
+            if t and t > when:
+                return t
+    return None
+
+
+def foreign_note_after(cfg, iid: int, when: datetime, notes: list[dict] | None = None) -> dict | None:
+    """First non-fleet, non-system comment after `when`, or None."""
+    if notes is None:
+        notes = list(iter_notes(cfg, iid))
+    for note in notes:
+        t = ts(note.get("created_at"))
+        if t and t > when and not is_fleet_note(note):
+            return note
+    return None
 
 
 def reopen_precheck(cfg, iid: int) -> tuple[str, str]:
     """For an open issue carrying completion evidence: is that evidence still
-    valid? Returns (verdict, reason) — verdict 'skip' (valid, just never got
-    closed: do NOT claim, do NOT close) or 'claimable' (invalidated by a
-    reopen or later human comment: needs a real re-fix)."""
-    done_at = completion_signal_time(cfg, iid)
+    valid? Returns (verdict, reason) — 'skip' (valid, just never got closed:
+    do NOT claim, do NOT close) or 'claimable' (invalidated by a reopen or a
+    later human comment: needs a real re-fix)."""
+    notes = list(iter_notes(cfg, iid))
+    done_at = completion_signal_time(cfg, iid, notes)
     if not done_at:
         return "claimable", "有 merged-to-test 迹象但找不到完成记录，按普通候选处理"
-    status, events = api(cfg, "GET", f"/issues/{iid}/resource_state_events",
-                         params={"per_page": 100})
-    if status != 200:
-        return "skip", f"无法读取状态事件（API {status}），不能安全判断，跳过"
-    for ev in events:
-        if ev.get("state") == "reopened" and (ev.get("created_at") or "") > done_at:
-            return "claimable", f"完成记录({done_at})之后发生 reopen，旧完成标记已失效"
-    for note in iter_notes(cfg, iid):
-        body = note.get("body") or ""
-        if (not note.get("system") and (note.get("created_at") or "") > done_at
-                and not REPORT_RE.search(body) and not LEGACY_DONE_RE.search(body)):
-            return "claimable", f"完成记录之后出现新的人工评论（note {note['id']}），需重新确认"
-    return "skip", f"完成记录({done_at})仍有效，仅历史未关闭 — 不领取、不关闭"
+    reopen = reopen_after(cfg, iid, done_at)
+    if reopen:
+        return "claimable", f"完成记录({done_at.isoformat()})之后于 {reopen.isoformat()} 发生 reopen，旧完成标记已失效"
+    note = foreign_note_after(cfg, iid, done_at, notes)
+    if note:
+        return "claimable", f"完成记录之后出现新的人工评论（note {note['id']}），需重新确认"
+    return "skip", f"完成记录({done_at.isoformat()})仍有效，仅历史未关闭 — 不领取、不关闭"
 
 
 def prerequisite_satisfied(cfg, pre_iid: int) -> bool:
-    status, pre = api(cfg, "GET", f"/issues/{pre_iid}")
+    status, pre, _ = api(cfg, "GET", f"/issues/{pre_iid}")
     if status != 200:
         return False  # can't confirm → not satisfied
     return pre.get("state") == "closed" or "codex:merged-to-test" in (pre.get("labels") or [])
 
 
-def cmd_claim(args, cfg):
-    iid = args.issue_iid
-    status, issue = api(cfg, "GET", f"/issues/{iid}")
-    if status == 404:
-        skip(f"issue #{iid} 不存在")
-    if status != 200:
-        die(f"GitLab API {status} reading issue")
+def _claim_checks(cfg, iid: int, issue: dict) -> list[str]:
+    """The skip checks, factored so claim can re-run them AFTER acquiring the
+    lock — every pre-lock read is a stale snapshot by definition, and the
+    check-then-lock window is where a concurrent close/claim slips in.
+    Returns the labels list (dies via skip() on any failed check)."""
     if issue.get("state") == "closed":
         skip("issue 已关闭")
     labels = issue.get("labels") or []
-
     if "codex:in-progress" in labels:
         skip("codex:in-progress — 其他 worker 处理中")
     if any(l in labels for l in ("codex:waiting-merge", "codex:ready-for-review")):
@@ -214,6 +308,17 @@ def cmd_claim(args, cfg):
             skip(f"前置 #{pre_iid} 尚未合入（{l}）")
     if any(l in ("blocked", "status:blocked", "codex:blocked") for l in labels) and not blocked_by:
         skip("通用 blocked 标记（无可回扫的 blocked-by-*），不自动处理")
+    return labels
+
+
+def cmd_claim(args, cfg):
+    iid = args.issue_iid
+    status, issue, _ = api(cfg, "GET", f"/issues/{iid}")
+    if status == 404:
+        skip(f"issue #{iid} 不存在")
+    if status != 200:
+        die(f"GitLab API {status} reading issue")
+    labels = _claim_checks(cfg, iid, issue)
 
     if "codex:merged-to-test" in labels or completion_signal_time(cfg, iid):
         verdict, reason = reopen_precheck(cfg, iid)
@@ -226,40 +331,81 @@ def cmd_claim(args, cfg):
         return
 
     ref = get_branch_head(cfg, cfg["TARGET_BRANCH"])
-    result = create_lock(cfg, f"codex-lock/issue-{iid}", ref)
-    if result == "busy":
+    if create_lock(cfg, f"codex-lock/issue-{iid}", ref) == "busy":
         skip("锁已存在 — 其他 worker 已领取")
+
+    # Post-lock re-validation: the issue may have changed between the checks
+    # above and winning the lock. Now that we hold it, re-read and re-check;
+    # any failure releases the lock before skipping.
+    status, issue, _ = api(cfg, "GET", f"/issues/{iid}")
+    if status != 200:
+        delete_lock(cfg, f"codex-lock/issue-{iid}")
+        die(f"GitLab API {status} re-reading issue after lock")
+    try:
+        labels = _claim_checks(cfg, iid, issue)
+    except SystemExit:
+        delete_lock(cfg, f"codex-lock/issue-{iid}")
+        raise
+
+    # Durable ownership record — the lock branch can't carry metadata, and
+    # release/stale-takeover decisions need to know whose lock this is.
+    wid = worker_id()
+    status, _, _ = api(cfg, "POST", f"/issues/{iid}/notes", body={
+        "body": f"{CLAIM_MARK} lock: codex-lock/issue-{iid} worker: {wid} "
+                f"time: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}"})
+    if status != 201:
+        delete_lock(cfg, f"codex-lock/issue-{iid}")
+        die(f"GitLab API {status} posting claim comment — lock released, retry claim")
+
     print(f"CLAIMED: issue #{iid} — {issue.get('title', '')}")
-    print(f"lock: codex-lock/issue-{iid} @ {ref[:10]}  worker: {worker_id()}")
+    print(f"lock: codex-lock/issue-{iid} @ {ref[:10]}  worker: {wid}")
     if "codex:merged-to-test" in labels:
-        api(cfg, "PUT", f"/issues/{iid}", body={"remove_labels": "codex:merged-to-test"})
-        print("已移除失效的 codex:merged-to-test")
+        status, _, _ = api(cfg, "PUT", f"/issues/{iid}", body={"remove_labels": "codex:merged-to-test"})
+        print("已移除失效的 codex:merged-to-test" if status == 200
+              else f"WARNING: 移除失效 label 失败（API {status}），完成时 finish 会重新覆盖")
 
 
 def cmd_release(args, cfg):
-    delete_lock(cfg, f"codex-lock/issue-{args.issue_iid}")
-    print(f"released: codex-lock/issue-{args.issue_iid}")
+    iid = args.issue_iid
+    if not args.force:
+        owner, claimed_at = lock_owner(cfg, iid)
+        wid = worker_id()
+        if owner and owner != wid:
+            die(f"锁属于 {owner}（claimed {claimed_at}），当前 worker 是 {wid} — "
+                f"只能释放自己的锁；确认对方已失联超过 6 小时后用 --force 接管释放")
+    delete_lock(cfg, f"codex-lock/issue-{iid}")
+    print(f"released: codex-lock/issue-{iid}")
 
 
 def cmd_block(args, cfg):
     iid, pre = args.issue_iid, args.by
     label = f"codex:blocked-by-{pre}"
-    status, _ = api(cfg, "PUT", f"/issues/{iid}", body={"add_labels": label})
-    label_note = "" if status == 200 else f"（label 写入失败 API {status}，以本评论为准）"
+    status_label, _, _ = api(cfg, "PUT", f"/issues/{iid}", body={"add_labels": label})
+    label_note = "" if status_label == 200 else f"（label 写入失败 API {status_label}，以本评论为准）"
     body = (f"🔒 依赖阻塞：#{iid} 依赖 #{pre}，前置未合入 origin/test，暂不处理。{label_note}\n"
             f"worker: {worker_id()}  time: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
             f"原因: {args.reason or '前置依赖未完成'}")
-    api(cfg, "POST", f"/issues/{iid}/notes", body={"body": body})
+    status_note, _, _ = api(cfg, "POST", f"/issues/{iid}/notes", body={"body": body})
+    if status_label != 200 and status_note != 201:
+        # Neither the label nor the comment stuck — there is NO durable block
+        # record. Keep the lock so no other worker claims it, and fail loudly.
+        die(f"blocked-by 登记完全失败（label API {status_label}, note API {status_note}）— "
+            f"锁保留，需人工处理")
     delete_lock(cfg, f"codex-lock/issue-{iid}")
-    print(f"blocked-by #{pre} 已登记，锁已释放")
+    print(f"blocked-by #{pre} 已登记（label: {'ok' if status_label == 200 else 'FAILED'}, "
+          f"comment: {'ok' if status_note == 201 else 'FAILED'}），锁已释放")
+
+
+def _global_lock(cfg, name: str, label: str):
+    ref = get_branch_head(cfg, cfg["TARGET_BRANCH"])
+    if create_lock(cfg, name, ref) == "busy":
+        print(f"BUSY: {label}被占用，等待后重试")
+        sys.exit(SKIP)
+    print(f"{label} acquired @ {ref[:10]}")
 
 
 def cmd_merge_lock(args, cfg):
-    ref = get_branch_head(cfg, cfg["TARGET_BRANCH"])
-    if create_lock(cfg, "codex-lock/merge-test", ref) == "busy":
-        print("BUSY: 其他 worker 正在合并 test，等待后重试")
-        sys.exit(SKIP)
-    print(f"merge lock acquired @ {ref[:10]}")
+    _global_lock(cfg, "codex-lock/merge-test", "merge lock")
 
 
 def cmd_merge_unlock(args, cfg):
@@ -267,103 +413,138 @@ def cmd_merge_unlock(args, cfg):
     print("merge lock released")
 
 
+def cmd_db_lock(args, cfg):
+    _global_lock(cfg, "codex-lock/db-migration", "db-migration lock")
+    if args.iid:
+        status, _, _ = api(cfg, "POST", f"/issues/{args.iid}/notes", body={
+            "body": f"🔐 codex-db-migration-lock worker: {worker_id()} "
+                    f"time: {time.strftime('%Y-%m-%dT%H:%M:%S%z')} "
+                    f"test@{get_branch_head(cfg, cfg['TARGET_BRANCH'])[:10]}\n"
+                    f"原因: {args.reason or 'db migration'}"})
+        if status != 201:
+            print(f"WARNING: 迁移锁登记评论失败（API {status}）— 锁已持有，继续", file=sys.stderr)
+
+
+def cmd_db_unlock(args, cfg):
+    delete_lock(cfg, "codex-lock/db-migration")
+    print("db-migration lock released")
+
+
 def cmd_rescan(args, cfg):
-    unblocked = 0
-    for page in range(1, 11):
-        status, issues = api(cfg, "GET", "/issues",
-                             params={"state": "opened", "per_page": 100, "page": page})
-        if status != 200:
-            die(f"GitLab API {status} listing open issues")
-        for issue in issues:
-            labels = issue.get("labels") or []
-            blocked_by = [l for l in labels if l.startswith("codex:blocked-by-")]
-            if not blocked_by:
-                continue
-            pres = []
-            for l in blocked_by:
-                try:
-                    pres.append(int(l.rsplit("-", 1)[1]))
-                except ValueError:
-                    pres = None
-                    break
-            if pres is None or not all(prerequisite_satisfied(cfg, p) for p in pres):
-                continue
-            iid = issue["iid"]
-            api(cfg, "PUT", f"/issues/{iid}", body={"remove_labels": ",".join(blocked_by)})
-            api(cfg, "POST", f"/issues/{iid}/notes", body={
-                "body": f"🔓 前置依赖（{', '.join('#' + str(p) for p in pres)}）已合入 origin/test，"
-                        f"解除依赖阻塞，可重新领取。worker: {worker_id()}"})
-            print(f"unblocked: #{iid}（前置 {pres} 已满足）")
+    unblocked, failures = 0, 0
+    for issue in paged_get(cfg, "/issues", params={"state": "opened"}):
+        labels = issue.get("labels") or []
+        blocked_by = [l for l in labels if l.startswith("codex:blocked-by-")]
+        if not blocked_by:
+            continue
+        pres = []
+        for l in blocked_by:
+            try:
+                pres.append(int(l.rsplit("-", 1)[1]))
+            except ValueError:
+                pres = None
+                break
+        if pres is None or not all(prerequisite_satisfied(cfg, p) for p in pres):
+            continue
+        iid = issue["iid"]
+        status_label, _, _ = api(cfg, "PUT", f"/issues/{iid}", body={"remove_labels": ",".join(blocked_by)})
+        status_note, _, _ = api(cfg, "POST", f"/issues/{iid}/notes", body={
+            "body": f"🔓 前置依赖（{', '.join('#' + str(p) for p in pres)}）已合入 origin/test，"
+                    f"解除依赖阻塞，可重新领取。worker: {worker_id()}"})
+        if status_label == 200:
             unblocked += 1
-        if len(issues) < 100:
-            break
-    print(f"rescan complete: {unblocked} 个 issue 解除阻塞")
+            print(f"unblocked: #{iid}（前置 {pres} 已满足）"
+                  + ("" if status_note == 201 else f"（解除评论失败 API {status_note}）"))
+        else:
+            failures += 1
+            print(f"FAILED to unblock #{iid}: label API {status_label}", file=sys.stderr)
+    print(f"rescan complete: {unblocked} 个 issue 解除阻塞" + (f"，{failures} 个失败" if failures else ""))
+    if failures:
+        sys.exit(1)
 
 
 def cmd_finish(args, cfg):
     iid, sha = args.issue_iid, args.commit
 
-    # 1. commit must already be on the target branch — hard gate
-    status, refs = api(cfg, "GET", f"/repository/commits/{urllib.parse.quote(sha, safe='')}/refs",
-                       params={"type": "branch", "per_page": 100})
+    # Gate 1: commit must already be on the target branch (refs endpoint is
+    # paginated — follow all pages, or a repo with >100 branches containing
+    # this commit could false-reject a genuinely merged one).
+    status, _, _ = api(cfg, "GET", f"/repository/commits/{urllib.parse.quote(sha, safe='')}")
     if status == 404:
         die(f"commit {sha} not found on the remote — push first")
     if status != 200:
-        die(f"GitLab API {status} checking commit refs")
-    branches = {b.get("name") for b in refs}
+        die(f"GitLab API {status} checking commit")
+    branches = {b.get("name") for b in paged_get(
+        cfg, f"/repository/commits/{urllib.parse.quote(sha, safe='')}/refs", params={"type": "branch"})}
     if cfg["TARGET_BRANCH"] not in branches:
         die(f"commit {sha} is NOT reachable from '{cfg['TARGET_BRANCH']}' "
             f"(found on: {', '.join(sorted(branches)) or 'no branches'}) — merge before finishing")
 
-    # 2. files list: explicit, or derived from the commit diff
+    # Gate 2: this worker must actually hold the issue's lock — finish
+    # without claim would let any worker close any issue with any commit.
+    if get_branch(cfg, f"codex-lock/issue-{iid}") is None:
+        die(f"codex-lock/issue-{iid} 不存在 — 未经 claim 的 issue 禁止 finish")
+    owner, _ = lock_owner(cfg, iid)
+    if owner and owner != worker_id():
+        die(f"锁属于 {owner}，当前 worker 是 {worker_id()} — 不能替其他 worker finish")
+
+    # files list: explicit, or derived from the commit diff
     if args.files:
         files = [f.strip() for f in args.files.split(",") if f.strip()]
     else:
-        status, diff = api(cfg, "GET", f"/repository/commits/{urllib.parse.quote(sha, safe='')}/diff",
-                           params={"per_page": 100})
-        if status != 200:
-            die(f"GitLab API {status} fetching commit diff for files list")
+        diff = list(paged_get(cfg, f"/repository/commits/{urllib.parse.quote(sha, safe='')}/diff"))
         files = sorted({d.get("new_path") or d.get("old_path") for d in diff if d})
 
-    # 3. find-or-create the structured report comment (idempotent by sha)
+    # find-or-create the structured report comment (idempotent by sha)
+    notes = list(iter_notes(cfg, iid))
     existing = None
-    for page in range(1, 6):
-        status, notes = api(cfg, "GET", f"/issues/{iid}/notes", params={"per_page": 100, "page": page})
-        if status != 200:
-            die(f"GitLab API {status} listing notes")
-        for note in notes:
-            m = REPORT_RE.search(note.get("body") or "")
-            if m:
-                try:
-                    if json.loads(m.group(1)).get("commit_sha") == sha:
-                        existing = note
-                except json.JSONDecodeError:
-                    pass
-        if len(notes) < 100:
-            break
+    for note in notes:
+        m = REPORT_RE.search(note.get("body") or "")
+        if m:
+            try:
+                if json.loads(m.group(1)).get("commit_sha") == sha:
+                    existing = note
+            except json.JSONDecodeError:
+                pass
     if existing:
+        report_time = ts(existing.get("created_at"))
         print(f"report comment already present (note {existing['id']}) — skipping post")
     else:
         payload = {"worker_id": worker_id(), "commit_sha": sha, "files": files, "verified": True}
         body_text = (f"✅ 修复完成并已合入 {cfg['TARGET_BRANCH']}（commit {sha[:10]}，"
                      f"{len(files)} 个文件）\n\n<!-- codex-report/v1 {json.dumps(payload, ensure_ascii=False)} -->")
-        status, note = api(cfg, "POST", f"/issues/{iid}/notes", body={"body": body_text})
+        status, note, _ = api(cfg, "POST", f"/issues/{iid}/notes", body={"body": body_text})
         if status != 201:
             die(f"GitLab API {status} posting report comment: {note}")
+        report_time = ts(note.get("created_at")) or datetime.now().astimezone()
         print(f"posted report comment (note {note['id']})")
 
-    # 4. ensure label, then close (each idempotent; close failure is non-fatal)
-    status, issue = api(cfg, "GET", f"/issues/{iid}")
+    # ensure label
+    status, issue, _ = api(cfg, "GET", f"/issues/{iid}")
     if status != 200:
         die(f"GitLab API {status} fetching issue")
-    labels = issue.get("labels") or []
-    if "codex:merged-to-test" not in labels:
-        api(cfg, "PUT", f"/issues/{iid}", body={"add_labels": "codex:merged-to-test"})
+    if "codex:merged-to-test" not in (issue.get("labels") or []):
+        status, _, _ = api(cfg, "PUT", f"/issues/{iid}", body={"add_labels": "codex:merged-to-test"})
+        if status != 200:
+            die(f"GitLab API {status} adding codex:merged-to-test — report is posted, "
+                f"fix permissions and re-run finish (idempotent)")
         print("label codex:merged-to-test added")
+
+    # Gate 3 (final, pre-close): nothing may have invalidated THIS completion
+    # since the report — a reopen or a new human comment means close is unsafe.
+    if report_time:
+        reopen = reopen_after(cfg, iid, report_time)
+        if reopen:
+            die(f"完成记录之后于 {reopen.isoformat()} 发生 reopen — 禁止关闭，需重新处理")
+        note = foreign_note_after(cfg, iid, report_time)
+        if note:
+            die(f"完成记录之后出现新的人工评论（note {note['id']}）— 禁止关闭，先复核该评论")
+
     if issue.get("state") != "closed":
-        status, _ = api(cfg, "PUT", f"/issues/{iid}", body={"state_event": "close"})
-        print("issue closed" if status == 200 else
-              f"WARNING: close failed (API {status}) — report+label are in place, safe to re-run")
+        status, _, _ = api(cfg, "PUT", f"/issues/{iid}", body={"state_event": "close"})
+        if status != 200:
+            die(f"close failed (API {status}) — report+label 已就位，修复权限后重跑 finish 即可")
+        print("issue closed")
     else:
         print("issue already closed")
     print(f"finish complete: issue #{iid} / commit {sha[:10]}")
@@ -373,12 +554,13 @@ def main():
     parser = argparse.ArgumentParser(prog="codex-issue")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_claim = sub.add_parser("claim", help="atomically claim an issue (skip checks + reopen precheck + lock)")
+    p_claim = sub.add_parser("claim", help="atomically claim an issue (skip checks + reopen precheck + lock + ownership comment)")
     p_claim.add_argument("issue_iid", type=int)
     p_claim.add_argument("--dry-run", action="store_true", help="run all checks, don't create the lock")
 
-    p_release = sub.add_parser("release", help="drop this issue's lock branch (idempotent)")
+    p_release = sub.add_parser("release", help="drop this issue's lock branch (ownership-checked)")
     p_release.add_argument("issue_iid", type=int)
+    p_release.add_argument("--force", action="store_true", help="take over a stale lock (>6h, worker gone)")
 
     p_block = sub.add_parser("block", help="record a dependency block and release the lock")
     p_block.add_argument("issue_iid", type=int)
@@ -387,9 +569,13 @@ def main():
 
     sub.add_parser("merge-lock", help="acquire the global test merge lock (exit 2 = busy)")
     sub.add_parser("merge-unlock", help="release the global test merge lock")
+    p_dbl = sub.add_parser("db-lock", help="acquire the global db-migration lock (exit 2 = busy)")
+    p_dbl.add_argument("--iid", type=int, help="issue to post the registration comment on")
+    p_dbl.add_argument("--reason")
+    sub.add_parser("db-unlock", help="release the global db-migration lock")
     sub.add_parser("rescan", help="dependency-unblock sweep over open issues")
 
-    p_finish = sub.add_parser("finish", help="report a merged fix and close the issue (idempotent)")
+    p_finish = sub.add_parser("finish", help="report a merged fix and close the issue (idempotent, lock-checked)")
     p_finish.add_argument("issue_iid", type=int)
     p_finish.add_argument("--commit", required=True, help="fix commit sha (must already be on TARGET_BRANCH)")
     p_finish.add_argument("--files", help="comma-separated changed files; default: derived from the commit diff")
@@ -399,6 +585,7 @@ def main():
     {
         "claim": cmd_claim, "release": cmd_release, "block": cmd_block,
         "merge-lock": cmd_merge_lock, "merge-unlock": cmd_merge_unlock,
+        "db-lock": cmd_db_lock, "db-unlock": cmd_db_unlock,
         "rescan": cmd_rescan, "finish": cmd_finish,
     }[args.cmd](args, cfg)
 

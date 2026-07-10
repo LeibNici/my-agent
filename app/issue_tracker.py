@@ -95,7 +95,11 @@ async def _fetch_gitlab_state_events(client: httpx.AsyncClient, api_base: str,
             break  # older GitLab without this API → degrade to snapshot-only
         events = resp.json()
         for ev in events:
-            if ev.get("state") == "reopened":
+            # GitLab versions disagree on the reopen event's state value
+            # ("reopened" vs "opened"); accept both. Safe because issue
+            # CREATION never emits a state event — any opened/reopened
+            # event in this stream is a reopen.
+            if ev.get("state") in ("reopened", "opened"):
                 reopens += 1
             elif ev.get("state") == "closed":
                 last_closed_at = ev.get("created_at")
