@@ -10,6 +10,8 @@ from app.database import (
     grant_permission, revoke_permission, list_permissions, get_user_repos,
     get_usage_summary, get_usage_by_user, get_recent_llm_calls,
     get_feedback_summary, get_recent_negative_feedback,
+    get_semantic_search_stats, get_semantic_search_recent,
+    get_issue_tracking_overview,
 )
 from app.repo_sync import mask_url_credentials
 from app.models import (
@@ -210,6 +212,33 @@ async def api_feedback_summary():
     summary = await get_feedback_summary()
     summary["recent_negative"] = await get_recent_negative_feedback(20)
     return summary
+
+
+# ==================== Issue progress tracking ====================
+
+@router.get("/issues/tracking")
+async def api_issue_tracking(limit: int = 100):
+    return await get_issue_tracking_overview(limit)
+
+
+@router.post("/issues/tracking/poll")
+async def api_issue_tracking_poll():
+    """Manual refresh — same reconciliation the background loop runs."""
+    from app.issue_tracker import poll_tracked_issues
+    polled = await poll_tracked_issues()
+    return {"ok": True, "polled": polled}
+
+
+# ==================== Semantic search recall log ====================
+
+@router.get("/semantic-search/summary")
+async def api_semantic_search_summary():
+    return await get_semantic_search_stats()
+
+
+@router.get("/semantic-search/recent")
+async def api_semantic_search_recent(limit: int = 50, low_score_only: bool = False):
+    return await get_semantic_search_recent(limit, low_score_only)
 
 
 @router.get("/users/{user_id}/repos")

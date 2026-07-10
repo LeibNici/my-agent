@@ -452,10 +452,144 @@ async function loadUsage() {
     `).join("") || `<tr><td colspan="3" style="color:var(--faint);">暂无差评</td></tr>`;
 }
 
+// ===== Issue progress tracking =====
+const TRACK_STATUS = {
+    submitted: { label: "已提报", color: "var(--mute)" },
+    claimed:   { label: "修复中", color: "var(--ink-800)" },
+    merged:    { label: "已合入", color: "var(--moss)" },
+    closed:    { label: "已关闭", color: "var(--moss)" },
+    reopened:  { label: "被打回", color: "var(--rust)" },
+};
+
+async function loadIssueTracking() {
+    const resp = await fetch("/api/admin/issues/tracking?limit=100", { headers: authHeaders() });
+    const data = await resp.json();
+    const counts = data.counts || {};
+
+    document.getElementById("issues-summary-cards").innerHTML =
+        ["submitted", "claimed", "merged", "closed", "reopened"].map(key => `
+        <div class="stat-card">
+            <div class="stat-label">${TRACK_STATUS[key].label}</div>
+            <div class="stat-value" style="color:${key === 'reopened' && counts[key] ? 'var(--rust)' : 'inherit'}">${formatNumber(counts[key] || 0)}</div>
+        </div>
+    `).join("");
+
+    document.getElementById("issues-tracking-table").innerHTML = (data.submissions || []).map(s => {
+        const st = TRACK_STATUS[s.track_status] || TRACK_STATUS.submitted;
+        const codexLabels = (s.remote_labels || []).filter(l => l.startsWith("codex:"));
+        return `
+        <tr>
+            <td>${esc((s.submitted_at || "").replace("T", " ").slice(0, 16))}</td>
+            <td>${esc(s.username || "-")}</td>
+            <td>${esc(s.repo_name || "-")}</td>
+            <td><a href="${esc(s.issue_url || '#')}" target="_blank" rel="noopener" title="${esc(s.title)}">#${s.issue_number} ${esc(s.title.length > 30 ? s.title.slice(0, 30) + "…" : s.title)}</a></td>
+            <td>
+                <span class="badge" style="background:transparent;border:1px solid ${st.color};color:${st.color};">${st.label}</span>
+                ${s.track_error ? `<span title="${esc(s.track_error)}" style="color:var(--rust);cursor:help;margin-left:4px;">⚠</span>` : ""}
+                ${codexLabels.length ? `<span style="font-family:var(--font-mono);font-size:11px;color:var(--faint);margin-left:4px;" title="${esc(codexLabels.join(', '))}">${codexLabels.length}🏷</span>` : ""}
+            </td>
+            <td style="color:${s.reopen_count ? 'var(--rust)' : 'var(--faint)'}">${s.reopen_count || 0}</td>
+            <td style="color:var(--faint)">${s.last_checked_at ? esc(s.last_checked_at.replace("T", " ").slice(5, 16)) : "未检查"}</td>
+        </tr>`;
+    }).join("") || `<tr><td colspan="7" style="color:var(--faint);">暂无提报工单</td></tr>`;
+}
+
+async function pollIssueTracking(btn) {
+    btn.disabled = true; btn.textContent = "同步中…";
+    try {
+        const { ok, data } = await apiRequest("/api/admin/issues/tracking/poll", { method: "POST" });
+        showMsg(ok ? `已同步 ${data.polled} 条工单状态` : "同步失败", ok);
+        if (ok) await loadIssueTracking();
+    } finally {
+        btn.disabled = false; btn.textContent = "立即同步";
+    }
+}
+
+// ===== Semantic search recall log =====
+// score coloring is shared between the summary cards and the recent-queries
+// table: null (no hits at all) reads the same as a genuinely low score,
+// since both are the "this query didn't work" signal the panel exists to surface.
+function scoreColor(score) {
+    if (score == null || score < 0.5) return "var(--rust)";
+    if (score >= 0.7) return "var(--moss)";
+    return "var(--mute)";
+}
+
+async function loadSemanticSearch() {
+    const lowOnly = document.getElementById("semantic-low-score-only").checked;
+    const [summaryResp, recentResp] = await Promise.all([
+        fetch("/api/admin/semantic-search/summary", { headers: authHeaders() }),
+        fetch(`/api/admin/semantic-search/recent?limit=50&low_score_only=${lowOnly}`, { headers: authHeaders() }),
+    ]);
+    const summary = await summaryResp.json();
+    const recent = await recentResp.json();
+
+    const avgScore = Number(summary.avg_top1_score || 0);
+    document.getElementById("semantic-summary-cards").innerHTML = `
+        <div class="stat-card">
+            <div class="stat-label">查询次数</div>
+            <div class="stat-value">${formatNumber(summary.query_count)}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">平均 Top1 分数</div>
+            <div class="stat-value" style="color:${scoreColor(avgScore)}">${avgScore.toFixed(3)}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">低分查询（&lt;0.5）</div>
+            <div class="stat-value" style="color:var(--rust)">${formatNumber(summary.low_score_count)}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">零召回查询</div>
+            <div class="stat-value" style="color:var(--rust)">${formatNumber(summary.no_result_count)}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">平均耗时</div>
+            <div class="stat-value">${formatMs(summary.avg_duration_ms)}</div>
+        </div>
+    `;
+
+    const dist = summary.distribution || {};
+    const buckets = [
+        { key: "bucket_none", label: "无结果", color: "var(--rust)" },
+        { key: "bucket_0_3", label: "0.0-0.3", color: "var(--rust)" },
+        { key: "bucket_3_5", label: "0.3-0.5", color: "var(--rust)" },
+        { key: "bucket_5_7", label: "0.5-0.7", color: "var(--mute)" },
+        { key: "bucket_7_10", label: "0.7-1.0", color: "var(--moss)" },
+    ];
+    const maxCount = Math.max(1, ...buckets.map(b => Number(dist[b.key] || 0)));
+    document.getElementById("semantic-distribution").innerHTML = buckets.map(b => {
+        const count = Number(dist[b.key] || 0);
+        const pct = Math.round(count / maxCount * 100);
+        return `
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;font-family:var(--font-mono);font-size:12.5px;">
+                <div style="width:70px;color:var(--mute);">${b.label}</div>
+                <div style="flex:1;background:var(--bg-tertiary);border-radius:3px;overflow:hidden;height:16px;">
+                    <div style="width:${pct}%;background:${b.color};height:100%;"></div>
+                </div>
+                <div style="width:32px;text-align:right;">${count}</div>
+            </div>
+        `;
+    }).join("");
+
+    document.getElementById("semantic-recent-table").innerHTML = recent.map(r => `
+        <tr>
+            <td>${esc((r.created_at || "").replace("T", " ").slice(0, 19))}</td>
+            <td>${esc(r.username || "-")}</td>
+            <td>${esc(r.repo_name || (r.repo_id != null ? `#${r.repo_id}` : "-"))}</td>
+            <td title="${esc(r.query)}">${esc(r.query.length > 40 ? r.query.slice(0, 40) + "…" : r.query)}</td>
+            <td>${r.result_count}</td>
+            <td style="color:${scoreColor(r.top1_score)}">${r.top1_score != null ? Number(r.top1_score).toFixed(3) : "—"}</td>
+            <td>${formatMs(r.duration_ms)}</td>
+        </tr>
+    `).join("") || `<tr><td colspan="7" style="color:var(--faint);">暂无数据</td></tr>`;
+}
+
 // ===== Init =====
 if (isAuthorizedAdmin) {
     loadUsers();
     loadRepos();
     loadPerms();
+    loadIssueTracking();
     loadUsage();
+    loadSemanticSearch();
 }

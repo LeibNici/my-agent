@@ -176,6 +176,25 @@ async def init_db():
                 UNIQUE(message_id, user_id)
             )
         """)
+        # One row per semantic_search tool call — recall-quality signal the
+        # admin dashboard didn't have before: llm_call_metrics only knows
+        # token/latency per LLM turn, not which tool ran or what it found.
+        # Written by the tool itself via a raw sqlite3 connection (see
+        # semantic_index._log_search) since it executes in the worker thread
+        # the registry offloads sync tools to, not on the asyncio loop.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS semantic_search_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                repo_id INTEGER,
+                query TEXT NOT NULL,
+                result_count INTEGER NOT NULL,
+                top1_score REAL,
+                results_json TEXT NOT NULL,
+                duration_ms INTEGER,
+                created_at TEXT NOT NULL
+            )
+        """)
         # SQLite does not auto-index foreign keys — without these, every
         # session open / usage query walks the whole table.
         await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
@@ -183,6 +202,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_issue_submissions_session ON issue_submissions(session_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_issue_actions_session ON issue_actions(session_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_semantic_search_log_created ON semantic_search_log(created_at)")
         await db.commit()
 
         # Migration: add owner_id to existing sessions table if missing
@@ -200,6 +220,22 @@ async def init_db():
         # submission by (title text alone collides/misses too easily).
         issue_submissions_columns = await _table_columns(db, "issue_submissions")
         await _add_column_if_missing(db, "issue_submissions", "draft_tool_use_id", "TEXT", issue_submissions_columns)
+
+        # Migration: progress tracking — filed issues used to vanish from the
+        # platform's view the moment they were submitted; these columns hold
+        # what the background poller (app/issue_tracker.py) observes on the
+        # tracker afterwards. track_status is the derived lifecycle phase
+        # (submitted/claimed/merged/closed/reopened); remote_state is GitLab's
+        # raw opened/closed; reopen 检测 comes from the resource_state_events
+        # API (authoritative event stream), not snapshot diffing, so a
+        # close→reopen happening entirely between two polls is still counted.
+        await _add_column_if_missing(db, "issue_submissions", "track_status", "TEXT DEFAULT 'submitted'", issue_submissions_columns)
+        await _add_column_if_missing(db, "issue_submissions", "remote_state", "TEXT", issue_submissions_columns)
+        await _add_column_if_missing(db, "issue_submissions", "remote_labels", "TEXT", issue_submissions_columns)
+        await _add_column_if_missing(db, "issue_submissions", "reopen_count", "INTEGER DEFAULT 0", issue_submissions_columns)
+        await _add_column_if_missing(db, "issue_submissions", "closed_at", "TEXT", issue_submissions_columns)
+        await _add_column_if_missing(db, "issue_submissions", "last_checked_at", "TEXT", issue_submissions_columns)
+        await _add_column_if_missing(db, "issue_submissions", "track_error", "TEXT", issue_submissions_columns)
 
         # Migration: add branch and separate username/token credential columns
         # to existing repositories table if missing
@@ -633,6 +669,96 @@ async def get_issue_submissions_for_session(session_id: str) -> list[dict]:
         return rows
 
 
+# ==================== Issue progress tracking ====================
+
+async def get_trackable_submissions() -> list[dict]:
+    """Submissions the poller should refresh this round. Everything still
+    open/unknown is polled every round; closed issues drop to at most one
+    check per day (instead of stopping entirely) so a late reopen is still
+    caught — Codex's fleet reopens issues when a merged fix regresses."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT id, repo_id, issue_number, issue_url, track_status, remote_state,
+                   reopen_count, closed_at, last_checked_at
+            FROM issue_submissions
+            WHERE issue_number IS NOT NULL AND issue_url IS NOT NULL
+              AND (
+                remote_state IS NULL OR remote_state != 'closed'
+                OR last_checked_at IS NULL
+                OR last_checked_at < datetime('now', 'localtime', '-1 day')
+              )
+            ORDER BY id
+        """)
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def update_issue_tracking(submission_id: int, track_status: str = None,
+                                remote_state: str = None, remote_labels: str = None,
+                                reopen_count: int = None, closed_at: str = None,
+                                track_error: str = None, clear_error: bool = False):
+    """Persist one poll's observation. Only touches passed fields, mirroring
+    update_repo's pattern; last_checked_at is always stamped — it marks the
+    poll ATTEMPT, success or failure (track_error carries the failure)."""
+    fields, values = ["last_checked_at = ?"], [datetime.now().isoformat()]
+    if track_status is not None:
+        fields.append("track_status = ?"); values.append(track_status)
+    if remote_state is not None:
+        fields.append("remote_state = ?"); values.append(remote_state)
+    if remote_labels is not None:
+        fields.append("remote_labels = ?"); values.append(remote_labels)
+    if reopen_count is not None:
+        fields.append("reopen_count = ?"); values.append(reopen_count)
+    if closed_at is not None:
+        fields.append("closed_at = ?"); values.append(closed_at)
+    if clear_error:
+        fields.append("track_error = NULL")
+    elif track_error is not None:
+        fields.append("track_error = ?"); values.append(track_error)
+    values.append(submission_id)
+    async with _connect() as db:
+        await db.execute(f"UPDATE issue_submissions SET {', '.join(fields)} WHERE id = ?", values)
+        await db.commit()
+
+
+async def get_issue_tracking_overview(limit: int = 100) -> dict:
+    """The 工单 tab's data: status counts + the tracked-submission list.
+    Counts are simple tallies, deliberately NOT dressed up as a 修复率 —
+    'closed' includes won't-fix/duplicate closures, and calling that a fix
+    rate would be a fake number until Phase 2's structured completion
+    reports can distinguish real fixes."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT COALESCE(track_status, 'submitted') as status, COUNT(*) as n
+            FROM issue_submissions WHERE issue_number IS NOT NULL
+            GROUP BY COALESCE(track_status, 'submitted')
+        """)
+        counts = {r["status"]: r["n"] for r in await cursor.fetchall()}
+        cursor = await db.execute("""
+            SELECT s.id, s.repo_id, r.name as repo_name, s.title, s.issue_number, s.issue_url,
+                   s.labels, s.submitted_at,
+                   COALESCE(s.track_status, 'submitted') as track_status,
+                   s.remote_state, s.remote_labels, s.reopen_count, s.closed_at,
+                   s.last_checked_at, s.track_error,
+                   COALESCE(u.username, '(已删除用户 #' || s.user_id || ')') as username
+            FROM issue_submissions s
+            LEFT JOIN users u ON u.id = s.user_id
+            LEFT JOIN repositories r ON r.id = s.repo_id
+            WHERE s.issue_number IS NOT NULL
+            ORDER BY s.id DESC
+            LIMIT ?
+        """, (limit,))
+        rows = [dict(r) for r in await cursor.fetchall()]
+        for r in rows:
+            for key in ("labels", "remote_labels"):
+                try:
+                    r[key] = json.loads(r[key]) if r[key] else []
+                except (json.JSONDecodeError, TypeError):
+                    r[key] = []
+        return {"counts": counts, "submissions": rows}
+
+
 # ==================== Issue actions (comment/close/reopen an existing issue) ====================
 
 async def record_issue_action(
@@ -818,6 +944,60 @@ async def get_recent_llm_calls(limit: int = 50) -> list[dict]:
             LEFT JOIN users u ON u.id = m.user_id
             LEFT JOIN sessions s ON s.id = m.session_id
             ORDER BY m.id DESC
+            LIMIT ?
+        """, (limit,))
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+# ==================== Semantic search log ====================
+
+async def get_semantic_search_stats() -> dict:
+    """Aggregate recall-quality signal for the admin dashboard: how many
+    queries ran, how often the top hit was a weak match (top1_score < 0.5,
+    the same threshold the recent-queries view flags), and how often nothing
+    came back at all. Score buckets let the panel show a distribution instead
+    of just one average masking a bimodal (great queries + garbage queries) mix."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT
+                COUNT(*) as query_count,
+                COALESCE(AVG(top1_score), 0) as avg_top1_score,
+                COALESCE(AVG(duration_ms), 0) as avg_duration_ms,
+                SUM(CASE WHEN top1_score IS NOT NULL AND top1_score < 0.5 THEN 1 ELSE 0 END) as low_score_count,
+                SUM(CASE WHEN result_count = 0 THEN 1 ELSE 0 END) as no_result_count
+            FROM semantic_search_log
+        """)
+        summary = dict(await cursor.fetchone())
+        cursor = await db.execute("""
+            SELECT
+                SUM(CASE WHEN top1_score IS NULL THEN 1 ELSE 0 END) as bucket_none,
+                SUM(CASE WHEN top1_score < 0.3 THEN 1 ELSE 0 END) as bucket_0_3,
+                SUM(CASE WHEN top1_score >= 0.3 AND top1_score < 0.5 THEN 1 ELSE 0 END) as bucket_3_5,
+                SUM(CASE WHEN top1_score >= 0.5 AND top1_score < 0.7 THEN 1 ELSE 0 END) as bucket_5_7,
+                SUM(CASE WHEN top1_score >= 0.7 THEN 1 ELSE 0 END) as bucket_7_10
+            FROM semantic_search_log
+        """)
+        summary["distribution"] = dict(await cursor.fetchone())
+        return summary
+
+
+async def get_semantic_search_recent(limit: int = 50, low_score_only: bool = False) -> list[dict]:
+    """Most recent semantic_search calls with user/repo context. low_score_only
+    filters to top1_score < 0.5 (or no hits at all) — the queries worth
+    reviewing for a chunking/embedding-model tuning signal."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        where = "WHERE l.top1_score IS NULL OR l.top1_score < 0.5" if low_score_only else ""
+        cursor = await db.execute(f"""
+            SELECT l.id, l.query, l.repo_id, r.name as repo_name, l.result_count,
+                   l.top1_score, l.duration_ms, l.created_at,
+                   COALESCE(u.username, '(已删除用户 #' || l.user_id || ')') as username
+            FROM semantic_search_log l
+            LEFT JOIN users u ON u.id = l.user_id
+            LEFT JOIN repositories r ON r.id = l.repo_id
+            {where}
+            ORDER BY l.id DESC
             LIMIT ?
         """, (limit,))
         return [dict(r) for r in await cursor.fetchall()]

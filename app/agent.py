@@ -60,6 +60,7 @@ class Agent:
         allowed_repo_paths: list[str] | None = None,
         unsynced_repo_names: list[str] | None = None,
         active_repo: dict | None = None,
+        user_id: int | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent loop, yielding events as they occur.
 
@@ -85,6 +86,8 @@ class Agent:
             # The repo this chat turn is scoped to ({id, name}) — draft_issue
             # stamps it into drafts so submission can't target the wrong repo.
             "active_repo": active_repo,
+            # For tools that log their own per-user activity (semantic_search).
+            "user_id": user_id,
         })
 
         # Collect available tools (all tools if no skills, or skill-specific tools)

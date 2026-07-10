@@ -31,13 +31,17 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
+import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
 import numpy as np
 
 from app.config import settings, app_settings
-from app.tools.access import get_allowed_paths, no_access_reason
+from app.database import DB_PATH
+from app.tools.access import get_allowed_paths, get_tool_user_id, no_access_reason
 from app.tools.registry import tool
 from app.tools.symbol_index import _index_path as _tags_path, _load_tags
 
@@ -351,6 +355,7 @@ def semantic_search(query: str, max_results: int = 8) -> str:
     if not embedding_key_or_fallback():
         return "语义检索未启用（未配置 embedding API key）。请改用 code_search / find_symbol。"
 
+    started = time.perf_counter()
     # Sync tool (registry offloads to a thread) — use a blocking client here.
     resp = httpx.post(
         f"{app_settings.embedding_base_url}/embeddings",
@@ -381,17 +386,56 @@ def semantic_search(query: str, max_results: int = 8) -> str:
         repo_name = os.path.basename(repo_path)
         for i in top:
             m = meta[int(i)]
-            label = f" ({m['name']})" if m.get("name") else ""
-            hits.append((float(scores[int(i)]),
-                         f"{repo_name}/{m['path']}:{m['start']}-{m['end']}{label}"))
+            hits.append({
+                "score": float(scores[int(i)]), "repo_id": repo_name,
+                "path": m["path"], "start": m["start"], "end": m["end"], "name": m.get("name") or "",
+            })
 
     if not any_index:
         return ("语义索引尚未构建（仓库同步后会在后台自动构建，首次需要几分钟）。"
                 "请先用 code_search / find_symbol。")
+
+    hits.sort(key=lambda h: -h["score"])
+    top_hits = hits[:max_results]
+    _log_search(query, top_hits, int((time.perf_counter() - started) * 1000))
+
     if not hits:
         return f"没有与「{query}」语义相近的代码块。换个说法试试，或改用 code_search。"
 
-    hits.sort(key=lambda x: -x[0])
-    lines = [f"{score:.3f}  {ref}" for score, ref in hits[:max_results]]
+    lines = [f"{h['score']:.3f}  {h['repo_id']}/{h['path']}:{h['start']}-{h['end']}"
+             + (f" ({h['name']})" if h["name"] else "") for h in top_hits]
     return (f"与「{query}」语义最相近的代码位置（分值越高越相关，建议用 file_reader 查看确认）：\n"
             + "\n".join(lines))
+
+
+def _log_search(query: str, top_hits: list[dict], duration_ms: int) -> None:
+    """Best-effort recall-quality log for the admin 语义检索 dashboard — never
+    lets a logging failure affect the tool's actual return value. Uses a raw
+    blocking sqlite3 connection rather than database.py's aiosqlite helpers:
+    this function runs inside the worker thread the registry offloads sync
+    tools to (asyncio.to_thread), with no event loop here to await against.
+    WAL mode + busy_timeout (set the same way database.py's _connect does)
+    make this safe alongside the app's normal async connections."""
+    try:
+        top1 = top_hits[0] if top_hits else None
+        repo_id = int(top1["repo_id"]) if top1 and str(top1["repo_id"]).isdigit() else None
+        results_json = json.dumps(
+            [{"repo_id": h["repo_id"], "path": h["path"], "start": h["start"],
+              "end": h["end"], "name": h["name"], "score": round(h["score"], 4)} for h in top_hits],
+            ensure_ascii=False,
+        )
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(
+                "INSERT INTO semantic_search_log "
+                "(user_id, repo_id, query, result_count, top1_score, results_json, duration_ms, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (get_tool_user_id(), repo_id, query[:500], len(top_hits),
+                 top1["score"] if top1 else None, results_json, duration_ms, datetime.now().isoformat()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass

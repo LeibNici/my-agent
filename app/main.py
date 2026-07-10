@@ -136,12 +136,15 @@ async def lifespan(app: FastAPI):
         print(f"  ❌ Startup repo sync failed: {type(e).__name__}: {e}")
 
     sync_task = asyncio.create_task(periodic_sync_loop(app_settings.repo_sync_interval_minutes))
+    from app.issue_tracker import periodic_tracking_loop
+    tracking_task = asyncio.create_task(periodic_tracking_loop(app_settings.issue_track_interval_minutes))
     yield
-    sync_task.cancel()
-    try:
-        await sync_task
-    except asyncio.CancelledError:
-        pass
+    for task in (sync_task, tracking_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="CodeAxis", lifespan=lifespan)
@@ -405,6 +408,7 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
                 allowed_repo_paths=allowed_repo_paths,
                 unsynced_repo_names=unsynced_repo_names,
                 active_repo=active_repo,
+                user_id=current_user["id"],
             ):
                 if event.type == "text_delta":
                     full_text += event.data["text"]

@@ -143,7 +143,9 @@
             <button class="tab-btn active" onclick="switchTab('users', this)">用户</button>
             <button class="tab-btn" onclick="switchTab('repos', this)">仓库</button>
             <button class="tab-btn" onclick="switchTab('perms', this)">权限</button>
+            <button class="tab-btn" onclick="switchTab('issues', this)">工单</button>
             <button class="tab-btn" onclick="switchTab('usage', this)">用量</button>
+            <button class="tab-btn" onclick="switchTab('semantic', this)">语义检索</button>
         </div>
         <div class="admin-content">
             <div id="msg-area"></div>
@@ -223,6 +225,22 @@
                 </div>
             </div>
 
+            <!-- Issue Tracking Panel -->
+            <div id="panel-issues" class="panel">
+                <div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:12px;">
+                    <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="pollIssueTracking(this)">立即同步</button>
+                    <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="loadIssueTracking()">刷新</button>
+                </div>
+                <div class="stat-grid" id="issues-summary-cards"></div>
+                <div class="card">
+                    <h3>提报工单追踪 <span style="font-weight:normal;font-size:12px;color:var(--mute);margin-left:8px">状态链：已提报 → 已领取 → 已合入 → 已关闭 / 被打回</span></h3>
+                    <table>
+                        <thead><tr><th>提报时间</th><th>提报人</th><th>仓库</th><th>Issue</th><th>状态</th><th>Reopen</th><th>上次检查</th></tr></thead>
+                        <tbody id="issues-tracking-table"></tbody>
+                    </table>
+                </div>
+            </div>
+
             <!-- Usage Panel -->
             <div id="panel-usage" class="panel">
                 <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
@@ -249,6 +267,29 @@
                     <table>
                         <thead><tr><th>时间</th><th>会话</th><th>用户</th></tr></thead>
                         <tbody id="feedback-negative-table"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Semantic Search Panel -->
+            <div id="panel-semantic" class="panel">
+                <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
+                    <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="loadSemanticSearch()">刷新</button>
+                </div>
+                <div class="stat-grid" id="semantic-summary-cards"></div>
+                <div class="card">
+                    <h3>Top1 分数分布</h3>
+                    <div id="semantic-distribution"></div>
+                </div>
+                <div class="card">
+                    <h3>最近查询
+                        <label style="font-weight:normal;font-size:13px;color:var(--mute);margin-left:12px;">
+                            <input type="checkbox" id="semantic-low-score-only" onchange="loadSemanticSearch()"> 只看低分（top1 &lt; 0.5 或无结果）
+                        </label>
+                    </h3>
+                    <table>
+                        <thead><tr><th>时间</th><th>用户</th><th>仓库</th><th>查询</th><th>结果数</th><th>Top1 分数</th><th>耗时</th></tr></thead>
+                        <tbody id="semantic-recent-table"></tbody>
                     </table>
                 </div>
             </div>

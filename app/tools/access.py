@@ -18,6 +18,13 @@ def get_allowed_paths() -> list[str]:
     return [os.path.realpath(p) for p in paths if p]
 
 
+def get_tool_user_id() -> int | None:
+    """Current turn's user id from tool context — for tools that log their
+    own per-user activity (e.g. semantic_search's recall-quality log)."""
+    ctx = tool_context.get() or {}
+    return ctx.get("user_id")
+
+
 def is_within_allowed_paths(real_path: str, allowed_paths: list[str]) -> bool:
     """The actual repo-boundary test: real_path is allowed if it IS one of
     the allowed roots, or is nested under one. Centralized here — this exact
