@@ -282,11 +282,30 @@ def _prepare_model_messages(history: list[dict]) -> list[dict]:
       every base64 screenshot would otherwise be re-uploaded on every LLM
       call of every later turn, dominating input cost for image-heavy
       sessions long after the image stopped mattering.
-    - History is windowed to the most recent max_history_messages, cutting
-      only at safe points: the first kept message must be a plain user turn,
-      never an orphaned tool_result relay (the API rejects a tool_result
-      whose tool_use was trimmed away) or an assistant message.
+    - The CURRENT turn (everything from the last plain user message on) is
+      always sent whole, even if it alone exceeds the window. It must be:
+      a tool_result whose tool_use was trimmed away is rejected by the API.
+    - PAST turns are condensed rather than sliced: their tool_use/tool_result
+      bookkeeping is dropped and only the text survives (the question asked,
+      and what the assistant concluded). This is the same trade the image
+      placeholder makes — keep the meaning, drop the bulk.
+
+      Slicing past turns positionally does not work here. One budget-exhausted
+      turn is ~61 messages of bookkeeping, more than the whole 60-message
+      window; a tail slice lands mid-turn, the alignment loop finds no plain
+      user message to start from, and pops EVERYTHING — the model gets an
+      empty conversation. That silently breaks the one thing "继续调查" exists
+      to do, since the checkpoint summary it says to build on would be the
+      first thing trimmed. Condensing keeps the original question and that
+      summary while shedding the 60 bookkeeping messages between them.
+    - What's left of the condensed past is then windowed to fit under
+      max_history_messages alongside the current turn.
     """
+    def _is_tool_relay(m: dict) -> bool:
+        return isinstance(m["content"], list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"]
+        )
+
     msgs = []
     for m in history:
         content = m["content"]
@@ -299,15 +318,34 @@ def _prepare_model_messages(history: list[dict]) -> list[dict]:
         msgs.append({"role": m["role"], "content": content})
 
     limit = settings.max_history_messages
-    if limit and len(msgs) > limit:
-        msgs = msgs[-limit:]
-        def _is_tool_relay(m: dict) -> bool:
-            return isinstance(m["content"], list) and any(
-                isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"]
-            )
-        while msgs and (msgs[0]["role"] != "user" or _is_tool_relay(msgs[0])):
-            msgs.pop(0)
-    return msgs
+    if not limit or len(msgs) <= limit:
+        return msgs
+
+    last_turn_start = 0
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i]["role"] == "user" and not _is_tool_relay(msgs[i]):
+            last_turn_start = i
+            break
+    current_turn = msgs[last_turn_start:]
+
+    condensed = []
+    for m in msgs[:last_turn_start]:
+        if m["role"] == "user":
+            if not _is_tool_relay(m):  # a real question, not a tool_result relay
+                condensed.append(m)
+        elif isinstance(m["content"], list):
+            texts = [b for b in m["content"] if isinstance(b, dict) and b.get("type") == "text"]
+            if texts:  # keep what it said, drop the tool_use blocks
+                condensed.append({"role": "assistant", "content": texts})
+        else:
+            condensed.append(m)  # plain-text assistant answer (incl. checkpoint summaries)
+
+    room = max(limit - len(current_turn), 0)
+    if len(condensed) > room:
+        condensed = condensed[len(condensed) - room:] if room else []
+    while condensed and condensed[0]["role"] != "user":
+        condensed.pop(0)  # a conversation may not open on an assistant message
+    return condensed + current_turn
 
 
 async def chat_event_stream(req: ChatRequest, current_user: dict):
@@ -463,10 +501,13 @@ async def chat_event_stream(req: ChatRequest, current_user: dict):
                                                partial_text + "\n\n_（回复未完成：发生错误）_")
                     await record_llm_call_metrics(pending_llm_metrics)
                     pending_llm_metrics = []
-                    # message_id lets the client attach 👍/👎 to this answer
+                    # message_id lets the client attach 👍/👎 to this answer.
+                    # budget_exhausted tells the client this is a checkpoint
+                    # report, not a finished answer — it offers "继续调查".
                     yield {"event": "done", "data": json.dumps({
                         "session_id": session_id, "text": full_text,
                         "message_id": final_message_id,
+                        "budget_exhausted": event.data.get("budget_exhausted", False),
                     }, ensure_ascii=False)}
                 elif event.type == "error":
                     yield {"event": "error", "data": json.dumps(event.data, ensure_ascii=False)}

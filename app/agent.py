@@ -21,6 +21,67 @@ class AgentEvent:
     data: dict = field(default_factory=dict)
 
 
+# ==================== Tool-call budget ====================
+#
+# The iteration cap is a COST guard, not a quality ceiling. A real session
+# spent all 30 rounds on a legitimate, non-repetitive cross-layer trace and
+# got back nothing but "Reached max tool iterations" — the whole turn's
+# findings were thrown away, and the user recovered only by manually typing
+# "继续". No fixed N fixes that: an agent that misreads the question can
+# burn any budget on the wrong path. So instead of a bigger number:
+#
+#   - at the midpoint, make the model re-check its trajectory (catching a
+#     wrong path at round 15 is worth far more than warning at round 27);
+#   - in the last rounds, push it to consolidate rather than keep searching;
+#   - when the budget IS gone, spend one final tool-free call turning
+#     whatever was learned into a checkpoint report, and let the human
+#     authorize another budget window with one click.
+#
+# The human between windows IS the design. These texts go only into the copy
+# of the conversation sent to the model — never persisted, or they'd render
+# as user messages in the transcript.
+
+_MIDPOINT_CHECK = (
+    "[系统提示] 本轮调查已过半。请先在心里核对：真正要回答的问题是什么？"
+    "目前已确认了什么、已排除了什么？当前这条调查路线还有证据支撑吗？"
+    "如果没有，立刻换方向，不要沿着无证据的假设继续深挖。"
+)
+
+_ENDGAME_CHECK = (
+    "[系统提示] 本轮调查仅剩 {n} 轮。请停止扩大搜索范围，开始收敛："
+    "基于已掌握的信息整理结论——已确认什么、已排除什么、还缺什么证据。"
+    "除非有一个明确的关键缺口必须补齐，否则现在就给出结论。"
+)
+
+_WRAPUP_PROMPT = (
+    "[系统提示] 本轮工具调用预算已用尽，不要再调用任何工具。"
+    "请直接用文字给出阶段性汇报：\n"
+    "1. 目前已确认的结论（附代码位置）\n"
+    "2. 已排除的可能性\n"
+    "3. 还缺什么证据、下一步应该查什么\n"
+    "即使结论不完整也要如实汇报，这份汇报会直接展示给用户。"
+)
+
+_WRAPUP_FALLBACK = (
+    "本轮工具调用预算已用尽，且未能生成阶段性汇报。"
+    "上面的工具调用记录包含了已经查到的信息，可点击「继续调查」在此基础上继续。"
+)
+
+_WRAPUP_MAX_TOKENS = 1200  # a synthesis call, not another investigation window
+
+
+def _budget_reminder(next_iteration: int, max_iterations: int) -> str | None:
+    """The model-only nudge to append to the tool results that iteration
+    `next_iteration` will read, or None. Endgame outranks the midpoint check
+    when a small max_iterations makes both fire."""
+    remaining = max_iterations - next_iteration  # rounds left, including the next one
+    if 1 <= remaining <= 3:
+        return _ENDGAME_CHECK.format(n=remaining)
+    if max_iterations >= 6 and next_iteration == max_iterations // 2:
+        return _MIDPOINT_CHECK
+    return None
+
+
 def _apply_cache_control(messages: list[dict]) -> None:
     """Move the conversation cache breakpoint to the last content block.
 
@@ -247,7 +308,16 @@ class Agent:
                     "results": tool_result_blocks,
                 })
 
-                messages.append({"role": "user", "content": tool_result_blocks})
+                # Budget nudge rides along on the message the next round already
+                # has to read — no extra LLM call. It goes into a NEW list so the
+                # blocks just persisted above stay clean; the API requires the
+                # tool_result blocks to come before any trailing text block.
+                model_content = tool_result_blocks
+                reminder = _budget_reminder(iteration + 1, settings.max_tool_iterations)
+                if reminder:
+                    model_content = tool_result_blocks + [{"type": "text", "text": reminder}]
+
+                messages.append({"role": "user", "content": model_content})
                 # Loop continues — LLM will see tool results
 
             else:
@@ -258,11 +328,65 @@ class Agent:
                 })
                 return
 
-        # Hit iteration limit — error, not success
-        yield AgentEvent(type="error", data={
-            "message": f"Reached max tool iterations ({settings.max_tool_iterations})"
+        # Budget exhausted. NOT an error — the tool results gathered so far are
+        # real work. Spend one final tool-free call converting them into a
+        # checkpoint report the user can act on (and continue from), instead of
+        # discarding the entire turn.
+        messages.append({"role": "user", "content": [{"type": "text", "text": _WRAPUP_PROMPT}]})
+        if cache_enabled:
+            _apply_cache_control(messages)
+
+        wrap_text = ""
+        t_wrap_start = time.monotonic()
+        wrap_in_tokens = wrap_out_tokens = 0
+        # tool_choice=none is the real enforcement; the instruction alone is
+        # only a request. Some Anthropic-compatible endpoints reject the field,
+        # so fall back to instruction-only — and either way any tool_use the
+        # model still emits is simply never executed, text is the deliverable.
+        for attempt, extra in enumerate(({"tool_choice": {"type": "none"}}, {})):
+            try:
+                async with self.llm.client.messages.stream(
+                    model=self.llm.model,
+                    max_tokens=_WRAPUP_MAX_TOKENS,
+                    messages=messages,
+                    system=system,
+                    tools=tools if tools else None,
+                    **extra,
+                ) as stream:
+                    async for event in stream:
+                        etype = getattr(event, "type", None)
+                        if etype == "message_start":
+                            wrap_in_tokens = event.message.usage.input_tokens
+                        elif etype == "message_delta":
+                            wrap_out_tokens = event.usage.output_tokens
+                        elif etype == "content_block_delta":
+                            delta = event.delta
+                            if getattr(delta, "type", None) == "text_delta":
+                                wrap_text += delta.text
+                                yield AgentEvent(type="text_delta", data={"text": delta.text})
+                break
+            except Exception:
+                # Only retry the un-streamed case: once text has reached the
+                # client, a retry would duplicate it in the transcript.
+                if attempt == 0 and not wrap_text:
+                    continue
+                break
+
+        yield AgentEvent(type="llm_metrics", data={
+            "iteration": settings.max_tool_iterations,
+            "model": self.llm.model,
+            "input_tokens": wrap_in_tokens,
+            "output_tokens": wrap_out_tokens,
+            "ttft_ms": None,
+            "total_ms": int((time.monotonic() - t_wrap_start) * 1000),
         })
+
+        if not wrap_text.strip():
+            wrap_text = _WRAPUP_FALLBACK
+            yield AgentEvent(type="text_delta", data={"text": wrap_text})
+
         yield AgentEvent(type="done", data={
-            "text": "",
-            "success": False,
+            "text": wrap_text,
+            "success": True,
+            "budget_exhausted": True,
         })

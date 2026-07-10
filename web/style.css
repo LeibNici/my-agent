@@ -1212,6 +1212,38 @@ body {
     text-align: center;
 }
 
+/* Tool-call budget ran out — amber (pending), not rust: the checkpoint report
+   above it is real work, and one click buys another budget window. */
+.budget-exhausted-notice {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin: 10px auto 14px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    background: var(--amber-dim);
+    color: var(--amber);
+    border: 1px solid var(--amber);
+    font-size: 13px;
+}
+.budget-exhausted-notice button {
+    padding: 4px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--amber);
+    background: transparent;
+    color: var(--amber);
+    font-family: var(--font-body);
+    font-size: 12.5px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+.budget-exhausted-notice button:hover:not(:disabled) {
+    background: var(--amber);
+    color: var(--ink-950);
+}
+.budget-exhausted-notice button:disabled { opacity: 0.45; cursor: not-allowed; }
+
 /* Inserted mid-transcript, right before the message that silently landed in
    a new session (a resolved session's next message never reuses the old
    id) — wire (info), not moss (success/resolved) or amber (pending), since

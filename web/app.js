@@ -678,6 +678,9 @@ async function sendMessage() {
                         if (data.message_id) {
                             appendFeedbackBar(bubble, data.message_id, null);
                         }
+                        if (data.budget_exhausted) {
+                            appendBudgetExhaustedNotice();
+                        }
                     } else if (eventType === "error") {
                         hideThinking(contentEl);
                         contentEl.innerHTML += `<p style="color:var(--error)">${escapeHtml(data.message)}</p>`;
@@ -1161,6 +1164,37 @@ function appendResolvedNotice() {
     const div = document.createElement("div");
     div.className = "session-resolved-notice";
     div.textContent = "✅ 本次任务已完结 — 发送新消息将开始一个新会话";
+    messagesDiv.appendChild(div);
+    scrollToBottom();
+}
+
+// The turn ran out of tool-call budget and wrapped up with a checkpoint
+// report instead of a finished answer. Not an error state — the report above
+// is real work. One click authorizes another budget window, carrying that
+// report forward (the model is told not to redo what's already done).
+const CONTINUE_INVESTIGATION_PROMPT =
+    "继续调查。基于上面的阶段性结论，优先补齐尚缺的证据，不要重复已经完成的检查。";
+
+function appendBudgetExhaustedNotice() {
+    const messagesDiv = document.getElementById("messages");
+    const div = document.createElement("div");
+    div.className = "budget-exhausted-notice";
+
+    const text = document.createElement("span");
+    text.textContent = "本轮调查预算已用尽，上面是阶段性结论。";
+    div.appendChild(text);
+
+    const btn = document.createElement("button");
+    btn.textContent = "继续调查";
+    btn.onclick = () => {
+        if (isStreaming) return;
+        btn.disabled = true;
+        const input = document.getElementById("message-input");
+        input.value = CONTINUE_INVESTIGATION_PROMPT;
+        sendMessage();
+    };
+    div.appendChild(btn);
+
     messagesDiv.appendChild(div);
     scrollToBottom();
 }

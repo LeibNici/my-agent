@@ -70,10 +70,15 @@ class AnthropicSettings(BaseSettings):
         "later realize the draft should change, say so in text and ask the user whether to redraft; never "
         "silently call draft_issue again as a way to conclude the turn."
     )
-    # 10 was too tight for real multi-file/multi-condition investigations even
-    # with correctly-targeted tool calls (no repetition/loop) — raised after
-    # confirming a genuine case that used all 10 legitimately and still needed
-    # more. Configurable via ANTHROPIC_MAX_TOOL_ITERATIONS if this needs tuning.
+    # A COST guard, not a quality ceiling — see the budget section in
+    # app/agent.py. Running out no longer fails the turn: the agent gets a
+    # midpoint course-check, endgame consolidation nudges, and finally one
+    # tool-free call that turns whatever it found into a checkpoint report
+    # the user can continue from with one click. Because a human authorizes
+    # each new budget window, a modest number is preferable to a large one —
+    # raising it just spends more before reaching that checkpoint. (10 was
+    # genuinely too tight for real cross-layer investigations; 30 is not.)
+    # Configurable via ANTHROPIC_MAX_TOOL_ITERATIONS.
     max_tool_iterations: int = 30
 
     # Prompt caching (cache_control breakpoints): "auto" enables it only when
