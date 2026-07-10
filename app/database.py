@@ -262,6 +262,16 @@ async def init_db():
         # submitter-side "有新进展" unread badge.
         await _add_column_if_missing(db, "issue_submissions", "status_changed_at", "TEXT", issue_submissions_columns)
 
+        # Migration: server-side "last viewed my filed issues" timestamp.
+        # Freshness used to be computed client-side by comparing
+        # status_changed_at (naive server-local time) against a
+        # localStorage timestamp from the BROWSER's clock — silently wrong
+        # whenever server and browser disagree on timezone/clock. Comparing
+        # two server-local timestamps against each other, entirely
+        # server-side, removes that class of bug outright.
+        users_columns = await _table_columns(db, "users")
+        await _add_column_if_missing(db, "users", "my_issues_seen_at", "TEXT", users_columns)
+
         # Migration: add branch and separate username/token credential columns
         # to existing repositories table if missing
         repositories_columns = await _table_columns(db, "repositories")
@@ -825,9 +835,15 @@ async def get_fix_reports_for_submissions(submission_ids: list[int]) -> dict[int
 async def get_my_issue_submissions(user_id: int, limit: int = 50) -> list[dict]:
     """The submitter's own filed issues with tracking state — powers the
     我的提报 drawer. Own submissions only; no bodies (the drawer doesn't
-    need N×KB of markdown)."""
+    need N×KB of markdown). `fresh` is computed here against the user's own
+    my_issues_seen_at — both timestamps are server-local, so unlike the
+    naive client-side version this replaced, it can't be thrown off by the
+    browser's clock/timezone disagreeing with the server's."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT my_issues_seen_at FROM users WHERE id = ?", (user_id,))
+        row = await cursor.fetchone()
+        seen_at = row["my_issues_seen_at"] if row else None
         cursor = await db.execute("""
             SELECT s.id, s.repo_id, r.name as repo_name, s.title, s.issue_number, s.issue_url,
                    s.submitted_at, COALESCE(s.track_status, 'submitted') as track_status,
@@ -845,7 +861,32 @@ async def get_my_issue_submissions(user_id: int, limit: int = 50) -> list[dict]:
             r["fix_verified"] = bool(verified)
             r["fix_files_count"] = len(verified[-1]["files"]) if verified else None
             r["fix_commit"] = (verified[-1].get("commit_sha") or "")[:10] if verified else None
+            r["fresh"] = bool(r["status_changed_at"]) and (not seen_at or r["status_changed_at"] > seen_at)
         return rows
+
+
+async def get_my_unread_issue_count(user_id: int) -> int:
+    """Cheap COUNT for the sidebar badge — avoids pulling the full
+    submissions+fix-reports payload (up to 50 rows, each with parsed
+    files_json) just to render a number on every page load."""
+    async with _connect() as db:
+        cursor = await db.execute("SELECT my_issues_seen_at FROM users WHERE id = ?", (user_id,))
+        row = await cursor.fetchone()
+        seen_at = row[0] if row else None
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM issue_submissions "
+            "WHERE user_id = ? AND issue_number IS NOT NULL AND status_changed_at IS NOT NULL "
+            "AND (? IS NULL OR status_changed_at > ?)",
+            (user_id, seen_at, seen_at),
+        )
+        return (await cursor.fetchone())[0]
+
+
+async def mark_my_issues_seen(user_id: int) -> None:
+    async with _connect() as db:
+        await db.execute("UPDATE users SET my_issues_seen_at = ? WHERE id = ?",
+                         (datetime.now().isoformat(), user_id))
+        await db.commit()
 
 
 async def get_issue_tracking_overview(limit: int = 100) -> dict:

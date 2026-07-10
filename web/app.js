@@ -82,7 +82,7 @@ document.addEventListener("DOMContentLoaded", () => {
     loadRepos();
     loadSkills();
     loadSessions();
-    if (_isAuthenticated) refreshMyIssuesBadge();
+    refreshMyIssuesBadge(); // _isAuthenticated already guaranteed by the early return above
 
     const inputArea = document.getElementById("input-area");
     if (inputArea) {
@@ -119,38 +119,36 @@ document.addEventListener("keydown", (e) => {
 // poller keeps the data fresh; this is read-only. Status vocabulary is
 // translated from tracker jargon into "what should I do now" terms — the
 // load-bearing one is 可验证 (merged to test): the submitter can go
-// re-verify on the test environment.
-const MI_STEPS = ["提报", "修复中", "可验证", "完成"];
+// re-verify on the test environment. Colors reuse the app's existing
+// moss/amber/rust status vocabulary (.impeccable.md) rather than a new
+// palette: amber = needs your attention, moss = done, rust = regressed.
 const MI_STATUS = {
-    submitted: { step: 0, label: "待处理" },
-    claimed:   { step: 1, label: "修复中" },
-    merged:    { step: 2, label: "可验证" },
-    closed:    { step: 3, label: "完成" },
-    reopened:  { step: 1, label: "重新处理中" },
+    submitted: { label: "待处理", color: "var(--faint)" },
+    claimed:   { label: "修复中", color: "var(--mute)" },
+    merged:    { label: "可验证", color: "var(--amber)" },
+    closed:    { label: "已完成", color: "var(--moss)" },
+    reopened:  { label: "重新处理中", color: "var(--rust)" },
 };
 
-async function fetchMyIssues() {
-    const resp = await fetch("/api/issues/mine", { headers: authHeaders() });
-    if (!resp.ok) return [];
-    return await resp.json();
-}
-
-// Server timestamps are naive LOCAL time; `new Date(naive)` parses them as
-// local, matching a stored epoch — never compare them to toISOString() (UTC
-// string) lexicographically, that's off by the timezone offset.
-function miSeenAt() { return Number(localStorage.getItem("myIssuesSeenAt") || 0); }
-function miIsFresh(s, seen) {
-    return s.status_changed_at && new Date(s.status_changed_at).getTime() > seen;
-}
+// authFetch (not a raw fetch) throughout — an expired token needs the
+// standard redirect-to-login every other call gets, not a silently empty
+// result that reads as "no issues filed."
 
 async function refreshMyIssuesBadge() {
-    const items = await fetchMyIssues();
-    const seen = miSeenAt();
-    const fresh = items.filter(s => miIsFresh(s, seen)).length;
+    // A COUNT query server-side, not the full drawer payload — freshness
+    // itself is computed in SQL against the user's own my_issues_seen_at
+    // (both server-local timestamps, so unlike the old localStorage-based
+    // version this can't be thrown off by the browser's clock/timezone
+    // disagreeing with the server's).
     const badge = document.getElementById("my-issues-badge");
-    if (badge) {
-        badge.textContent = fresh;
-        badge.hidden = fresh === 0;
+    if (!badge) return;
+    try {
+        const resp = await authFetch("/api/issues/mine/unread-count");
+        const { count } = resp.ok ? await resp.json() : { count: 0 };
+        badge.textContent = count;
+        badge.hidden = count === 0;
+    } catch {
+        badge.hidden = true; // network error — fail quiet, not with a stale/wrong count
     }
 }
 
@@ -161,40 +159,44 @@ async function openMyIssues() {
     drawer.hidden = false;
     overlay.hidden = false;
     list.innerHTML = `<div class="mi-empty">加载中…</div>`;
-    const items = await fetchMyIssues();
-    const seen = miSeenAt();
+
+    let items;
+    try {
+        const resp = await authFetch("/api/issues/mine");
+        items = resp.ok ? await resp.json() : null;
+    } catch {
+        items = null;
+    }
+    if (items === null) {
+        list.innerHTML = `<div class="mi-empty">加载失败，请重试。</div>`;
+        return; // don't mark-seen on a failed load — nothing was actually shown
+    }
+
     if (!items.length) {
         list.innerHTML = `<div class="mi-empty">还没有提报过工单。<br>在会话里确认一个 bug 后即可一键提报。</div>`;
     } else {
         list.innerHTML = items.map(s => {
-            const st = MI_STATUS[s.track_status] || MI_STATUS.submitted;
-            const reopened = s.track_status === "reopened";
-            const isFresh = miIsFresh(s, seen);
-            const steps = MI_STEPS.map((name, i) => {
-                let cls = "mi-step";
-                if (i < st.step) cls += " done";
-                if (i === st.step) cls += " current" + (s.track_status === "merged" ? " mi-verify" : "");
-                const label = (i === st.step && reopened) ? st.label : name;
-                return `<span class="${cls}">${label}</span>`;
-            }).join("");
+            const status = MI_STATUS[s.track_status] ? s.track_status : "submitted";
+            const st = MI_STATUS[status];
             return `
-            <div class="mi-item">
-                <div class="mi-item-top">
-                    <span class="mi-item-iid">#${s.issue_number}</span>
-                    <a class="mi-item-title" href="${escapeHtml(s.issue_url || "#")}" target="_blank" rel="noopener" title="${escapeHtml(s.title)}">${escapeHtml(s.title)}</a>
+            <div class="mi-item" data-status="${status}" data-fresh="${!!s.fresh}">
+                <div class="mi-item-row">
+                    <span class="mi-item-id">${s.fresh ? `<span class="sr-only">有新进展：</span>` : ""}#${s.issue_number}</span>
+                    <span class="mi-item-status">${st.label}</span>
                 </div>
+                <a class="mi-item-title" href="${escapeHtml(s.issue_url || "#")}" target="_blank" rel="noopener">${escapeHtml(s.title)}</a>
                 <div class="mi-item-meta">
-                    ${escapeHtml(s.repo_name || "")} · 提报于 ${escapeHtml((s.submitted_at || "").slice(0, 16).replace("T", " "))}
-                    ${s.reopen_count ? ` · <span style="color:var(--rust)">被打回 ×${s.reopen_count}</span>` : ""}
-                    ${isFresh ? ` · <span class="mi-item-fresh">有新进展</span>` : ""}
+                    ${escapeHtml(s.repo_name || "")} · ${escapeHtml((s.submitted_at || "").slice(0, 16).replace("T", " "))}
+                    ${s.reopen_count ? ` · <span class="mi-reopen-count">被打回 ×${s.reopen_count}</span>` : ""}
                 </div>
-                <div class="mi-steps${reopened ? " reopened" : ""}">${steps}</div>
-                ${s.fix_verified ? `<div class="mi-fix-detail">✓ 修复已验证 · commit ${escapeHtml(s.fix_commit || "")} · ${s.fix_files_count} 个文件</div>` : ""}
+                ${s.fix_verified ? `<div class="mi-fix-detail">commit ${escapeHtml(s.fix_commit || "")} · ${s.fix_files_count} 个文件</div>` : ""}
             </div>`;
         }).join("");
     }
-    // Opening the drawer marks everything as seen (epoch ms — see miSeenAt).
-    localStorage.setItem("myIssuesSeenAt", String(Date.now()));
+
+    // Mark seen server-side (stamps the server's own clock) now that the
+    // current fresh/stale state has actually been rendered.
+    authFetch("/api/issues/mine/seen", { method: "POST" }).catch(() => {});
     const badge = document.getElementById("my-issues-badge");
     if (badge) badge.hidden = true;
 }
@@ -1082,7 +1084,7 @@ function resolveIssueCardRepo(card, draft, outcome) {
     return { repoId, repoName };
 }
 
-function renderIssueStatusLink(statusEl, label, url, number) {
+function renderIssueStatusLink(statusEl, label, url, number, color = "var(--success)") {
     statusEl.textContent = `${label} `;
     const link = document.createElement("a");
     link.href = url || "#";
@@ -1090,7 +1092,7 @@ function renderIssueStatusLink(statusEl, label, url, number) {
     link.rel = "noopener noreferrer";
     link.textContent = `#${number}`;
     statusEl.appendChild(link);
-    statusEl.style.color = "var(--success)";
+    statusEl.style.color = color;
 }
 
 function cancelIssueCard(btn) {
@@ -1214,9 +1216,13 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
     // The label carries the LIVE tracking status (kept fresh by the admin
     // poller), so a replayed session shows "上次报的那个修好了" in place.
     if (submission) {
-        const live = (MI_STATUS[submission.track_status] || {}).label;
-        const label = live && submission.track_status !== "submitted" ? `已提交 · ${live}` : "已提交";
-        renderIssueStatusLink(card.querySelector(".issue-status"), label, submission.issue_url, submission.issue_number);
+        const st = MI_STATUS[submission.track_status];
+        const label = st && submission.track_status !== "submitted" ? `已提交 · ${st.label}` : "已提交";
+        // A reopened/regressed issue must not read as a green "success" —
+        // pass the tracking-status color through instead of the default.
+        const color = st && submission.track_status !== "submitted" ? st.color : undefined;
+        renderIssueStatusLink(card.querySelector(".issue-status"), label, submission.issue_url, submission.issue_number,
+                              color || "var(--success)");
     }
 
     scrollToBottom();

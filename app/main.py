@@ -909,9 +909,28 @@ async def check_duplicate_issues(req: IssueDupCheckRequest, user: dict = Depends
 async def my_issue_submissions(user: dict = Depends(get_current_user)):
     """The submitter's own filed issues + fix progress — powers the 我的提报
     drawer. Data is kept fresh by the admin-side tracking poller; this is a
-    plain read."""
+    plain read. Each row's `fresh` flag is computed server-side against
+    my_issues_seen_at (see get_my_issue_submissions) — no client-side
+    clock/timezone comparison involved."""
     from app.database import get_my_issue_submissions
     return await get_my_issue_submissions(user["id"])
+
+
+@app.get("/api/issues/mine/unread-count")
+async def my_issue_unread_count(user: dict = Depends(get_current_user)):
+    """Lightweight badge source — a COUNT query, not the full drawer payload."""
+    from app.database import get_my_unread_issue_count
+    return {"count": await get_my_unread_issue_count(user["id"])}
+
+
+@app.post("/api/issues/mine/seen")
+async def my_issues_mark_seen(user: dict = Depends(get_current_user)):
+    """Called when the 我的提报 drawer is opened — stamps the server's own
+    clock, never a client-supplied timestamp (that's what made the old
+    localStorage-based version vulnerable to browser/server clock skew)."""
+    from app.database import mark_my_issues_seen
+    await mark_my_issues_seen(user["id"])
+    return {"ok": True}
 
 
 # ==================== Serve frontend ====================
