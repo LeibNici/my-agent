@@ -6,7 +6,8 @@
   "main": "src/provider.ts",
   "scripts": {
     "smoke": "tsx src/smoke.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "scenarios": "tsx src/scenarios.ts"
   },
   "keywords": [],
   "author": "",
