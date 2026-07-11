@@ -23,6 +23,24 @@ def text_turn(chunks, input_tokens=10, output_tokens=5):
     ]
 
 
+def text_turn_then_raise(chunks, exc, input_tokens=10):
+    """Like text_turn, but the event list ends with `exc` (an Exception
+    instance) instead of the normal content_block_stop/message_delta tail —
+    models a connection drop partway through a stream, after some text has
+    already reached the client. `gen()` below raises when it walks into an
+    Exception instance instead of yielding it."""
+    return [
+        SimpleNamespace(type="message_start",
+                        message=SimpleNamespace(usage=SimpleNamespace(input_tokens=input_tokens))),
+        SimpleNamespace(type="content_block_start",
+                        content_block=SimpleNamespace(type="text")),
+        *[SimpleNamespace(type="content_block_delta",
+                          delta=SimpleNamespace(type="text_delta", text=c))
+          for c in chunks],
+        exc,
+    ]
+
+
 def tool_turn(name, input_obj, tool_id, text="", input_tokens=10, output_tokens=5):
     """One LLM call that (optionally streams text then) emits one tool_use."""
     events = [
@@ -77,6 +95,12 @@ class FakeLLM:
 
             async def gen():
                 for e in scripted:
+                    # A raw Exception instance embedded mid-list models a
+                    # stream that dies partway through, after prior events
+                    # (e.g. partial text) have already been yielded — see
+                    # text_turn_then_raise.
+                    if isinstance(e, Exception):
+                        raise e
                     yield e
             yield gen()
         return ctx()
