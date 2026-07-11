@@ -33,4 +33,10 @@ describe("codec-legacy", () => {
   it("未知块类型 throw CodecError", () => {
     expect(() => legacyToDomain({ role: "user", content: [{ type: "banana" }] })).toThrow(CodecError);
   });
+  it("is_error 非布尔值 throw CodecError (fail-loud)", () => {
+    expect(() => legacyToDomain({ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "x", is_error: "yes" }] })).toThrow(CodecError);
+  });
+  it("tool_use input 为数组 throw CodecError", () => {
+    expect(() => legacyToDomain({ role: "user", content: [{ type: "tool_use", id: "t", name: "foo", input: [1, 2] }] })).toThrow(CodecError);
+  });
 });

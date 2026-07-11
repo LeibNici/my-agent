@@ -87,8 +87,8 @@ function convertLegacyBlockToDomain(block: unknown): DomainBlock {
       if (typeof b.id !== "string" || typeof b.name !== "string") {
         throw new CodecError("Tool use block missing 'id' or 'name'");
       }
-      if (typeof b.input !== "object" || b.input === null) {
-        throw new CodecError("Tool use block missing 'input'");
+      if (typeof b.input !== "object" || b.input === null || Array.isArray(b.input)) {
+        throw new CodecError("Tool use block 'input' must be a plain object");
       }
       return {
         type: "tool_use",
@@ -104,7 +104,13 @@ function convertLegacyBlockToDomain(block: unknown): DomainBlock {
       if (typeof b.content !== "string") {
         throw new CodecError("Tool result block missing 'content'");
       }
-      const isError = typeof b.is_error === "boolean" ? b.is_error : false;
+      let isError = false;
+      if (b.is_error !== undefined) {
+        if (typeof b.is_error !== "boolean") {
+          throw new CodecError("Tool result block 'is_error' must be boolean if present");
+        }
+        isError = b.is_error;
+      }
       return {
         type: "tool_result",
         toolUseId: b.tool_use_id,
@@ -119,42 +125,39 @@ function convertLegacyBlockToDomain(block: unknown): DomainBlock {
 
 function convertDomainBlockToLegacy(block: DomainBlock): Record<string, unknown> {
   switch (block.type) {
-    case "text": {
-      const tb = block as TextBlock;
-      return { type: "text", text: tb.text };
-    }
-    case "image": {
-      const ib = block as ImageBlock;
+    case "text":
+      return { type: "text", text: block.text };
+    case "image":
       return {
         type: "image",
         source: {
           type: "base64",
-          media_type: ib.mediaType,
-          data: ib.base64Data,
+          media_type: block.mediaType,
+          data: block.base64Data,
         },
       };
-    }
-    case "tool_use": {
-      const tub = block as ToolUseBlock;
+    case "tool_use":
       return {
         type: "tool_use",
-        id: tub.id,
-        name: tub.name,
-        input: tub.input,
+        id: block.id,
+        name: block.name,
+        input: block.input,
       };
-    }
     case "tool_result": {
-      const trb = block as ToolResultBlock;
       const result: Record<string, unknown> = {
         type: "tool_result",
-        tool_use_id: trb.toolUseId,
-        content: trb.content,
+        tool_use_id: block.toolUseId,
+        content: block.content,
       };
       // Omit is_error if false (the default)
-      if (trb.isError) {
+      if (block.isError) {
         result.is_error = true;
       }
       return result;
+    }
+    default: {
+      const _exhaustive: never = block;
+      throw new CodecError(`Unknown block type: ${_exhaustive}`);
     }
   }
 }
