@@ -1,11 +1,13 @@
 import { Worker } from "node:worker_threads";
 import { once } from "node:events";
-import type { StoredMessageRow, LlmMetricsRow } from "./storage.js";
+import type { StoredMessageRow, LlmMetricsRow, UserRow } from "./storage.js";
 
 export type DbClient = {
   addMessage(sessionId: string, role: string, content: string | unknown[]): Promise<number>;
   getMessages(sessionId: string): Promise<StoredMessageRow[]>;
   recordLlmCallMetrics(rows: LlmMetricsRow[]): Promise<void>;
+  getUserByUsername(username: string): Promise<UserRow | null>;
+  createUser(username: string, passwordHash: string, role?: string): Promise<number>;
   close(): Promise<void>;
 };
 
@@ -104,6 +106,9 @@ export function createDbClient(dbPath: string): DbClient {
     addMessage: (sessionId, role, content) => call<number>("addMessage", [sessionId, role, content]),
     getMessages: (sessionId) => call<StoredMessageRow[]>("getMessages", [sessionId]),
     recordLlmCallMetrics: (rows) => call<void>("recordLlmCallMetrics", [rows]),
+    getUserByUsername: (username) => call<UserRow | null>("getUserByUsername", [username]),
+    createUser: (username, passwordHash, role) =>
+      call<number>("createUser", [username, passwordHash, role]),
     close: () => {
       // 幂等：第二次及以后的 close() 返回同一个 promise（resolve-as-noop），不再发 RPC。
       if (!closePromise) {

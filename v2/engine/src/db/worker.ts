@@ -37,6 +37,16 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: undefined });
         break;
       }
+      case "getUserByUsername": {
+        const [username] = args as [string];
+        reply({ id, ok: true, result: storage.getUserByUsername(username) });
+        break;
+      }
+      case "createUser": {
+        const [username, passwordHash, role] = args as [string, string, string | undefined];
+        reply({ id, ok: true, result: storage.createUser(username, passwordHash, role) });
+        break;
+      }
       case "close": {
         storage.close();
         reply({ id, ok: true, result: undefined });

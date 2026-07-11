@@ -27,6 +27,22 @@ describe("openStorage", () => {
     expect(() => openStorage(p2)).toThrow(SchemaError);
     expect(() => openStorage(p2)).toThrow(/messages/);
   });
+  it("独缺 users 表 ⇒ SchemaError 点名 users（其余表齐全时该检查才轮得到）", () => {
+    const p3 = join(dir, "no-users.db");
+    const db = new Database(p3);
+    db.exec(`
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
+        owner_id INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+        role TEXT NOT NULL, content TEXT NOT NULL, timestamp TEXT NOT NULL);
+      CREATE TABLE llm_call_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+        user_id INTEGER, model TEXT, iteration INTEGER, input_tokens INTEGER, output_tokens INTEGER,
+        ttft_ms INTEGER, total_ms INTEGER, created_at TEXT NOT NULL);
+    `);
+    db.close();
+    expect(() => openStorage(p3)).toThrow(SchemaError);
+    expect(() => openStorage(p3)).toThrow(/users/);
+  });
 });
 
 describe("addMessage / getMessages（test_message_codec goldens 对齐）", () => {
@@ -75,5 +91,38 @@ describe("recordLlmCallMetrics", () => {
     expect(rows.length).toBe(2);
     expect(rows[0].created_at).toBe(rows[1].created_at);
     expect(rows[1].iteration).toBe(2);
+  });
+});
+
+describe("createUser / getUserByUsername（v1 database.py 同语义）", () => {
+  it("round trip：返回 lastrowid，读回完整行", () => {
+    const id = storage.createUser("alice", "hashed-pw", "user");
+    expect(typeof id).toBe("number");
+    expect(id).toBeGreaterThan(0);
+    const row = storage.getUserByUsername("alice");
+    expect(row).not.toBeNull();
+    expect(row).toMatchObject({ id, username: "alice", password_hash: "hashed-pw", role: "user" });
+    expect(row!.created_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+  });
+  it("role 省略时默认 'user'（对照 v1 create_user 的默认参数）", () => {
+    storage.createUser("bob", "hashed-pw");
+    expect(storage.getUserByUsername("bob")!.role).toBe("user");
+  });
+  it("显式 role 直通（如 'admin'）", () => {
+    storage.createUser("root", "hashed-pw", "admin");
+    expect(storage.getUserByUsername("root")!.role).toBe("admin");
+  });
+  it("不存在的用户名 ⇒ null（不是抛错、不是 undefined）", () => {
+    expect(storage.getUserByUsername("ghost-user")).toBeNull();
+  });
+  it("is_active 默认为 1（列存在但 createUser 不显式写它，交给 DEFAULT）", () => {
+    storage.createUser("carol", "hashed-pw");
+    expect(storage.getUserByUsername("carol")!.is_active).toBe(1);
+  });
+  it("连续创建两个用户 id 递增；重复用户名违反 UNIQUE 约束", () => {
+    const id1 = storage.createUser("dup", "pw1");
+    const id2 = storage.createUser("someone-else", "pw2");
+    expect(id2).toBeGreaterThan(id1);
+    expect(() => storage.createUser("dup", "pw3")).toThrow(/UNIQUE/i);
   });
 });

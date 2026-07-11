@@ -5,6 +5,9 @@ import Database from "better-sqlite3";
 
 // DDL 逐字复制自 app/database.py init_db()（Node 永不执行 DDL，这是测试 fixture 在替 Python 建库）
 const SCHEMA = `
+CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', is_active INTEGER DEFAULT 1,
+  created_at TEXT NOT NULL);
 CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
   owner_id INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,

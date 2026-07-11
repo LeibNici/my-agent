@@ -78,4 +78,21 @@ describe("createDbClient", () => {
       },
     ]);
   });
+
+  it("createUser / getUserByUsername 经 worker 的写读回环", async () => {
+    const id = await client.createUser("alice", "hashed-pw", "user");
+    expect(id).toBeGreaterThan(0);
+    const row = await client.getUserByUsername("alice");
+    expect(row).toMatchObject({ id, username: "alice", role: "user" });
+  });
+
+  it("createUser 省略 role 时经 worker 仍落到默认 'user'（undefined 经 postMessage 结构化克隆后触发默认参数）", async () => {
+    await client.createUser("bob", "hashed-pw");
+    const row = await client.getUserByUsername("bob");
+    expect(row!.role).toBe("user");
+  });
+
+  it("getUserByUsername 查无此人经 worker 回环仍是 null（不是 undefined）", async () => {
+    expect(await client.getUserByUsername("ghost-user")).toBeNull();
+  });
 });

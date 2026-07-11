@@ -21,10 +21,21 @@ export type LlmMetricsRow = {
   total_ms: number | null;
 };
 
+export type UserRow = {
+  id: number;
+  username: string;
+  password_hash: string;
+  role: string;
+  is_active: number;
+  created_at: string;
+};
+
 export type Storage = {
   addMessage(sessionId: string, role: string, content: string | unknown[]): number;
   getMessages(sessionId: string): StoredMessageRow[];
   recordLlmCallMetrics(rows: LlmMetricsRow[]): void;
+  getUserByUsername(username: string): UserRow | null;
+  createUser(username: string, passwordHash: string, role?: string): number;
   close(): void;
 };
 
@@ -69,6 +80,19 @@ function checkSchema(db: Database.Database): void {
   ) {
     throw new SchemaError(
       "missing llm_call_metrics table or required columns"
+    );
+  }
+
+  const usersColumns = getTableColumns("users");
+  if (
+    !usersColumns.has("id") ||
+    !usersColumns.has("username") ||
+    !usersColumns.has("password_hash") ||
+    !usersColumns.has("role") ||
+    !usersColumns.has("created_at")
+  ) {
+    throw new SchemaError(
+      "missing users table or required columns (id, username, password_hash, role, created_at)"
     );
   }
 }
@@ -173,6 +197,23 @@ export function openStorage(dbPath: string): Storage {
       });
 
       txn();
+    },
+
+    getUserByUsername(username: string): UserRow | null {
+      const row = db
+        .prepare("SELECT * FROM users WHERE username = ?")
+        .get(username) as UserRow | undefined;
+      return row ?? null;
+    },
+
+    createUser(username: string, passwordHash: string, role: string = "user"): number {
+      const now = pyLocalIsoNow();
+      const res = db
+        .prepare(
+          "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)"
+        )
+        .run(username, passwordHash, role, now);
+      return Number(res.lastInsertRowid);
     },
 
     close(): void {
