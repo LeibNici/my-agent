@@ -25,7 +25,7 @@
 //     failures into this shape rather than throw). This adapter treats that
 //     message_end as a silent no-op; the caller is expected to notice via
 //     `agent.state.errorMessage` after the run settles and call `fail()`
-//     instead of `finish()` — see event-adapter.test.ts's runTurnThroughAdapter.
+//     instead of `finish()` — see test/agent-harness.ts's runTurnThroughAdapter.
 //   - turn_end always fires (even with an empty toolResults array, e.g. after
 //     a plain text turn) — only turn_end with a non-empty toolResults array
 //     maps to tool_exchange.

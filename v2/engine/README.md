@@ -97,6 +97,11 @@ throw。
 | domain → pi 的 image 块 | `codec-pi.ts` `domainToPi` | assistant 或 user 消息里出现 `type:"image"` 的 domain 块 | **当前 turn 的图片是 Phase 3 的工作**——历史消息里的图片已经在 `history-policy.ts` 换成了纯文本占位符（`HISTORY_IMAGE_PLACEHOLDER`），所以理论上只有"当前 turn 夹带的新截图"才会撞上这个 CodecError；Phase 3 需要给 pi 的图片内容块补一条编码路径 |
 | pi → domain 的 ThinkingContent | `codec-pi.ts` `piAssistantToDomain` | pi 的 assistant 消息内容块里出现 `type:"thinking"` | domain 层目前没有 thinking 的对应类型；是否需要、何时暴露推理过程给 legacy 侧留给后续决定 |
 
+**关键注意**：`piAssistantToDomain` 对 thinking 块的 CodecError 是在 event-adapter
+的 subscribe 路径内（message_end/turn_end 事件回调中）抛出的，这意味着 **adapter
+可能在流中断地抛错**，尽管它对错误事件声称无抛出。Phase 3 集成启用推理模型前必须
+自行决策：要么关闭推理，要么先将 thinking 类型补充到 domain 层。
+
 两处都是 fail-loud 而非静默丢弃——遇到这些块类型时会抛错而不是悄悄吃掉数据，
 这样任何漏配的调用方会在测试/联调阶段就发现，而不是在生产里丢数据。
 
