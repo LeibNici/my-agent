@@ -1,0 +1,21 @@
+{
+  "name": "codex-v2-engine",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "CodeAxis v2 domain DTO layer and event codec",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@sinclair/typebox": "0.34.13"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "tsx": "4.19.2",
+    "typescript": "5.7.3",
+    "vitest": "1.6.1"
+  }
+}
