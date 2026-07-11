@@ -1,0 +1,23 @@
+{
+  "name": "pi-provider",
+  "version": "1.0.0",
+  "description": "Phase 0A spike: pi-ai provider scaffold for DashScope qwen3.7-plus.",
+  "private": true,
+  "main": "src/provider.ts",
+  "scripts": {
+    "smoke": "tsx src/smoke.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.80.6"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "tsx": "4.19.2",
+    "typescript": "5.7.3"
+  }
+}
