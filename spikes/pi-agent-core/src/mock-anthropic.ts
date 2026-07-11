@@ -80,6 +80,49 @@ export function toolTurn(name: string, input: object, id: string): SseEvent[] {
 }
 
 /**
+ * A single assistant turn carrying TWO content blocks — a leading text block
+ * (index 0) and a trailing tool_use block (index 1) — in one message. The base
+ * `textTurn`/`toolTurn` helpers only emit a single block at index 0; B1 needs a
+ * real text+tool_use combined message to prove the event stream can reconstruct
+ * the legacy `text_delta → tool_use` ordering WITHIN one assistant turn. Each
+ * block gets its own start/delta/stop triplet with a distinct `index`, which is
+ * exactly what the parser matches on (`blocks.findIndex(b => b.index === ...)`,
+ * see Task 9 report note #3). Additive — leaves the existing helpers untouched.
+ */
+export function textThenToolTurn(
+  text: string,
+  name: string,
+  input: object,
+  id: string,
+): SseEvent[] {
+  return [
+    {
+      type: "message_start",
+      message: {
+        id: "m1",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: "mock",
+        usage: { input_tokens: 10, output_tokens: 0 },
+      },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+    { type: "content_block_stop", index: 0 },
+    { type: "content_block_start", index: 1, content_block: { type: "tool_use", id, name, input: {} } },
+    {
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+    },
+    { type: "content_block_stop", index: 1 },
+    { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } },
+    { type: "message_stop" },
+  ];
+}
+
+/**
  * Starts a scripted mock Anthropic Messages server: request N gets
  * `turns[N]`'s SSE events (0-indexed); once the script is exhausted it keeps
  * replying with a text turn so a run doesn't hang mid-loop. Every request
