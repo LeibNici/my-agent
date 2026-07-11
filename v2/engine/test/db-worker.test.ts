@@ -36,6 +36,34 @@ describe("createDbClient", () => {
     await expect(client.addMessage("s1", "user", "still alive")).resolves.toBeGreaterThan(0);
   });
 
+  it("close() 幂等：double close 两个 promise 都 settle（第二次 resolve 为 no-op）", async () => {
+    const p1 = client.close();
+    const p2 = client.close();
+    await expect(Promise.all([p1, p2])).resolves.toBeDefined();
+    // 完全 await 过后再 close 也一样是 no-op
+    await expect(client.close()).resolves.toBeUndefined();
+  });
+
+  it("close() 之后的调用立刻 reject（/closed/），不挂死", async () => {
+    await client.close();
+    await expect(client.addMessage("s1", "user", "too late")).rejects.toThrow(/closed/i);
+    await expect(client.getMessages("s1")).rejects.toThrow(/closed/i);
+  });
+
+  it("close() 与同 tick 发出的在途调用：全部 settle，不挂死", async () => {
+    const inflight = client.addMessage("s1", "user", "racing close");
+    const closing = client.close();
+    const settled = await Promise.race([
+      Promise.allSettled([inflight, closing]),
+      new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5000)),
+    ]);
+    expect(settled).not.toBe("timeout");
+    const [msgResult, closeResult] = settled as PromiseSettledResult<unknown>[];
+    // worker 单线程按序处理：先发的 addMessage 正常成功也行，被 exit-drain 拒掉也行 —— 但绝不能 pending
+    expect(["fulfilled", "rejected"]).toContain(msgResult.status);
+    expect(closeResult.status).toBe("fulfilled");
+  });
+
   it("metrics 批量走 worker", async () => {
     await client.recordLlmCallMetrics([
       {

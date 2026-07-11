@@ -40,6 +40,8 @@ export function createDbClient(dbPath: string): DbClient {
   const pending = new Map<number, Pending>();
   let nextId = 1;
   let fatalError: Error | null = null;
+  let closePromise: Promise<void> | null = null;
+  let exited = false;
 
   function settle(id: number, fn: (p: Pending) => void): void {
     const p = pending.get(id);
@@ -53,18 +55,35 @@ export function createDbClient(dbPath: string): DbClient {
     settle(msg.id, (p) => (msg.ok ? p.resolve(msg.result) : p.reject(new Error(msg.error))));
   });
 
-  worker.on("error", (err) => {
-    fatalError = err instanceof Error ? err : new Error(String(err));
+  function drainPending(err: Error): void {
     for (const p of pending.values()) {
-      p.reject(fatalError);
+      p.reject(err);
     }
     pending.clear();
     worker.unref();
+  }
+
+  worker.on("error", (err) => {
+    fatalError = err instanceof Error ? err : new Error(String(err));
+    drainPending(fatalError);
   });
 
-  function call<T>(method: string, args: unknown[]): Promise<T> {
+  // 常驻 exit 处理器：干净退出不触发 "error"，而 worker 端 close 后 parentPort 已关，
+  // 晚到的请求消息被静默丢弃 —— 没有这个 drain，那些调用就永远 pending。
+  // （事件监听器本身不计入事件循环的 ref 计数，不会让 unref 失效。）
+  worker.on("exit", () => {
+    exited = true;
+    drainPending(fatalError ?? new Error("db worker exited before responding"));
+  });
+
+  // send() 是真正投递到 worker 的底层通道；call() 在其上加 closed 拦截。
+  // close() 自己的 RPC 必须走 send() 而不是 call()，因为发出它时 closePromise 已置位。
+  function send<T>(method: string, args: unknown[]): Promise<T> {
     if (fatalError) {
       return Promise.reject(fatalError);
+    }
+    if (exited) {
+      return Promise.reject(new Error("db worker exited before responding"));
     }
     const id = nextId++;
     return new Promise<T>((resolve, reject) => {
@@ -74,17 +93,38 @@ export function createDbClient(dbPath: string): DbClient {
     });
   }
 
+  function call<T>(method: string, args: unknown[]): Promise<T> {
+    if (closePromise) {
+      return Promise.reject(new Error("db client is closed"));
+    }
+    return send<T>(method, args);
+  }
+
   return {
     addMessage: (sessionId, role, content) => call<number>("addMessage", [sessionId, role, content]),
     getMessages: (sessionId) => call<StoredMessageRow[]>("getMessages", [sessionId]),
     recordLlmCallMetrics: (rows) => call<void>("recordLlmCallMetrics", [rows]),
-    close: async () => {
-      await call<void>("close", []);
-      // call() 在收到回复、pending 归零那一刻已经 unref 过 worker 了——但线程还没
-      // 真退出（worker 端 parentPort.close() 是异步生效的）。重新 ref 住，等到真正
-      // 的 "exit" 事件，否则主线程可能在 worker 退出前就被判定为"无事可做"而先走。
-      worker.ref();
-      await once(worker, "exit");
+    close: () => {
+      // 幂等：第二次及以后的 close() 返回同一个 promise（resolve-as-noop），不再发 RPC。
+      if (!closePromise) {
+        closePromise = (async () => {
+          try {
+            await send<void>("close", []);
+          } catch {
+            // worker 已经 error/exit 也算"关闭完成"—— close() 的职责是确保关了，
+            // 不是复述上一次失败；那些失败已经通过各自调用的 reject 传出去了。
+          }
+          if (!exited) {
+            // send() 在收到回复、pending 归零那一刻已经 unref 过 worker 了——但线程
+            // 还没真退出（worker 端 parentPort.close() 是异步生效的）。重新 ref 住，
+            // 等真正的 "exit" 事件，否则主线程可能在 worker 退出前就"无事可做"先走。
+            worker.ref();
+            await once(worker, "exit");
+            worker.unref();
+          }
+        })();
+      }
+      return closePromise;
     },
   };
 }
