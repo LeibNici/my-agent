@@ -407,6 +407,20 @@ async function B4(): Promise<ScenarioResult> {
   const BUDGET = 2; // stop after 2 tool turns
 
   // A standalone tool-free wrap-up call against the mock (plain pi-ai stream).
+  //
+  // NOTE on the oracle: this achieves tool-freeness by omitting `tools`
+  // entirely (tools:[] -> the field is absent from the serialized body).
+  // That is NOT what the legacy golden (tests/test_agent_budget.py) checks.
+  // The legacy oracle asserts, on the wrap-up's FIRST attempt (fake.calls[8]),
+  // `tool_choice == {"type": "none"}` — `tools` itself still rides along in
+  // the payload there (app/agent.py passes `tools=tools if tools else None`
+  // on both attempts) — and only on the RETRY (fake.calls[9], which only
+  // happens if attempt 0 raised) asserts `"tool_choice" not in fake.calls[9]`.
+  // So legacy enforces "no tool calls this turn" via `tool_choice:"none"`;
+  // this spike enforces the same outcome via "send no tools field at all" —
+  // an equivalent-or-stronger mechanism that matches the brief's B4 sketch,
+  // but it never exercises pi-ai's `tool_choice:"none"` support nor legacy's
+  // reject-and-retry-without-tool_choice fallback. Open question for GATE.md.
   async function wrapUp(setup: Setup, mock: MockServer): Promise<number> {
     const before = mock.requests.length;
     const stream = await setup.models.streamSimple(
