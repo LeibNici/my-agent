@@ -3,109 +3,12 @@
 // Anthropic server (test/mock-anthropic.ts). Oracle = the three golden event
 // sequences in tests/test_agent_events.py (Python characterization tests).
 //
-// Agent assembly copied from spikes/pi-agent-core/src/scenarios.ts's B1
-// (Model object, wrapped streamFn keeping `this` bound to the models
-// instance, pass-through convertToLlm via the Agent class default,
-// toolExecution:"sequential", subscribe, await agent.prompt).
+// Agent assembly + the runTurnThroughAdapter driver live in
+// test/agent-harness.ts (extracted here, Task 7 reuses it for the
+// end-to-end integration test rather than duplicating this wiring).
 import { describe, it, expect } from "vitest";
-import {
-  Agent,
-  type AgentEvent as PiAgentEvent,
-  type AgentTool,
-  type StreamFn,
-} from "@earendil-works/pi-agent-core";
-import { createModels, createProvider, envApiKeyAuth, type Model } from "@earendil-works/pi-ai";
-import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
-import { Type, type Static } from "typebox";
-import { startMock, textTurn, textThenToolTurn, type MockServer } from "./mock-anthropic.js";
-import { createEventAdapter } from "../src/event-adapter.js";
-import type { DomainEvent } from "../src/domain.js";
-
-const DUMMY_API_KEY = "sk-mock-offline-not-a-real-key";
-const MODEL_LABEL = "mock";
-
-type Setup = { models: ReturnType<typeof createModels>; model: Model<"anthropic-messages">; streamFn: StreamFn };
-
-function buildSetup(url: string): Setup {
-  const models = createModels();
-  const provider = createProvider({
-    id: "mock",
-    name: "Mock Anthropic (offline, Task 6)",
-    auth: { apiKey: envApiKeyAuth("Mock", ["MOCK_ANTHROPIC_API_KEY"]) },
-    api: anthropicMessagesApi(),
-    models: [
-      {
-        id: MODEL_LABEL,
-        name: MODEL_LABEL,
-        api: "anthropic-messages",
-        provider: "mock",
-        baseUrl: url,
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 131072,
-        maxTokens: 4096,
-      },
-    ],
-  });
-  models.setProvider(provider);
-  const model = models.getModel("mock", MODEL_LABEL) as Model<"anthropic-messages"> | undefined;
-  if (!model) throw new Error("mock/mock model not registered");
-  // Wrap so streamSimple keeps its `this` bound to the models instance.
-  const streamFn: StreamFn = (m, ctx, opts) => models.streamSimple(m, ctx, opts);
-  return { models, model, streamFn };
-}
-
-// calculator-shaped stub tool (matches the Python golden's tool name/shape).
-const CalculatorParams = Type.Object({ expression: Type.String() });
-function makeCalculatorTool(): AgentTool {
-  return {
-    name: "calculator",
-    label: "Calculator",
-    description: "evaluates a simple arithmetic expression",
-    parameters: CalculatorParams,
-    executionMode: "sequential",
-    execute: async (_id, params) => {
-      const expr = (params as Static<typeof CalculatorParams>).expression;
-      return { content: [{ type: "text", text: `${expr} = 2` }], details: {} };
-    },
-  };
-}
-
-/** Drives a single real pi Agent turn through createEventAdapter, returning
- * the flattened domain-event sequence — the assembly + finish()/fail()
- * dispatch this test file owns per the task-6 brief. */
-async function runTurnThroughAdapter(
-  mock: MockServer,
-  prompt: string,
-  tools: AgentTool[] = [],
-): Promise<DomainEvent[]> {
-  const { model, streamFn } = buildSetup(mock.url);
-  const adapter = createEventAdapter({ model: MODEL_LABEL });
-  const events: DomainEvent[] = [];
-
-  const agent = new Agent({
-    initialState: { systemPrompt: "sys", model, tools, messages: [] },
-    streamFn,
-    getApiKey: () => DUMMY_API_KEY,
-    toolExecution: "sequential",
-  });
-  agent.subscribe((e: PiAgentEvent) => {
-    events.push(...adapter.onPiEvent(e));
-  });
-
-  await agent.prompt(prompt);
-
-  // pi never throws for LLM/transport failures (StreamFn contract) — a
-  // failed run surfaces as agent.state.errorMessage instead (see
-  // event-adapter.ts's header note). Dispatch finish() vs fail() on that.
-  if (agent.state.errorMessage) {
-    events.push(...adapter.fail(agent.state.errorMessage));
-  } else {
-    events.push(...adapter.finish());
-  }
-  return events;
-}
+import { startMock, textTurn, textThenToolTurn } from "./mock-anthropic.js";
+import { runTurnThroughAdapter, makeCalculatorTool } from "./agent-harness.js";
 
 describe("event-adapter — golden sequences from test_agent_events.py", () => {
   it("纯文本回合：text_delta* → llm_metrics → done（test_text_only_turn_sequence）", async () => {
@@ -121,7 +24,7 @@ describe("event-adapter — golden sequences from test_agent_events.py", () => {
       textThenToolTurn("算一下", "calculator", { expression: "1+1" }, "tu_1"),
       textTurn("答案是2"),
     ]);
-    const events = await runTurnThroughAdapter(mock, "1+1=?", [makeCalculatorTool()]);
+    const events = await runTurnThroughAdapter(mock, "1+1=?", { tools: [makeCalculatorTool()] });
     expect(events.map((e) => e.type)).toEqual([
       "text_delta",
       "llm_metrics",

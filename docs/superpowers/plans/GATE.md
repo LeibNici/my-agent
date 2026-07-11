@@ -47,14 +47,24 @@ per-turn ephemeral agent 基座。
 1. **checkpoint / turn barrier / wrap-up 的实现层**：已由 0B 回答——
    B2（屏障）/B3（reminder 注入）/B4（预算停+wrap-up）在 Agent 类与
    agentLoop 两层均实测可行（对照规范：Task 5 的 `test_agent_budget.py`
-   goldens）。**仍开放的两点**（须在 Phase-1 早期联调验证，均为离线 mock
-   验证不了的真实端点接受度问题）：
+   goldens）。**曾经开放的两点，已在 Phase-1 早期联调验证中关闭**（见
+   `spikes/pi-provider/REPORT-phase1.md`，commit `2bb6425`）：
    - B3 的 reminder 在 pi 里落成独立尾随 user 消息（tool_result-user 后
      连续第二条 user 消息，pi codec 不合并）——DashScope 等真实
      Anthropic 兼容端点是否接受此消息形状，未验证；
+     ⇒ **E1 = PASS**：两轮独立调用均正常收到 `done`、无 4xx/error，
+     DashScope 接受该双 user 消息形状；`codec-pi.ts` 保持 pi 默认形状，
+     无需手工合并 reminder 进前一条 tool_result user 消息。
    - legacy wrap-up 靠 `tool_choice:"none"`（含端点拒绝后的回退重试路径），
      spike 用的是整体省略 `tools` 字段——`tool_choice:"none"` 在 pi-ai 上
      从未实际发出过，等价性未在线上验证。
+     ⇒ **E2 = PASS，且推翻了"NOT-EXPOSED"的前提**：`toolChoice` 确实被
+     `@earendil-works/pi-ai` 的 `anthropic-messages` 后端暴露
+     （`AnthropicOptions.toolChoice`），两轮真实 DashScope 调用均无 4xx 且
+     语义生效（prompt 明确要求调用工具，两次均未产生 `toolcall_end`）。
+     v2 wrap-up 因此有两条都已验证可行的路径——tools 整体省略、或
+     `toolChoice:"none"`——具体选哪条留给 Phase 3（细节见
+     `v2/engine/README.md`）。
 2. **每 turn 临时 Agent + SQLite 真相源**：0B 全部六个场景均以"每场景
    FRESH Agent + `initialState.messages` 注入"的模式跑通，即目标运行模型
    已被 spike 全程采用并验证。落实为强制约束（禁止常驻 Agent 状态、
