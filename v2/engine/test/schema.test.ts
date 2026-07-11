@@ -17,7 +17,7 @@ describe("loadSettings", () => {
     expect(settings.adminPassword).toBe("admin123");
     expect(settings.tokenExpireHours).toBe(24);
     expect(settings.corsOrigins).toContain("http://localhost:8000");
-    expect(settings.prompt_cache).toBe("auto");
+    expect(settings.promptCache).toBe("auto");
   });
 
   it("parses numeric fields from env strings", () => {
@@ -39,8 +39,8 @@ describe("loadSettings", () => {
       ANTHROPIC_BASE_URL: "https://custom.example.com",
       ANTHROPIC_MODEL: "custom-model",
     });
-    expect(settings.api_key).toBe("test-key");
-    expect(settings.base_url).toBe("https://custom.example.com");
+    expect(settings.apiKey).toBe("test-key");
+    expect(settings.baseUrl).toBe("https://custom.example.com");
     expect(settings.model).toBe("custom-model");
   });
 
@@ -53,13 +53,13 @@ describe("loadSettings", () => {
     });
     expect(settings.adminUsername).toBe("superadmin");
     expect(settings.adminPassword).toBe("supersecret");
-    expect(settings.repos_dir).toBe("/custom/repos");
-    expect(settings.github_token).toBe("github-token-123");
+    expect(settings.reposDir).toBe("/custom/repos");
+    expect(settings.githubToken).toBe("github-token-123");
   });
 
   it("contains systemPrompt with default Chinese text", () => {
     const settings = loadSettings({});
-    expect(settings.system_prompt).toContain("You are an internal code assistant");
+    expect(settings.systemPrompt).toContain("You are an internal code assistant");
   });
 });
 

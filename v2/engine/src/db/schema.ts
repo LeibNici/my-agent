@@ -64,9 +64,9 @@ export function initSchema(dbPath: string): void {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL DEFAULT 'New Chat',
       owner_id INTEGER,
-      resolved_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      resolved_at TEXT,
       FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE SET NULL
     )
   `);
