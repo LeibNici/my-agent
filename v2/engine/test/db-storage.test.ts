@@ -1,29 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { openStorage, SchemaError, type Storage } from "../src/db/storage.js";
-
-// DDL 逐字复制自 app/database.py init_db()（Node 永不执行 DDL，这是测试 fixture 在替 Python 建库）
-const SCHEMA = `
-CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
-  owner_id INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-  role TEXT NOT NULL, content TEXT NOT NULL, timestamp TEXT NOT NULL,
-  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE);
-CREATE TABLE llm_call_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-  user_id INTEGER, model TEXT, iteration INTEGER, input_tokens INTEGER, output_tokens INTEGER,
-  ttft_ms INTEGER, total_ms INTEGER, created_at TEXT NOT NULL,
-  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE);`;
+import { makeSeededDb } from "./db-fixture.js";
 
 let dir: string, dbPath: string, storage: Storage;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "v2db-"));
-  dbPath = join(dir, "t.db");
-  const db = new Database(dbPath); db.exec(SCHEMA);
-  db.prepare("INSERT INTO sessions (id, title, created_at, updated_at) VALUES ('s1','seed','x','x')").run();
-  db.close();
+  const f = makeSeededDb();
+  dir = f.dir;
+  dbPath = f.dbPath;
   storage = openStorage(dbPath);
 });
 afterEach(() => { storage.close(); rmSync(dir, { recursive: true, force: true }); });
