@@ -52,6 +52,10 @@ def test_past_turns_condensed_current_turn_kept_whole(monkeypatch):
     # past turns: tool_use/tool_result bookkeeping gone, questions/answers remain
     flat = str(out[:-3])
     assert "tu_1" not in flat and "tu_2" not in flat
+    # condensation KEEPS the past questions and text conclusions (the whole
+    # point vs. positional slicing — see app/main.py docstring)
+    assert any(m == {"role": "user", "content": "问题2"} for m in out[:-3])
+    assert any(m["role"] == "assistant" and "结论2" in str(m["content"]) for m in out[:-3])
     assert out[0]["role"] == "user"  # never opens on assistant
 
 
