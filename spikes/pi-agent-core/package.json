@@ -1,0 +1,25 @@
+{
+  "name": "pi-agent-core",
+  "version": "1.0.0",
+  "description": "Phase 0B spike: offline mock Anthropic SSE server + smoke test that pi-agent-core's Agent class accepts its output.",
+  "private": true,
+  "main": "src/mock-anthropic.ts",
+  "scripts": {
+    "smoke": "tsx src/smoke.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@sinclair/typebox": "0.34.13"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "tsx": "4.19.2",
+    "typescript": "5.7.3"
+  }
+}
