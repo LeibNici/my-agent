@@ -1,6 +1,7 @@
 """FakeLLM: drop-in replacement for app.llm.LLMClient that replays scripted
 Anthropic stream events and records every request the agent sends.
 Event attribute shapes mirror exactly what app/agent.py reads."""
+import copy
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -64,7 +65,9 @@ class FakeLLM:
         self.client = SimpleNamespace(messages=SimpleNamespace(stream=self._stream))
 
     def _stream(self, **kwargs):
-        self.calls.append(kwargs)
+        # snapshot: the agent mutates `messages` in place across iterations,
+        # so a live reference would show every call the final state
+        self.calls.append(copy.deepcopy(kwargs))
         scripted = self.turns.pop(0)
 
         @asynccontextmanager
