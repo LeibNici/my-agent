@@ -8,53 +8,30 @@
 // convertToLlm via the Agent class default, toolExecution:"sequential",
 // subscribe, await agent.prompt) — see that file's header comment for the
 // full rationale.
+//
+// Task 4 lifted this assembly pattern into production code
+// (src/engine/turn.ts's buildModelSetup/finalizeAgentRun) — this harness now
+// delegates to those instead of duplicating the createModels/createProvider
+// wiring and the errorMessage->fail()/finish() dispatch decision.
 import {
   Agent,
   type AgentEvent as PiAgentEvent,
   type AgentMessage,
   type AgentTool,
-  type StreamFn,
 } from "@earendil-works/pi-agent-core";
-import { createModels, createProvider, envApiKeyAuth, type Model } from "@earendil-works/pi-ai";
-import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { Type, type Static } from "typebox";
 import type { MockServer } from "./mock-anthropic.js";
 import { createEventAdapter } from "../src/event-adapter.js";
+import { buildModelSetup, finalizeAgentRun, type ModelSetup } from "../src/engine/turn.js";
 import type { DomainEvent } from "../src/domain.js";
 
 const DUMMY_API_KEY = "sk-mock-offline-not-a-real-key";
 const MODEL_LABEL = "mock";
 
-type Setup = { models: ReturnType<typeof createModels>; model: Model<"anthropic-messages">; streamFn: StreamFn };
+type Setup = ModelSetup;
 
 export function buildSetup(url: string): Setup {
-  const models = createModels();
-  const provider = createProvider({
-    id: "mock",
-    name: "Mock Anthropic (offline, Task 6/7)",
-    auth: { apiKey: envApiKeyAuth("Mock", ["MOCK_ANTHROPIC_API_KEY"]) },
-    api: anthropicMessagesApi(),
-    models: [
-      {
-        id: MODEL_LABEL,
-        name: MODEL_LABEL,
-        api: "anthropic-messages",
-        provider: "mock",
-        baseUrl: url,
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 131072,
-        maxTokens: 4096,
-      },
-    ],
-  });
-  models.setProvider(provider);
-  const model = models.getModel("mock", MODEL_LABEL) as Model<"anthropic-messages"> | undefined;
-  if (!model) throw new Error("mock/mock model not registered");
-  // Wrap so streamSimple keeps its `this` bound to the models instance.
-  const streamFn: StreamFn = (m, ctx, opts) => models.streamSimple(m, ctx, opts);
-  return { models, model, streamFn };
+  return buildModelSetup({ baseUrl: url, apiKey: DUMMY_API_KEY, model: MODEL_LABEL, maxTokens: 4096 });
 }
 
 // calculator-shaped stub tool (matches the Python golden's tool name/shape).
@@ -116,11 +93,9 @@ export async function runTurnThroughAdapter(
 
   // pi never throws for LLM/transport failures (StreamFn contract) — a
   // failed run surfaces as agent.state.errorMessage instead (see
-  // event-adapter.ts's header note). Dispatch finish() vs fail() on that.
-  if (agent.state.errorMessage) {
-    events.push(...adapter.fail(agent.state.errorMessage));
-  } else {
-    events.push(...adapter.finish());
-  }
+  // event-adapter.ts's header note). finalizeAgentRun (src/engine/turn.ts)
+  // owns the fail()-vs-finish() dispatch on that so the decision isn't
+  // duplicated here.
+  events.push(...finalizeAgentRun(agent, adapter));
   return events;
 }

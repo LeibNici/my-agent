@@ -16,7 +16,7 @@ export type DomainEvent =
   | { type: "tool_use"; data: { id: string; name: string; input: Record<string, unknown> } }
   | { type: "tool_result"; data: { id: string; result: string } }
   | { type: "tool_exchange"; data: { assistant: DomainBlock[]; results: ToolResultBlock[] } }
-  | { type: "done"; data: { text: string; success: boolean } }
+  | { type: "done"; data: { text: string; success: boolean; budgetExhausted: boolean } }
   | { type: "error"; data: { message: string } };
 
 export class CodecError extends Error {}

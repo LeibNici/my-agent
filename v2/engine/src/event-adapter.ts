@@ -148,13 +148,16 @@ export function createEventAdapter(opts: { model: string }): {
   }
 
   function finish(): DomainEvent[] {
-    return [{ type: "done", data: { text: lastAssistantText, success: true } }];
+    // budgetExhausted is always false here — the budget-exhaustion path
+    // (turn.ts's runTurn) never calls finish() at all; it emits its own
+    // done{budgetExhausted:true} after the separate wrap-up call instead.
+    return [{ type: "done", data: { text: lastAssistantText, success: true, budgetExhausted: false } }];
   }
 
   function fail(message: string): DomainEvent[] {
     return [
       { type: "error", data: { message: `LLM API error: ${message}` } },
-      { type: "done", data: { text: "", success: false } },
+      { type: "done", data: { text: "", success: false, budgetExhausted: false } },
     ];
   }
 

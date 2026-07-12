@@ -15,7 +15,7 @@ describe("event-adapter — golden sequences from test_agent_events.py", () => {
     const mock = startMock([textTurn("你好")]);
     const events = await runTurnThroughAdapter(mock, "hi");
     expect(events.map((e) => e.type)).toEqual(["text_delta", "llm_metrics", "done"]);
-    expect(events.at(-1)!.data).toMatchObject({ text: "你好", success: true });
+    expect(events.at(-1)!.data).toMatchObject({ text: "你好", success: true, budgetExhausted: false });
     await mock.close();
   });
 
@@ -53,6 +53,7 @@ describe("event-adapter — golden sequences from test_agent_events.py", () => {
     expect(events.map((e) => e.type)).toEqual(["error", "done"]);
     expect((events[0].data as any).message).toMatch(/^LLM API error: /);
     expect((events[1].data as any).success).toBe(false);
+    expect((events[1].data as any).budgetExhausted).toBe(false);
     await mock.close();
   });
 });
