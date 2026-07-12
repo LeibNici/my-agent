@@ -1,0 +1,18 @@
+services:
+  codeaxis:
+    build:
+      context: .
+      dockerfile: engine/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "18082:8000"
+    environment:
+      APP_REPOS_DIR: /data/repos
+    volumes:
+      # File-bind-mounts — the host-side file must already exist (Docker
+      # creates a directory instead of erroring if it doesn't), see the
+      # deploy step that touches these before the first `docker compose up`.
+      - ./data/agent_data.db:/app/agent_data.db
+      - ./data/jwt_secret:/app/.jwt_secret
+      - ./data/repos:/data/repos
+      - ./engine/.env:/app/engine/.env:ro
