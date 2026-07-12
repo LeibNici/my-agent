@@ -100,23 +100,52 @@ function isPathAllowed(
   return [false, "Access denied: path is outside your assigned repositories"];
 }
 
+// Python's default text-mode open() does universal-newline translation on
+// read: "\r\n" and lone "\r" both become "\n" before the file is ever
+// iterated line-by-line. Applied BEFORE splitKeepingNewlines so a
+// Windows-authored CRLF source file (plausible for this product's
+// industrial/engineering-source audience) reads back with LF-only line
+// endings and no stray "\r", matching Python byte-for-byte.
+function normalizeNewlines(content: string): string {
+  return content.replace(/\r\n|\r/g, "\n");
+}
+
 // Splits file content into lines that KEEP their trailing "\n" (matching
 // Python's `for i, line in enumerate(f)` readline semantics, so that
 // "".join(lines) round-trips byte-for-byte), with zero lines for an empty
 // file (String.prototype.split's lookbehind form would otherwise yield one
 // spurious empty-string "line" for "").
-//
-// Known divergence (documented, not chased — matches this task's brief):
-// Python's default text-mode open() does universal-newline translation
-// (\r\n / \r -> \n) on read; this does not, so a CRLF source file will keep
-// its \r here where Python would have stripped it. Repo files synced by
-// repo-sync.ts are git-cloned on Linux and expected to be LF, so this is
-// not expected to matter in practice.
 function splitKeepingNewlines(content: string): string[] {
   if (content === "") {
     return [];
   }
   return content.split(/(?<=\n)/);
+}
+
+// Formats a byte size in MB exactly like Python's f"{size / 1024 / 1024:.1f}"
+// — CPython's float formatting is correctly-rounded off the double's TRUE
+// binary value with ties-to-even, which matters here because 1024*1024 is
+// 2**20: dividing an integer byte count by a power of two is an EXACT
+// double (no FP rounding error at all), so genuine decimal ties like
+// 5505024 bytes -> 5.25 do occur and must round to "5.2" (even), not "5.3"
+// (JS's toFixed(1) is round-half-away-from-zero and gets this wrong —
+// confirmed against `python3 -c` for several odd multiples of 262144 bytes
+// above 5MB, not just round numbers). Because the division is exact, the
+// whole computation is done in BigInt integer arithmetic (size*10 /
+// 2**20) so there is no floating-point step to introduce a different kind
+// of rounding error.
+function formatSizeMb(sizeBytes: number): string {
+  const numerator = BigInt(sizeBytes) * 10n;
+  const denominator = 1024n * 1024n; // 2**20
+  let quotient = numerator / denominator; // truncates toward zero (both operands positive)
+  const remainder = numerator % denominator;
+  const twiceRemainder = remainder * 2n;
+  if (twiceRemainder > denominator || (twiceRemainder === denominator && quotient % 2n !== 0n)) {
+    quotient += 1n;
+  }
+  const whole = quotient / 10n;
+  const decimal = quotient % 10n;
+  return `${whole}.${decimal}`;
 }
 
 async function execute(
@@ -145,8 +174,7 @@ async function execute(
 
   if (stat.size > MAX_FILE_SIZE_BYTES) {
     // Python: f"Error: File too large ({size / 1024 / 1024:.1f}MB). Max 5MB."
-    const sizeMb = (stat.size / 1024 / 1024).toFixed(1);
-    return `Error: File too large (${sizeMb}MB). Max 5MB.`;
+    return `Error: File too large (${formatSizeMb(stat.size)}MB). Max 5MB.`;
   }
 
   const startIndex = Math.max(startLine, 1) - 1;
@@ -156,7 +184,7 @@ async function execute(
     // behavior closely enough (exact replacement-run granularity may
     // differ for pathological byte sequences — not chased, files this tool
     // reads are expected to be valid UTF-8 source).
-    const content = fs.readFileSync(resolved).toString("utf8");
+    const content = normalizeNewlines(fs.readFileSync(resolved).toString("utf8"));
     const allLines = splitKeepingNewlines(content);
     const lines: string[] = [];
     for (let i = 0; i < allLines.length; i++) {

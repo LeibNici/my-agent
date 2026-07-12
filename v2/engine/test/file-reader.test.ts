@@ -122,6 +122,19 @@ describe("file_reader tool", () => {
     expect(result.length).toBe(5 * 1024 * 1024);
   });
 
+  it("formats the too-large size with Python's round-half-to-even (:.1f), not JS's round-half-away-from-zero", async () => {
+    // 5505024 / 1024 / 1024 === 5.25 EXACTLY (1024*1024 is a power of two,
+    // so this division has zero floating-point error) — a genuine decimal
+    // tie. Python's f"{5.25:.1f}" round-half-to-even gives "5.2" (verified
+    // via `python3 -c`); JS's Number.prototype.toFixed(1) gives "5.3"
+    // (round-half-away-from-zero) — this is the exact byte count the
+    // reviewer flagged as divergent.
+    const file = path.join(root, "tie.txt");
+    fs.writeFileSync(file, Buffer.alloc(5505024, "a"));
+    const result = await fileReaderTool.execute({ path: file }, makeCtx([root]));
+    expect(result).toBe("Error: File too large (5.2MB). Max 5MB.");
+  });
+
   it("paginates with start_line/max_lines and appends the exact truncation message", async () => {
     const file = path.join(root, "numbered.txt");
     const lines = Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n") + "\n";
@@ -180,5 +193,25 @@ describe("file_reader tool", () => {
     fs.mkdirSync(dir);
     const result = await fileReaderTool.execute({ path: dir }, makeCtx([root]));
     expect(result).toBe(`Error: Not a file: ${dir}`);
+  });
+
+  it("normalizes CRLF (and lone CR) line endings to LF, matching Python's universal-newline text-mode open()", async () => {
+    const file = path.join(root, "crlf.txt");
+    fs.writeFileSync(file, "line1\r\nline2\r\nline3\r\n");
+    const result = await fileReaderTool.execute({ path: file }, makeCtx([root]));
+    expect(result).toBe("line1\nline2\nline3\n");
+    expect(result).not.toContain("\r");
+  });
+
+  it("round-trips byte-exactly when the last line has no trailing newline", async () => {
+    // Python's `for i, line in enumerate(f)` + `"".join(lines)` keeps the
+    // final line exactly as-is when the file doesn't end in "\n" — no
+    // newline is invented for it. Every other fixture in this file ends
+    // with a trailing "\n"; this one deliberately doesn't.
+    const file = path.join(root, "no-trailing-newline.txt");
+    fs.writeFileSync(file, "line1\nline2\nline3");
+    const result = await fileReaderTool.execute({ path: file }, makeCtx([root]));
+    expect(result).toBe("line1\nline2\nline3");
+    expect(result.endsWith("\n")).toBe(false);
   });
 });
