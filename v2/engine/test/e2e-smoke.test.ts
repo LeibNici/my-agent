@@ -6,11 +6,18 @@
 // route) gets proven end-to-end here in one path — this is what closes
 // Phase 3: after this test is green, the product runs on Node.
 //
-// "no leaked handles" is itself part of the assertion (see the brief): if
-// startServer()'s stop() doesn't actually close the HTTP server and the db
-// worker thread, `npm test` (vitest run, not watch mode) hangs after
-// printing results instead of exiting — that failure mode wouldn't show up
-// as a red assertion, it'd show up as the test command never returning.
+// "no leaked handles" is itself part of the assertion (see the brief), and
+// it is enforced EXPLICITLY at the end of the test, not by hoping vitest's
+// process would hang on a leak: the default threads pool force-terminates
+// its workers after a run, so `npm test` exits cleanly even with a leaked
+// server/db worker (empirically verified during Task 6 review by stripping
+// stop()'s cleanup — the suite stayed green). The real enforcement is:
+//   - a stop() that HANGS (e.g. db worker never exits — db.close() only
+//     resolves after the worker's real "exit" event, see client.ts) fails
+//     this test via its own timeout;
+//   - a stop() that silently SKIPS closing is caught by the post-stop
+//     assertions below (connection refused on the port; db calls reject
+//     with /closed/).
 import { describe, it, expect, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -194,10 +201,22 @@ describe("e2e smoke — real server + real runTurn engine against an offline moc
     });
     expect(goneResp.status).toBe(404);
 
-    // ---- shut down cleanly; afterEach also calls stop() but doing it here
-    // too means a hang shows up as THIS test timing out, not as vitest's
-    // process failing to exit after every test already reported passed ----
-    await started.stop();
-    started = undefined;
+    // ---- clean shutdown, explicitly asserted (see file header: vitest's
+    // threads pool would NOT hang on a leak, so "the suite exits" proves
+    // nothing — these assertions are the real leak check) ----
+    const srv = started;
+    started = undefined; // afterEach's stop() would be a no-op re-call anyway (idempotent)
+    await srv.stop(); // a hang here = this test times out
+
+    // Server really released the port: a fresh connection must be REFUSED
+    // (fetch rejects), not served or left half-open.
+    await expect(fetch(`${base}/`)).rejects.toThrow();
+
+    // Db client really closed: post-close calls reject with the Phase-2
+    // closed-client error (client.ts). Combined with stop() having
+    // RESOLVED — db.close() only resolves after the worker thread's real
+    // "exit" event — this pins both "close was called" and "the worker is
+    // actually gone".
+    await expect(srv.db.getMessages(sessionId)).rejects.toThrow(/closed/);
   }, 15000);
 });

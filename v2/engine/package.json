@@ -4,7 +4,7 @@
   "type": "module",
   "description": "CodeAxis v2 domain DTO layer and event codec",
   "scripts": {
-    "start": "tsx src/server/main.ts",
+    "start": "exec tsx src/server/main.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

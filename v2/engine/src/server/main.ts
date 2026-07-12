@@ -73,13 +73,23 @@ export type StartedServer = {
   settings: Settings;
   db: DbClient;
   /**
-   * Closes the HTTP server (force-dropping any idle keep-alive sockets —
-   * see the `closeAllConnections` call below — so this doesn't hang waiting
-   * on a socket nobody was going to close) THEN the db client, in that
-   * order, resolving only once both are actually done. Idempotent: safe to
+   * Closes the HTTP server (force-dropping any still-ACTIVE connections —
+   * see the `closeAllConnections` note below) THEN the db client, in that
+   * order, resolving only once both are actually done. `db.close()`
+   * resolves only after the worker thread's real "exit" event (client.ts),
+   * so a resolved stop() means no leaked db worker. Idempotent: safe to
    * call from a test's `afterEach` and from a production signal handler
    * without double-work (`db.close()` is itself idempotent — Phase 2's
    * close-lifecycle work).
+   *
+   * How this is test-enforced (e2e-smoke.test.ts): a stop() that HANGS
+   * fails that test via its own timeout; a stop() that silently skips
+   * closing is caught by explicit post-stop assertions there (connection
+   * refused on the port; db calls reject as closed). Note "vitest would
+   * hang on a leaked handle" is NOT the enforcement mechanism — the
+   * default threads pool force-terminates its workers after a run, so a
+   * leak would not actually hang `npm test` (empirically verified during
+   * Task 6 review).
    */
   stop(): Promise<void>;
 };
@@ -131,13 +141,16 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
       stopped = (async () => {
         await new Promise<void>((resolve, reject) => {
           server.close((err) => (err ? reject(err) : resolve()));
-          // fetch/undici (and any other keep-alive HTTP/1.1 client) leaves
-          // idle sockets open after its response body is fully read —
-          // server.close()'s callback only fires once every connection is
-          // gone, so without this it can sit unresolved waiting on a socket
-          // nobody was going to close on their own. That's exactly the
-          // "vitest hangs after tests report done" failure mode the e2e
-          // test's own cleanup exists to catch.
+          // On Node >=19, server.close() already closes IDLE keep-alive
+          // sockets by itself (empirically re-verified on this repo's Node
+          // 24: the e2e test passes at the same speed with this line
+          // stripped — an earlier comment here claimed idle undici sockets
+          // would wedge close(), which is Node <19 behavior). What close()
+          // still waits for indefinitely is ACTIVE connections — e.g. a
+          // browser holding an SSE chat stream open when SIGTERM lands, the
+          // normal state for this product. closeAllConnections() drops
+          // those too, so shutdown is bounded instead of hostage to the
+          // longest-lived open stream.
           server.closeAllConnections();
         });
         await db.close();
