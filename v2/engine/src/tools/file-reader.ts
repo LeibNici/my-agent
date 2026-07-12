@@ -27,7 +27,12 @@ const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
 // Python's os.path.expanduser(path) only handles a bare "~" or a leading
 // "~/..." here — v1's callers never pass "~user"-style paths, so that form
 // (which Python does support) is deliberately not ported.
-function expandUser(inputPath: string): string {
+//
+// Exported: code-search.ts's _validate_repo_path port needs the exact same
+// expanduser + realpath-or-resolve pair v1 shares across file_reader.py and
+// code_search.py (both call os.path.expanduser/os.path.realpath directly) —
+// centralizing here instead of a second copy keeps them from drifting.
+export function expandUser(inputPath: string): string {
   if (inputPath === "~") {
     return os.homedir();
   }
@@ -42,7 +47,7 @@ function expandUser(inputPath: string): string {
 // do exist. Node's fs.realpathSync THROWS ENOENT for a missing path, so
 // this falls back to a lexical path.resolve() to match — same pattern as
 // access.ts's getAllowedPaths (see its comment for the same rationale).
-function realpathOrResolve(p: string): string {
+export function realpathOrResolve(p: string): string {
   try {
     return fs.realpathSync(p);
   } catch {
