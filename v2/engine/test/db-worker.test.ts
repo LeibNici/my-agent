@@ -95,4 +95,11 @@ describe("createDbClient", () => {
   it("getUserByUsername 查无此人经 worker 回环仍是 null（不是 undefined）", async () => {
     expect(await client.getUserByUsername("ghost-user")).toBeNull();
   });
+
+  it("updateSessionTitle 经 worker 的写读回环", async () => {
+    const uid = await client.createUser("alice", "hashed-pw", "user");
+    const sid = await client.createSession("New Chat", uid);
+    await client.updateSessionTitle(sid, "衍生出的标题");
+    expect((await client.getSession(sid))!.title).toBe("衍生出的标题");
+  });
 });

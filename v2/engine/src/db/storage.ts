@@ -65,6 +65,7 @@ export type Storage = {
   createSession(title: string, ownerId: number | null): string;
   listSessions(ownerId: number | null): SessionRow[];
   getSession(sessionId: string): SessionRow | null;
+  updateSessionTitle(sessionId: string, title: string): void;
   deleteSession(sessionId: string): void;
   listRepos(): RepoRow[];
   listReposForUser(userId: number): RepoRow[];
@@ -321,6 +322,17 @@ export function openStorage(dbPath: string): Storage {
         )
         .get(sessionId) as SessionRow | undefined;
       return row ?? null;
+    },
+
+    // v1 database.py's update_session_title: title + updated_at, nothing
+    // else touched (created_at/owner_id/resolved_at all untouched).
+    updateSessionTitle(sessionId: string, title: string): void {
+      const now = pyLocalIsoNow();
+      db.prepare("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?").run(
+        title,
+        now,
+        sessionId
+      );
     },
 
     // Explicit two DELETEs (messages then sessions), matching v1's

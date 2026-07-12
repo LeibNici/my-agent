@@ -202,6 +202,19 @@ describe("createSession / listSessions / getSession / deleteSession（v1 databas
     const ids = Array.from({ length: 20 }, () => storage.createSession("x", null));
     expect(new Set(ids).size).toBe(20);
   });
+
+  it("updateSessionTitle 只改 title + updated_at（v1 database.py::update_session_title 同语义）", () => {
+    const uid = seedUser("alice");
+    const id = storage.createSession("New Chat", uid);
+    const before = storage.getSession(id)!;
+    storage.updateSessionTitle(id, "衍生出的标题");
+    const after = storage.getSession(id)!;
+    expect(after.title).toBe("衍生出的标题");
+    expect(after.owner_id).toBe(before.owner_id);
+    expect(after.created_at).toBe(before.created_at);
+    expect(after.resolved_at).toBeNull();
+    expect(after.updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+  });
 });
 
 describe("listRepos / listReposForUser（v1 database.py list_repos/get_user_repos 同语义，Task 5）", () => {

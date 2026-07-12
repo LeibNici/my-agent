@@ -274,10 +274,38 @@ export async function* chatEventStream(
             if (finalText) {
               finalMessageId = await db.addMessage(sessionId, "assistant", finalText);
             }
+            // v1 main.py's chat_event_stream: on a successful turn, a
+            // session still titled "New Chat" gets its title derived from
+            // this turn — first 50 chars of the user's message, falling
+            // back to the model's own text (image-only turns, out of scope
+            // here — codec-pi.ts's domainToPi still throws on image
+            // blocks) and finally the image count. Re-fetches the session
+            // HERE (not the `session` var captured earlier) because the
+            // "not_found"/"resolved" transparent-new-session branches leave
+            // that variable pointing at the OLD session, if anything.
+            const s = await db.getSession(sessionId);
+            if (s && s.title === "New Chat") {
+              let title: string;
+              if (req.message.trim()) {
+                title = req.message.slice(0, 50);
+              } else if (finalText.trim()) {
+                title = finalText.trim().slice(0, 50);
+              } else if (req.images && req.images.length > 0) {
+                title = `${req.images.length} image(s)`;
+              } else {
+                title = "New Chat";
+              }
+              await db.updateSessionTitle(sessionId, title);
+            }
           } else {
             // LLM error / max-iterations: save whatever text had already
-            // streamed for this turn instead of losing it.
-            const partialText = event.data.text ?? "";
+            // streamed for this turn instead of losing it. event.data.text
+            // is NOT the source of truth here — event-adapter.ts's fail()
+            // always sends "" (it has no visibility into what streamed
+            // before the failure) — currentTextBuffer is the buffer this
+            // module has been accumulating from text_delta events all
+            // along, same role as v1's current_text_buffer.
+            const partialText = event.data.text || currentTextBuffer;
             if (partialText) {
               await db.addMessage(sessionId, "assistant", partialText + "\n\n_（回复未完成：发生错误）_");
             }

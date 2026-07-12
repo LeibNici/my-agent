@@ -103,7 +103,7 @@ export type ModelSetup = { models: MutableModels; model: Model<"anthropic-messag
  * test/agent-harness.ts's buildSetup delegates here instead of duplicating
  * the createModels/createProvider wiring. */
 export function buildModelSetup(
-  settings: Pick<Settings, "baseUrl" | "apiKey" | "model" | "maxTokens">,
+  settings: Pick<Settings, "baseUrl" | "apiKey" | "model" | "maxTokens" | "promptCache">,
 ): ModelSetup {
   const models = createModels();
   const provider = createProvider({
@@ -129,7 +129,17 @@ export function buildModelSetup(
   models.setProvider(provider);
   const model = models.getModel(PROVIDER_ID, settings.model) as Model<"anthropic-messages"> | undefined;
   if (!model) throw new Error(`model not registered: ${PROVIDER_ID}/${settings.model}`);
-  const streamFn: StreamFn = (m, ctx, opts) => models.streamSimple(m, ctx, opts);
+  // GATE-backed decision (0A spike S4: DashScope prompt caching is real,
+  // cacheRead=4005 on the second call) — default stays ON by omitting
+  // cacheRetention entirely, which lets pi-ai apply its own default
+  // ("short", unconditional cache_control on system/tools/last-user-turn —
+  // see node_modules/@earendil-works/pi-ai/dist/api/anthropic-messages.js's
+  // resolveCacheRetention). "off" is the one value that needs to be wired
+  // through explicitly, as cacheRetention:"none" — pi-ai only omits
+  // cache_control when told to.
+  const cacheRetention = settings.promptCache === "off" ? ("none" as const) : undefined;
+  const streamFn: StreamFn = (m, ctx, opts) =>
+    models.streamSimple(m, ctx, cacheRetention ? { ...opts, cacheRetention } : opts);
   return { models, model, streamFn };
 }
 
@@ -218,7 +228,14 @@ async function runWrapup(
   const stream = await setup.models.streamSimple(
     setup.model,
     { systemPrompt: settings.systemPrompt, messages: [...transcript, wrapupMessage], tools: [] },
-    { apiKey: settings.apiKey, maxTokens: WRAPUP_MAX_TOKENS },
+    {
+      apiKey: settings.apiKey,
+      maxTokens: WRAPUP_MAX_TOKENS,
+      // Same off-switch as buildModelSetup's streamFn — this call bypasses
+      // the Agent entirely (see file header), so the wiring has to be
+      // repeated here rather than inherited.
+      ...(settings.promptCache === "off" ? { cacheRetention: "none" as const } : {}),
+    },
   );
   let text = "";
   for await (const event of stream) {

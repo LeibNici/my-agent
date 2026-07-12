@@ -138,6 +138,34 @@ describe("runTurn — turn engine (Task 4)", () => {
     await mock.close();
   });
 
+  it("7. promptCache:'off' -> 请求体不含任何 cache_control；默认（'auto'）-> 请求体含 cache_control（GATE 的 0A S4：DashScope 缓存真实生效，cacheRead=4005，默认保持开启）", async () => {
+    const mockOff = startMock([textTurn("ok")]);
+    const settingsOff = testSettings({ baseUrl: mockOff.url, promptCache: "off" });
+    await collect(runTurn({ settings: settingsOff, tools: [] }, { sessionId: "s1", history: [], userText: "hi" }));
+    expect(JSON.stringify(mockOff.requests[0]?.body)).not.toContain("cache_control");
+    await mockOff.close();
+
+    const mockDefault = startMock([textTurn("ok")]);
+    const settingsDefault = testSettings({ baseUrl: mockDefault.url }); // promptCache defaults to "auto"
+    await collect(
+      runTurn({ settings: settingsDefault, tools: [] }, { sessionId: "s1", history: [], userText: "hi" }),
+    );
+    expect(JSON.stringify(mockDefault.requests[0]?.body)).toContain("cache_control");
+    await mockDefault.close();
+  });
+
+  it("8. promptCache:'off' 同样作用于 wrap-up 的单独 streamSimple 调用（不止 Agent 循环调用）", async () => {
+    const turns = exhaustingTurns();
+    const mock = startMock(turns);
+    const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8, promptCache: "off" });
+    await collect(
+      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+    );
+    // request[8] is the wrap-up call (see test 4/6's numbering).
+    expect(JSON.stringify(mock.requests[8]?.body)).not.toContain("cache_control");
+    await mock.close();
+  });
+
   it("6. 每 turn 新 Agent：连续两次 runTurn，第二次的请求体只来自入参 history（无第一 turn 残留）", async () => {
     const mock: MockServer = startMock([textTurn("第一轮回复"), textTurn("第二轮回复")]);
     const settings = testSettings({ baseUrl: mock.url });

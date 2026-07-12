@@ -62,6 +62,12 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.getSession(sessionId) });
         break;
       }
+      case "updateSessionTitle": {
+        const [sessionId, title] = args as [string, string];
+        storage.updateSessionTitle(sessionId, title);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
       case "deleteSession": {
         const [sessionId] = args as [string];
         storage.deleteSession(sessionId);

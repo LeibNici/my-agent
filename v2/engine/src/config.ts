@@ -70,9 +70,11 @@ export function loadOrCreateJwtSecret(repoRoot: string): string {
 }
 
 export function loadSettings(env?: Record<string, string | undefined>): Settings {
-  // When env is NOT provided (production path), call dotenv.config() once
+  // When env is NOT provided (production path), call dotenv.config() once.
+  // `quiet: true` suppresses dotenv's own stdout "tips" banner (an ad for
+  // dotenv-vault) — noise on every service start with no diagnostic value.
   if (!env) {
-    dotenv.config();
+    dotenv.config({ quiet: true });
   }
 
   const envVars = env || process.env;

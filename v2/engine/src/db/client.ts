@@ -11,6 +11,7 @@ export type DbClient = {
   createSession(title: string, ownerId: number | null): Promise<string>;
   listSessions(ownerId: number | null): Promise<SessionRow[]>;
   getSession(sessionId: string): Promise<SessionRow | null>;
+  updateSessionTitle(sessionId: string, title: string): Promise<void>;
   deleteSession(sessionId: string): Promise<void>;
   listRepos(): Promise<RepoRow[]>;
   listReposForUser(userId: number): Promise<RepoRow[]>;
@@ -118,6 +119,7 @@ export function createDbClient(dbPath: string): DbClient {
     createSession: (title, ownerId) => call<string>("createSession", [title, ownerId]),
     listSessions: (ownerId) => call<SessionRow[]>("listSessions", [ownerId]),
     getSession: (sessionId) => call<SessionRow | null>("getSession", [sessionId]),
+    updateSessionTitle: (sessionId, title) => call<void>("updateSessionTitle", [sessionId, title]),
     deleteSession: (sessionId) => call<void>("deleteSession", [sessionId]),
     listRepos: () => call<RepoRow[]>("listRepos", []),
     listReposForUser: (userId) => call<RepoRow[]>("listReposForUser", [userId]),

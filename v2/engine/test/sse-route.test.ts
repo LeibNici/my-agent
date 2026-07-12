@@ -396,6 +396,89 @@ describe("POST /api/chat — supplementary semantics", () => {
     const msgs = await client.getMessages(sessionId);
     expect(msgs[1].content).toBe("半截答案\n\n_（回复未完成：发生错误）_");
   });
+
+  it("done{success:false, text:''}（adapter.fail() 真实形状——pi 的 error 终态从不带文本）：落库用的是流式期间攒下的 currentTextBuffer，不是空的 done.text", async () => {
+    // The real event-adapter.ts's fail() ALWAYS sets done.data.text to ""
+    // (event-adapter.ts:160) — it has no way to know what text streamed
+    // before the failure. Reading event.data.text directly here (the bug)
+    // silently drops everything the user already saw stream in. v1 never
+    // had this gap: it kept its own current_text_buffer independent of
+    // whatever the "done" event happened to carry.
+    const { token } = await seedUser();
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([
+        { type: "text_delta", data: { text: "写到一半" } },
+        { type: "error", data: { message: "LLM API error: boom" } },
+        { type: "done", data: { text: "", success: false, budgetExhausted: false } },
+      ]),
+    });
+    const { frames } = await postChat(app, token, { message: "出错" });
+    expect(frames.map((f) => f.event)).toEqual(["session", "text", "error", "done", "end"]);
+    const sessionId = JSON.parse(frames[0].data).session_id;
+    const msgs = await client.getMessages(sessionId);
+    expect(msgs.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(msgs[1].content).toBe("写到一半\n\n_（回复未完成：发生错误）_");
+  });
+});
+
+// ==================== Session title auto-derivation (v1 main.py's chat_event_stream, "done" branch) ====================
+
+describe("会话标题自动推导（v1 main.py: title still 'New Chat' -> req.message[:50]）", () => {
+  it("成功回合后，仍是 'New Chat' 的会话标题被推导为用户消息前 50 字符", async () => {
+    const { token } = await seedUser();
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([
+        { type: "text_delta", data: { text: "答案" } },
+        { type: "done", data: { text: "答案", success: true, budgetExhausted: false } },
+      ]),
+    });
+    const { frames } = await postChat(app, token, { message: "这是一个很长的问题用来验证标题截断" });
+    const sessionId = JSON.parse(frames[0].data).session_id;
+    // Through the real GET /api/sessions/:id endpoint, not just the db client.
+    const sessResp = await authedRequest(app, token, `/api/sessions/${sessionId}`);
+    const sessBody = await sessResp.json();
+    expect(sessBody.session.title).toBe("这是一个很长的问题用来验证标题截断".slice(0, 50));
+  });
+
+  it("已经有标题的会话（非 'New Chat'）不会被第二轮对话覆盖", async () => {
+    const { id: uid, token } = await seedUser("user", "title-keep");
+    const sid = await client.createSession("New Chat", uid);
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([{ type: "done", data: { text: "ok", success: true, budgetExhausted: false } }]),
+    });
+    // Turn 1 derives the title from the first message.
+    await postChat(app, token, { session_id: sid, message: "第一条消息" });
+    expect((await client.getSession(sid))!.title).toBe("第一条消息");
+
+    // Turn 2 must NOT overwrite it, even with a different message.
+    const app2 = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([{ type: "done", data: { text: "ok2", success: true, budgetExhausted: false } }]),
+    });
+    await postChat(app2, token, { session_id: sid, message: "第二条消息" });
+    expect((await client.getSession(sid))!.title).toBe("第一条消息");
+  });
+
+  it("超过 50 字符的消息按 50 字符截断", async () => {
+    const { token } = await seedUser("user", "title-truncate");
+    const longMessage = "字".repeat(80);
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([{ type: "done", data: { text: "ok", success: true, budgetExhausted: false } }]),
+    });
+    const { frames } = await postChat(app, token, { message: longMessage });
+    const sessionId = JSON.parse(frames[0].data).session_id;
+    const session = await client.getSession(sessionId);
+    expect(session!.title).toBe("字".repeat(50));
+  });
 });
 
 // ==================== POST /api/auth/login ====================
