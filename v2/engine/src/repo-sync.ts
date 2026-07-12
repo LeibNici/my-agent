@@ -285,9 +285,12 @@ export type SyncRepoOptions = {
  * 成一次全新 clone —— 安全，因为这些 clone 是只读的（没有任何工具会往里写），
  * 没有本地状态会丢。
  *
- * 本身不加锁 —— 唯一的调用方 syncAndPersist 在整个函数体（clone/pull 加上后续
- * 的索引重建）期间都持有 per-repo 锁，所以同一个仓库的第二次 sync 永远不会
- * 观察到或竞争一个写到一半的 checkout。
+ * 本身不加锁 —— 唯一的调用方 syncAndPersist 的 clone/pull 本体、以及它成功后
+ * 排队的索引重建（默认 onSyncSuccess，见 defaultOnSyncSuccess），全程都串在
+ * 同一把 per-repo 锁的队列里（先后顺序严格保序，但锁在两段之间有一个短暂的
+ * 释放-重新获取的缝隙，不是从头到尾连续持有同一次加锁）。所以同一个仓库的
+ * 第二次 sync 永远不会插队到前一次 sync 的索引重建前面，也就不会观察到或
+ * 竞争一个写到一半的 checkout。
  *
  * 按 cloneFn 参数化（默认真正校验 URL 的 `cloneRepo`），理由同 cloneRepoCore
  * 顶部注释——测试 pull-fails-then-reclone 自愈这条路径需要对一个真实本地
@@ -359,8 +362,11 @@ export type SyncAndPersistOptions = {
  * 不用连带等 ctags 建完。这里换成显式的 onSyncSuccess 回调而不是 v1 那种
  * 运行时 `from app.tools.symbol_index import build_index` 的动态 import——
  * 索引构建是 Task 6 的活，这里不知道它、也不该 import 它；onSyncSuccess 是
- * fire-and-forget（不 await），调用方自己负责再排队到 per-repo 锁（v1 的
- * _background_build_index 也会重新拿一次锁）。
+ * fire-and-forget（不 await）——"排队到 per-repo 锁"这件事不是靠调用方各自
+ * 记得做，是下面默认挂的 `defaultOnSyncSuccess` 自己内部重新拿一次锁（对照
+ * v1 的 _background_build_index，见那里的注释）。显式传入别的 onSyncSuccess
+ * （比如测试用 vi.fn() 探针）会整个覆盖掉这个默认实现，自然也就不再有这层
+ * 锁保护——调用方主动选择绕开时，后果自负。
  *
  * 按 syncFn 参数化（默认真正校验 URL 的 `syncRepo`），理由同上——测试
  * updateRepo 落库 + last_sync_sha + 并发序列化这几件事需要对一个真实本地
@@ -421,18 +427,33 @@ async function syncAndPersistImpl(
   });
 }
 
+// Task 6 挂的默认 onSyncSuccess —— 模块级 import buildIndex（symbol-index.ts
+// 不反向依赖 repo-sync.ts，两者本就在同一 Node 进程里，不像 v1 要担心动态
+// import 的时机）。对 syncAndPersistImpl 而言仍是 fire-and-forget（这里自己
+// `void withRepoLock(...)`，不 await，syncAndPersistImpl 也不等它返回）——
+// 触发它的 create/update/手动 sync API 调用一旦 git 跑完就能返回，不用连带
+// 等 ctags 建完。
+//
+// 但 fire-and-forget 不等于对锁一无所知：ctags 扫描要读整个 checkout，如果
+// admin 紧接着一次 force-reclone 把 checkout rmtree 掉，这次 buildIndex 就
+// 在读一个正被删除/替换的目录——非崩溃性但会读到残缺/不存在的文件。所以像
+// v1 的 _background_build_index 那样，在真正跑 buildIndex 之前重新
+// `withRepoLock(repoId, ...)` 排队：这次 buildIndex 会排在"触发它的那次
+// sync"释放锁之后、"下一次 sync"拿到锁之前，两者不会再共享同一个 checkout
+// 目录的读写窗口。锁在 buildIndex 跑的时候被重新持有，而不是从触发它的那次
+// sync 起就没释放过——中间有一个短暂的“未上锁”缝隙，和 v1 两个独立的
+// `async with` 块语义一致，不是一次连续加锁。
+function defaultOnSyncSuccess(repoId: number, localPath: string): void {
+  void withRepoLock(repoId, () => buildIndex(localPath));
+}
+
 export async function syncAndPersist(
   db: DbClient,
   opts: SyncAndPersistOptions,
-  // Task 6: 默认挂上 buildIndex —— 模块级 import（symbol-index.ts 不反向依赖
-  // repo-sync.ts，两者本就在同一 Node 进程里，不像 v1 要担心动态 import 的
-  // 时机），仍是 fire-and-forget（onSyncSuccess 自己 `void buildIndex(...)`，
-  // 不 await，syncAndPersistImpl 也不等它）。显式传入 onSyncSuccess（包括
-  // 显式传 undefined，见 syncAllRepos/periodicSyncLoop 的透传）会覆盖这个
-  // 默认值——调用方（比如测试）想绕开索引重建、换一个 mock 时依然可以。
-  onSyncSuccess: (repoId: number, localPath: string) => void = (_repoId, localPath) => {
-    void buildIndex(localPath);
-  }
+  // 显式传入 onSyncSuccess（包括显式传 undefined，见 syncAllRepos/
+  // periodicSyncLoop 的透传）会覆盖这个默认值——调用方（比如测试）想绕开
+  // 索引重建、换一个 mock 时依然可以，但也就不再享有上面这层锁保护。
+  onSyncSuccess: (repoId: number, localPath: string) => void = defaultOnSyncSuccess
 ): Promise<{ ok: boolean; message: string }> {
   return syncAndPersistImpl(db, opts, onSyncSuccess, syncRepo);
 }
@@ -450,6 +471,31 @@ export const __internal = {
     opts: SyncAndPersistOptions,
     onSyncSuccess?: (repoId: number, localPath: string) => void
   ) => syncAndPersistImpl(db, opts, onSyncSuccess, (o) => syncRepoImpl(o, cloneRepoCore)),
+  // syncAndPersistUnvalidated 在 onSyncSuccess 被省略时传的是字面 undefined
+  // 给 syncAndPersistImpl（一个已经声明了形参、没有默认值的普通函数），JS
+  // 不会在那一层触发 `syncAndPersist` 导出函数自己的默认参数替换——那个默认
+  // 值只存在于 `syncAndPersist` 这个具名导出的参数列表里。所以要在测试里对
+  // 一个真实本地 origin 目录（validateUrl 会拒绝的那种）验证"生产真正会用的
+  // 默认 onSyncSuccess 是否重新排队到锁"，需要单独一个绕开 validateUrl、但
+  // 仍然接上 defaultOnSyncSuccess 的入口——否则测试只能验到自己传的 mock，
+  // 验不到默认实现本身。
+  defaultOnSyncSuccessUnvalidated: (db: DbClient, opts: SyncAndPersistOptions) =>
+    syncAndPersistImpl(db, opts, defaultOnSyncSuccess, (o) => syncRepoImpl(o, cloneRepoCore)),
+  // 同上，供 startServer()（src/server/main.ts）的 e2e 测试用：main.ts 启动时
+  // 跑的是公开的 syncAllRepos（过 validateUrl），e2e 测试要对一个真实本地
+  // origin 目录验证"启动确实同步成功了"，需要绕开 SSRF 网关的同款入口——
+  // main.ts 自己的 StartServerOptions.syncAllRepos 注入点默认还是走生产的
+  // 真实实现，只有测试显式传这个才会换成不校验 URL 的版本，和
+  // admin-routes.ts 的 deps.syncAndPersist 注入是同一套模式。
+  syncAllReposUnvalidated: (
+    db: DbClient,
+    repos: RepoSyncDescriptor[],
+    reposDir: string,
+    onSyncSuccess?: (repoId: number, localPath: string) => void
+  ) =>
+    syncAllReposImpl(db, repos, reposDir, onSyncSuccess, (d, o, cb) =>
+      syncAndPersistImpl(d, o, cb, (oo) => syncRepoImpl(oo, cloneRepoCore))
+    ),
 };
 
 export type RepoSyncDescriptor = {
@@ -472,17 +518,22 @@ export type RepoSyncDescriptor = {
  * 参数交给调用方负责组装（而不是自己去查 DB），调用方（Task 6/7 或后续的
  * server 启动流程）用 getRepoAdmin 之类拿到带凭证的全量行再传进来。
  */
-export async function syncAllRepos(
+async function syncAllReposImpl(
   db: DbClient,
   repos: RepoSyncDescriptor[],
   reposDir: string,
-  onSyncSuccess?: (repoId: number, localPath: string) => void
+  onSyncSuccess: ((repoId: number, localPath: string) => void) | undefined,
+  syncAndPersistFn: (
+    db: DbClient,
+    opts: SyncAndPersistOptions,
+    onSyncSuccess?: (repoId: number, localPath: string) => void
+  ) => Promise<{ ok: boolean; message: string }>
 ): Promise<void> {
   await Promise.all(
     repos
       .filter((repo) => repo.url)
       .map(async (repo) => {
-        const result = await syncAndPersist(
+        const result = await syncAndPersistFn(
           db,
           {
             repoId: repo.id,
@@ -498,6 +549,15 @@ export async function syncAllRepos(
         console.log(`  ${status} [${repo.name}] ${result.message}`);
       })
   );
+}
+
+export async function syncAllRepos(
+  db: DbClient,
+  repos: RepoSyncDescriptor[],
+  reposDir: string,
+  onSyncSuccess?: (repoId: number, localPath: string) => void
+): Promise<void> {
+  return syncAllReposImpl(db, repos, reposDir, onSyncSuccess, syncAndPersist);
 }
 
 /**

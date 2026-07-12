@@ -25,9 +25,30 @@ import { serve } from "@hono/node-server";
 import { loadSettings, loadOrCreateJwtSecret, type Settings } from "../config.js";
 import { initSchema } from "../db/schema.js";
 import { createDbClient, type DbClient } from "../db/client.js";
+import type { FullRepoRow } from "../db/storage.js";
 import { ensureAdminUser } from "../auth.js";
 import { runTurn } from "../engine/turn.js";
+import { syncAllRepos, periodicSyncLoop, type RepoSyncDescriptor } from "../repo-sync.js";
 import { buildApp } from "./app.js";
+
+// listReposFull() returns the admin/internal full row shape (snake_case,
+// straight off the sqlite columns) — repo-sync.ts's RepoSyncDescriptor is
+// camelCase and deliberately narrower (just what clone/pull need). This is
+// the one place that bridges them: both syncAllRepos (startup) and
+// periodicSyncLoop's injected fetchRepos (Task 3's design, see repo-sync.ts's
+// periodicSyncLoop doc comment — it takes credentials via an injected
+// fetcher rather than db.listRepos()'s client-safe/credential-free view)
+// go through this.
+function toSyncDescriptors(rows: FullRepoRow[]): RepoSyncDescriptor[] {
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    url: row.url,
+    branch: row.branch,
+    credUsername: row.cred_username,
+    credToken: row.cred_token,
+  }));
+}
 
 // This file lives at <repoRoot>/v2/engine/src/server/main.ts — four `..`
 // hops off its own directory lands on repo root, the exact same derivation
@@ -66,6 +87,17 @@ export type StartServerOptions = {
    * production (reads `.env` + `process.env`, real repo-root db path).
    */
   env?: Record<string, string | undefined>;
+  /**
+   * Test-only override for the startup repo-sync entry point. Production
+   * never sets this — the real `syncAllRepos` (repo-sync.ts), with its SSRF
+   * gate, always runs. An e2e test that wants to prove "startup sync
+   * actually populated local_path/last_sync_status" against a real local git
+   * fixture needs `repo-sync.ts`'s `__internal.syncAllReposUnvalidated`
+   * instead, for the exact reason admin-routes.ts injects
+   * `deps.syncAndPersist` the same way (see that file's header comment): a
+   * bare local temp dir is precisely what the SSRF gate exists to reject.
+   */
+  syncAllRepos?: typeof syncAllRepos;
 };
 
 export type StartedServer = {
@@ -117,6 +149,41 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   const db = createDbClient(dbPath);
   await ensureAdminUser(db, settings);
 
+  // Repo sync — v1's lifespan (app/main.py, ~line 124-138) awaits
+  // sync_all_repos(repos) on startup BEFORE the app starts serving requests,
+  // wrapped in try/except so one bad repo (bad path, filesystem error, ...)
+  // can't prevent the app itself from starting; it then launches
+  // periodic_sync_loop as a fire-and-forget background task. Mirrored here
+  // exactly: awaited-but-caught startup sync, then a NOT-awaited periodic
+  // loop. (syncAllRepos/periodicSyncLoop themselves were built in Task 3 but
+  // never wired to a caller until now.)
+  const syncAllReposFn = opts.syncAllRepos ?? syncAllRepos;
+  try {
+    const repos = toSyncDescriptors(await db.listReposFull());
+    if (repos.length) {
+      console.log("Syncing repositories...");
+      await syncAllReposFn(db, repos, settings.reposDir);
+    }
+  } catch (e) {
+    const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
+    console.log(`  ❌ Startup repo sync failed: ${label}`);
+  }
+
+  // periodicSyncLoop's fetchRepos is an injected fetcher (Task 3's design,
+  // see that function's doc comment) rather than a direct db.listRepos()
+  // call: listRepos() is the client-safe view with credentials stripped, so
+  // a periodic resync built on it would silently stop working for every
+  // private repo. db.listReposFull() is the credentialed admin view this
+  // process is trusted to hold. Not awaited — v1's asyncio.create_task
+  // equivalent — and its returned `stop()` is captured so shutdown (below)
+  // can cancel it instead of leaving a live timer past process teardown.
+  const repoSync = periodicSyncLoop(
+    settings.repoSyncIntervalMinutes,
+    () => db.listReposFull().then(toSyncDescriptors),
+    db,
+    settings.reposDir
+  );
+
   // engine: runTurn already IS a RunTurnFn — `(deps: RunTurnDeps, req) =>
   // AsyncGenerator<DomainEvent>` — with no wrapping needed here. buildApp
   // (src/server/app.ts) registers the tool list itself (side-effecting
@@ -139,6 +206,13 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   function stop(): Promise<void> {
     if (!stopped) {
       stopped = (async () => {
+        // Cancel the periodic repo-sync loop first: it holds a `setTimeout`
+        // that (though `.unref()`'d, so it can't itself keep the process
+        // alive) would otherwise keep firing background syncs against a
+        // `db`/`server` we're in the middle of tearing down. repoSync.stop()
+        // is synchronous (just clears the pending timer, see
+        // repo-sync.ts's periodicSyncLoop) — nothing to await here.
+        repoSync.stop();
         await new Promise<void>((resolve, reject) => {
           server.close((err) => (err ? reject(err) : resolve()));
           // On Node >=19, server.close() already closes IDLE keep-alive

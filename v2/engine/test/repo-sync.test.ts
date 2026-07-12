@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeSeededDb } from "./db-fixture.js";
 import { createDbClient, type DbClient } from "../src/db/client.js";
+import * as symbolIndex from "../src/tools/symbol-index.js";
 import {
   maskUrlCredentials,
   getRepoLocalPath,
@@ -16,6 +17,12 @@ import {
   periodicSyncLoop,
   __internal,
 } from "../src/repo-sync.js";
+
+// buildIndex 的默认调度这批测试要精确控制它的开始/结束时机（人为延迟 + 记录
+// 时间窗），来证明它有没有真的重新排进 per-repo 锁——不 mock 就没法可靠地
+// 制造"buildIndex 还没跑完，第二次 sync 已经想动手"这个窗口。
+vi.mock("../src/tools/symbol-index.js", () => ({ buildIndex: vi.fn() }));
+const mockedBuildIndex = vi.mocked(symbolIndex.buildIndex);
 
 // __internal.*Unvalidated 绕开 validateUrl，只用于让"clone/sync/persist 机制
 // 本身对不对"这批测试能对一个真实本地临时目录跑真实 git 子进程——见
@@ -403,6 +410,89 @@ describe("syncAndPersist", () => {
 
     const localPath = getRepoLocalPath(reposDir, repoId);
     expect(existsSync(join(localPath, ".git"))).toBe(true);
+  });
+});
+
+describe("默认 onSyncSuccess —— buildIndex 重新排队到 per-repo 锁", () => {
+  let reposDir: string, originDir: string, dbDir: string, dbPath: string, client: DbClient;
+  let repoId: number;
+
+  beforeEach(async () => {
+    reposDir = mkdtempSync(join(tmpdir(), "repo-sync-repos-"));
+    originDir = mkdtempSync(join(tmpdir(), "repo-sync-origin-"));
+    initOriginRepo(originDir);
+    const seeded = makeSeededDb();
+    dbDir = seeded.dir;
+    dbPath = seeded.dbPath;
+    client = createDbClient(dbPath);
+    repoId = await client.createRepo({ name: "r1", url: originDir });
+    mockedBuildIndex.mockReset();
+  });
+
+  afterEach(async () => {
+    await client.close();
+    rmSync(reposDir, { recursive: true, force: true });
+    rmSync(originDir, { recursive: true, force: true });
+    rmSync(dbDir, { recursive: true, force: true });
+    mockedBuildIndex.mockReset();
+  });
+
+  // v1 的 _background_build_index 在跑 ctags 之前会 `async with
+  // _get_repo_lock(repo_id)` 重新拿一次锁——目的是让"admin 强制 reclone、
+  // rmtree 掉 checkout"不会和"上一次 sync 遗留的后台 buildIndex 还在读同一个
+  // checkout"发生竞态。这条测试证明 Node 这边的默认 onSyncSuccess 复刻了这个
+  // 语义：真的把 buildIndex 重新排进同一把 per-repo 锁，而不是纯粹
+  // fire-and-forget、对锁一无所知。
+  //
+  // 证明手法和上面"两个并发调用被序列化"那条测试同源：给 buildIndex 一个人为
+  // 延迟并记录它的起止时间窗，紧接着立刻发起第二次 sync（同一个 repoId，
+  // forceReclone），记录第二次 sync 真正开始跑 git 的时间。如果 buildIndex
+  // 真的重新排进了锁，第二次 sync 的 git 调用必然不会早于 buildIndex 结束；
+  // 如果没排进锁（当前的 bug），两者会在时间窗上重叠。
+  it("buildIndex 排在锁的队列里，紧随其后的第二次 sync 不会和它时间窗口重叠", async () => {
+    const BUILD_INDEX_DELAY_MS = 80;
+    const buildIndexWindow = { start: 0, end: 0 };
+    mockedBuildIndex.mockImplementation(async () => {
+      buildIndexWindow.start = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, BUILD_INDEX_DELAY_MS));
+      buildIndexWindow.end = Date.now();
+      return true;
+    });
+
+    // 第一次 sync：成功，触发默认 onSyncSuccess -> 排队 buildIndex（不等它）。
+    const r1 = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+    });
+    expect(r1.ok).toBe(true);
+
+    // 第二次 sync：紧接着发起（forceReclone），同一个 repoId。它自己也要过
+    // withRepoLock，所以如果 buildIndex 真排进了锁，这次 await 会一直等到
+    // buildIndex 跑完才真正开始 git clone。
+    const secondSyncCalledAt = Date.now();
+    const r2 = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+      forceReclone: true,
+    });
+    const secondSyncDoneAt = Date.now();
+
+    expect(r2.ok).toBe(true);
+    // 两次 sync 各自成功一次，各自的默认 onSyncSuccess 都会排一次 buildIndex——
+    // 第一次是这条测试真正盯的那次（人为拖慢、量它的时间窗）；第二次是 r2 自己
+    // 触发的，不影响下面的时序断言（r2 的 await 不等它自己排的这次 buildIndex）。
+    expect(mockedBuildIndex).toHaveBeenCalledTimes(2);
+    expect(mockedBuildIndex.mock.calls[0]).toEqual([getRepoLocalPath(reposDir, repoId)]);
+
+    // buildIndex 必须已经跑完（它的结束时间点必须落在"第二次 sync 发起"和
+    // "第二次 sync 完成"这段区间之内，且第二次 sync 的总耗时必须覆盖到
+    // BUILD_INDEX_DELAY_MS——如果第二次 sync 完全没等 buildIndex，
+    // secondSyncDoneAt - secondSyncCalledAt 会远小于 BUILD_INDEX_DELAY_MS）。
+    expect(buildIndexWindow.end).toBeGreaterThan(0);
+    expect(secondSyncDoneAt - secondSyncCalledAt).toBeGreaterThanOrEqual(BUILD_INDEX_DELAY_MS);
+    expect(buildIndexWindow.end).toBeLessThanOrEqual(secondSyncDoneAt);
   });
 });
 

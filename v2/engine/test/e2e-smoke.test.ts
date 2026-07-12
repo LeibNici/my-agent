@@ -19,11 +19,15 @@
 //     assertions below (connection refused on the port; db calls reject
 //     with /closed/).
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer, type StartedServer } from "../src/server/main.js";
 import { startMock, textThenToolTurn, textTurn, type MockServer } from "./mock-anthropic.js";
+import { initSchema } from "../src/db/schema.js";
+import { createDbClient } from "../src/db/client.js";
+import { __internal as repoSyncInternal } from "../src/repo-sync.js";
 
 // ==================== SSE frame parsing (mirrors sse-route.test.ts's own parser) ====================
 
@@ -218,5 +222,99 @@ describe("e2e smoke — real server + real runTurn engine against an offline moc
     // "exit" event — this pins both "close was called" and "the worker is
     // actually gone".
     await expect(srv.db.getMessages(sessionId)).rejects.toThrow(/closed/);
+  }, 15000);
+});
+
+// ==================== Repo startup/periodic sync wiring ====================
+//
+// v1's lifespan (app/main.py, ~line 124-138) awaits sync_all_repos(repos) on
+// startup BEFORE the app starts serving, then launches periodic_sync_loop as
+// a fire-and-forget background task, cancelling it on shutdown. Task 3 built
+// syncAllRepos/periodicSyncLoop but nothing called them from main.ts — this
+// closes that gap and proves it end to end: a real server, a real local git
+// repo standing in for "the remote" (same fixture style as repo-sync.test.ts),
+// confirming the repo actually got cloned during startServer() and that
+// stop() cleanly cancels the periodic loop instead of hanging.
+function initFixtureOrigin(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  const run = (args: string[]) => execFileSync("git", args, { cwd: dir });
+  run(["init", "-b", "main"]);
+  run(["config", "user.email", "test@example.com"]);
+  run(["config", "user.name", "Test"]);
+  writeFileSync(join(dir, "README.md"), "hello\n");
+  run(["add", "-A"]);
+  run(["commit", "-m", "initial"]);
+}
+
+describe("repo startup/periodic sync — wired into startServer()", () => {
+  let localStarted: StartedServer | undefined;
+  let localDir: string | undefined;
+  let originDir: string | undefined;
+
+  afterEach(async () => {
+    await localStarted?.stop();
+    if (localDir) rmSync(localDir, { recursive: true, force: true });
+    if (originDir) rmSync(originDir, { recursive: true, force: true });
+    localStarted = undefined;
+    localDir = undefined;
+    originDir = undefined;
+  });
+
+  it("syncs a seeded repo on startup, and stop() cancels the periodic loop without hanging", async () => {
+    localDir = mkdtempSync(join(tmpdir(), "codeaxis-e2e-repo-sync-"));
+    originDir = mkdtempSync(join(tmpdir(), "codeaxis-e2e-repo-sync-origin-"));
+    initFixtureOrigin(originDir);
+
+    const dbPath = join(localDir, "agent_data.db");
+    const reposDir = join(localDir, "repos");
+
+    // Seed a repo row pointing at the local fixture "remote" BEFORE
+    // startServer() runs, so the startup sync (which must run against
+    // whatever's already in the db when the process boots, exactly like
+    // v1's `repos = await list_repos()` in lifespan) has something to sync.
+    // initSchema is idempotent (CREATE TABLE IF NOT EXISTS) — startServer's
+    // own initSchema(dbPath) call on the same path is a safe no-op after this.
+    initSchema(dbPath);
+    const seedClient = createDbClient(dbPath);
+    const repoId = await seedClient.createRepo({ name: "fixture-repo", url: originDir });
+    await seedClient.close();
+
+    localStarted = await startServer({
+      env: {
+        APP_JWT_SECRET: "e2e-repo-sync-test-secret-do-not-use-in-prod",
+        APP_DB_PATH: dbPath,
+        APP_PORT: "0",
+        APP_REPOS_DIR: reposDir,
+        // Default repoSyncIntervalMinutes (10) is fine — this test only
+        // needs to prove the periodic loop was STARTED (and stop() cancels
+        // it cleanly), not that a tick actually fires within the test window.
+      },
+      // originDir is a bare local temp path, exactly what the SSRF gate
+      // (repo-sync.ts's validateUrl) exists to reject — the real syncAllRepos
+      // would refuse it. This test cares about the WIRING (main.ts actually
+      // calling it, not just leaving it unwired), so it swaps in the same
+      // unvalidated-but-otherwise-real-git test entry point repo-sync.test.ts
+      // and admin-routes.test.ts already use for this exact reason.
+      syncAllRepos: repoSyncInternal.syncAllReposUnvalidated,
+    });
+
+    // Startup sync is awaited before startServer() resolves (matching v1's
+    // lifespan awaiting sync_all_repos before yield) — so by the time we get
+    // here, the seeded repo must already show a completed sync attempt.
+    const row = await localStarted.db.getRepoAdmin(repoId);
+    expect(row).not.toBeNull();
+    expect(row!.last_sync_status).toBe("ok");
+    expect(row!.local_path).toBe(join(reposDir, String(repoId)));
+    expect(existsSync(join(row!.local_path!, ".git"))).toBe(true);
+
+    // Clean shutdown must also stop the periodic sync loop — a stop() that
+    // leaves a live setInterval/setTimeout chain running (and therefore
+    // never lets the process exit cleanly outside of vitest's worker-pool
+    // force-termination) would hang here past the test's own timeout.
+    const srv = localStarted;
+    localStarted = undefined; // afterEach's stop() would be a no-op re-call anyway (idempotent)
+    await srv.stop(); // a hang here = this test times out
+
+    await expect(srv.db.getMessages("does-not-matter")).rejects.toThrow(/closed/);
   }, 15000);
 });
