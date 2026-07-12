@@ -86,6 +86,24 @@ export type UpdateRepoFields = Partial<{
   lastSyncSha: string | null;
 }>;
 
+// Admin-only full row — v1's get_repo (`SELECT *` from repositories).
+// Unlike RepoRow (the client-safe subset), this exposes cred_username/
+// cred_token/local_path/last_sync_*/index_status — the admin routes (Task 7)
+// need these to diff PATCH changes, compute has_token, and pass credentials
+// to sync_and_persist. Masking (strip cred_token to a has_token bool, mask
+// the URL) is the route layer's job, NOT this method's — it returns raw data.
+export type FullRepoRow = RepoRow & {
+  cred_username: string | null;
+  cred_token: string | null;
+  local_path: string | null;
+  created_at: string;
+  last_sync_at: string | null;
+  last_sync_status: string | null;
+  last_sync_message: string | null;
+  index_status: string | null;
+  last_sync_sha: string | null;
+};
+
 // list_permissions' JOIN row — username/repo_name resolved through
 // users/repositories so callers don't need a second round-trip.
 export type PermissionRow = {
@@ -118,6 +136,7 @@ export type Storage = {
   listReposForUser(userId: number): RepoRow[];
   getUserRepos(userId: number): RepoRow[];
   getRepo(repoId: number): RepoRow | null;
+  getRepoAdmin(repoId: number): FullRepoRow | null;
   createRepo(fields: CreateRepoFields): number;
   updateRepo(repoId: number, fields: UpdateRepoFields): void;
   deleteRepo(repoId: number): void;
@@ -474,6 +493,18 @@ export function openStorage(dbPath: string): Storage {
       const row = db
         .prepare("SELECT id, name, url, description, branch FROM repositories WHERE id = ?")
         .get(repoId) as Omit<RepoRow, "access_level"> | undefined;
+      return row ? { ...row, access_level: null } : null;
+    },
+
+    // Admin full-row lookup — v1's get_repo (`SELECT *`). Exposes the
+    // credential/local_path/sync-status columns getRepo omits; the admin
+    // routes (Task 7) need this to diff PATCH changes, compute has_token,
+    // and pass credentials to sync_and_persist. No masking here — that's
+    // the route layer's job (_admin_repo_view in v1).
+    getRepoAdmin(repoId: number): FullRepoRow | null {
+      const row = db
+        .prepare("SELECT * FROM repositories WHERE id = ?")
+        .get(repoId) as Omit<FullRepoRow, "access_level"> | undefined;
       return row ? { ...row, access_level: null } : null;
     },
 

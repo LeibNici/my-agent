@@ -120,6 +120,11 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.getRepo(repoId) });
         break;
       }
+      case "getRepoAdmin": {
+        const [repoId] = args as [number];
+        reply({ id, ok: true, result: storage.getRepoAdmin(repoId) });
+        break;
+      }
       case "createRepo": {
         const [fields] = args as [Parameters<typeof storage.createRepo>[0]];
         reply({ id, ok: true, result: storage.createRepo(fields) });

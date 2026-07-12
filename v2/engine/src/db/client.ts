@@ -6,6 +6,7 @@ import type {
   UserRow,
   SessionRow,
   RepoRow,
+  FullRepoRow,
   CreateRepoFields,
   UpdateRepoFields,
   PermissionRow,
@@ -31,6 +32,7 @@ export type DbClient = {
   listReposForUser(userId: number): Promise<RepoRow[]>;
   getUserRepos(userId: number): Promise<RepoRow[]>;
   getRepo(repoId: number): Promise<RepoRow | null>;
+  getRepoAdmin(repoId: number): Promise<FullRepoRow | null>;
   createRepo(fields: CreateRepoFields): Promise<number>;
   updateRepo(repoId: number, fields: UpdateRepoFields): Promise<void>;
   deleteRepo(repoId: number): Promise<void>;
@@ -153,6 +155,7 @@ export function createDbClient(dbPath: string): DbClient {
     listReposForUser: (userId) => call<RepoRow[]>("listReposForUser", [userId]),
     getUserRepos: (userId) => call<RepoRow[]>("getUserRepos", [userId]),
     getRepo: (repoId) => call<RepoRow | null>("getRepo", [repoId]),
+    getRepoAdmin: (repoId) => call<FullRepoRow | null>("getRepoAdmin", [repoId]),
     createRepo: (fields) => call<number>("createRepo", [fields]),
     updateRepo: (repoId, fields) => call<void>("updateRepo", [repoId, fields]),
     deleteRepo: (repoId) => call<void>("deleteRepo", [repoId]),

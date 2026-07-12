@@ -380,6 +380,55 @@ describe("getRepo / createRepo / updateRepo / deleteRepo（v1 database.py 同语
     expect(storage.getRepo(999)).toBeNull();
   });
 
+  it("getRepoAdmin 返回完整行（含 cred_username/cred_token/local_path/last_sync_*/index_status），plain getRepo 不带这些字段", () => {
+    const repoId = storage.createRepo({
+      name: "demo",
+      url: "https://example.com/demo.git",
+      description: "desc",
+      branch: "main",
+      credUsername: "bot",
+      credToken: "secret-token",
+    });
+    storage.updateRepo(repoId, {
+      localPath: "/data/repos/demo",
+      lastSyncAt: "2020-01-01T00:00:00.000000",
+      lastSyncStatus: "ok",
+      lastSyncMessage: "synced",
+      indexStatus: "indexed",
+      lastSyncSha: "abc123",
+    });
+
+    const full = storage.getRepoAdmin(repoId);
+    expect(full).toMatchObject({
+      id: repoId,
+      name: "demo",
+      url: "https://example.com/demo.git",
+      description: "desc",
+      branch: "main",
+      access_level: null,
+      cred_username: "bot",
+      cred_token: "secret-token",
+      local_path: "/data/repos/demo",
+      last_sync_at: "2020-01-01T00:00:00.000000",
+      last_sync_status: "ok",
+      last_sync_message: "synced",
+      index_status: "indexed",
+      last_sync_sha: "abc123",
+    });
+    expect(full!.created_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+
+    // plain getRepo stays narrow — proves this is an addition, not a silent widening
+    const narrow = storage.getRepo(repoId) as Record<string, unknown>;
+    expect("cred_username" in narrow).toBe(false);
+    expect("cred_token" in narrow).toBe(false);
+    expect("local_path" in narrow).toBe(false);
+    expect("last_sync_at" in narrow).toBe(false);
+  });
+
+  it("getRepoAdmin 查无此仓库 ⇒ null", () => {
+    expect(storage.getRepoAdmin(999)).toBeNull();
+  });
+
   it("deleteRepo 级联删除 permissions（显式两条 DELETE，先 permissions 后 repositories）", () => {
     const uid = storage.createUser("alice", "hashed-pw", "user");
     const repoId = storage.createRepo({ name: "demo", url: "https://example.com/demo.git" });
