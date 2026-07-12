@@ -20,9 +20,14 @@
 // strictFunctionTypes contravariance.
 import type { TSchema, Static } from "@sinclair/typebox";
 
-/** Placeholder per-call context. Repo-scoped access arrives in Phase 4;
- * for now every tool gets the same empty-ish plain object. */
-export type ToolContext = Record<string, unknown>;
+/** Per-call tool context with repo-scoped access permissions (Phase 4).
+ * Values arrive from the per-turn turn.ts caller (Task 8 wires real values;
+ * until then, call sites use empty-safe defaults). */
+export type ToolContext = {
+  allowedRepoPaths: string[]; // already realpath'd repo root directories
+  unsyncedRepoNames: string[]; // permitted but never synced (local_path empty)
+  userId: number | null; // current turn's user id, or null if unauthed
+};
 
 export type ToolDef<T extends TSchema = TSchema> = {
   name: string;

@@ -16,6 +16,12 @@ import { runTurnThroughAdapter } from "./agent-harness.js";
 // A minimal hand-built ToolDef for exercising registry/toPiTools in
 // isolation, without depending on calculator.ts's own registration side
 // effect or its specific schema.
+const defaultContext = {
+  allowedRepoPaths: [],
+  unsyncedRepoNames: [],
+  userId: null,
+};
+
 function makeDummyTool(name: string, execute: ToolDef["execute"] = async () => "ok"): ToolDef {
   return {
     name,
@@ -60,7 +66,7 @@ describe("registry — registerTool / listTools", () => {
 });
 
 describe("calculator — arithmetic (v1-parity: 1+1=2, 2*(3+4)=14, 10/4=2.5)", () => {
-  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, defaultContext);
 
   it("1+1 = 2", async () => {
     expect(await evalExpr("1+1")).toBe("2");
@@ -100,7 +106,7 @@ describe("calculator — arithmetic (v1-parity: 1+1=2, 2*(3+4)=14, 10/4=2.5)", (
 });
 
 describe("calculator — errors are returned as text, never thrown (v1 registry fault-tolerance semantics)", () => {
-  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, defaultContext);
 
   it("division by zero returns v1's error text, does not throw", async () => {
     await expect(evalExpr("5/0")).resolves.toMatch(/^Error: division by zero$/);
@@ -147,7 +153,7 @@ describe("calculator — errors are returned as text, never thrown (v1 registry 
 describe("toPiTools — maps ToolDef[] to pi's AgentTool[] shape", () => {
   it("maps name/description/schema straight through (typebox schema fed directly to pi)", () => {
     const def = makeDummyTool("__pi_shape__");
-    const [piTool] = toPiTools([def], {});
+    const [piTool] = toPiTools([def], defaultContext);
     expect(piTool.name).toBe("__pi_shape__");
     expect(piTool.description).toBe("__pi_shape__ description");
     expect(piTool.parameters).toBe(def.schema);
@@ -159,7 +165,7 @@ describe("toPiTools — maps ToolDef[] to pi's AgentTool[] shape", () => {
 
   it("a successful execute resolves to pi's AgentToolResult shape: {content:[{type:'text',text}], details:{}}", async () => {
     const def = makeDummyTool("__pi_success__", async () => "the-result");
-    const [piTool] = toPiTools([def], {});
+    const [piTool] = toPiTools([def], defaultContext);
     const result = await piTool.execute("tool_call_1", { x: "a" } as never);
     expect(result).toEqual({ content: [{ type: "text", text: "the-result" }], details: {} });
   });
@@ -168,7 +174,11 @@ describe("toPiTools — maps ToolDef[] to pi's AgentTool[] shape", () => {
     const def = makeDummyTool("__pi_ctx__", async (_input, ctx) =>
       JSON.stringify(ctx),
     );
-    const ctx = { marker: "phase3" };
+    const ctx = {
+      allowedRepoPaths: ["/repos/test"],
+      unsyncedRepoNames: [],
+      userId: 123,
+    };
     const [piTool] = toPiTools([def], ctx);
     const result = await piTool.execute("tool_call_1", { x: "a" } as never);
     expect(result.content).toEqual([{ type: "text", text: JSON.stringify(ctx) }]);
@@ -178,7 +188,7 @@ describe("toPiTools — maps ToolDef[] to pi's AgentTool[] shape", () => {
     const def = makeDummyTool("__pi_throws__", async () => {
       throw new Error("boom");
     });
-    const [piTool] = toPiTools([def], {});
+    const [piTool] = toPiTools([def], defaultContext);
     const result = await piTool.execute("tool_call_1", { x: "a" } as never);
     expect(result.content).toHaveLength(1);
     expect(result.content[0]).toMatchObject({ type: "text" });
@@ -189,12 +199,12 @@ describe("toPiTools — maps ToolDef[] to pi's AgentTool[] shape", () => {
     const def = makeDummyTool("__pi_throws_2__", async () => {
       throw new Error("kaboom");
     });
-    const [piTool] = toPiTools([def], {});
+    const [piTool] = toPiTools([def], defaultContext);
     await expect(piTool.execute("id", { x: "a" } as never)).resolves.toBeDefined();
   });
 
   it("end-to-end: the real calculator ToolDef through toPiTools behaves like a pi tool", async () => {
-    const piTools: AgentTool[] = toPiTools([calculatorTool], {});
+    const piTools: AgentTool[] = toPiTools([calculatorTool], defaultContext);
     const calc = piTools.find((t) => t.name === "calculator");
     expect(calc).toBeDefined();
     const result = await calc!.execute("id", { expression: "1+1" } as never);
@@ -207,7 +217,7 @@ describe("toPiTools — maps ToolDef[] to pi's AgentTool[] shape", () => {
 // `python3 -c` (or `python3 -c` + `ast.dump`/`repr(str(e))` for precision),
 // not recalled from memory, per the fix instructions.
 describe("calculator — float result formatting matches Python str() (H2)", () => {
-  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, defaultContext);
 
   it("4/2 = 2.0, not 2 — true division (/) always yields float, even for an exact int/int result", async () => {
     expect(await evalExpr("4/2")).toBe("2.0");
@@ -229,7 +239,7 @@ describe("calculator — float result formatting matches Python str() (H2)", () 
 });
 
 describe("calculator — per-operator, floatness-aware zero-division error text, verbatim from Python's ZeroDivisionError (H1)", () => {
-  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, defaultContext);
 
   it("/ by zero: int/int -> 'division by zero', float-involved -> 'float division by zero'", async () => {
     expect(await evalExpr("5/0")).toBe("Error: division by zero");
@@ -256,7 +266,7 @@ describe("calculator — per-operator, floatness-aware zero-division error text,
 });
 
 describe("calculator — ** and // added to match v1's _SAFE_BINOPS exactly (M1)", () => {
-  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, defaultContext);
 
   it("2**3 = 8 (int ** non-negative int -> int)", async () => {
     expect(await evalExpr("2**3")).toBe("8");
@@ -292,7 +302,7 @@ describe("calculator — ** and // added to match v1's _SAFE_BINOPS exactly (M1)
 });
 
 describe("calculator — % follows Python's floored-division sign (result takes the divisor's sign), not JS's native truncated-remainder %", () => {
-  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, defaultContext);
 
   it("-7%2 = 1 in Python; JS's native -7 % 2 is -1 — ported by hand via the floor-division identity, not JS's % operator", async () => {
     expect(await evalExpr("-7%2")).toBe("1");
@@ -308,7 +318,7 @@ describe("calculator — v1 Pow bounds: exponent checked FIRST, then base, both 
   // calculator() (tagged source executed via python3 with the registry
   // import stubbed), not derived from reading its f-strings — see Task 3
   // fix report (M3/M4 pass) for the oracle transcript.
-  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, defaultContext);
 
   it("|base| > 10000 -> Base error, v1 template verbatim (value rendered int-style)", async () => {
     expect(await evalExpr("20000**2")).toBe("Error: Base too large (20000, max ±10000)");
@@ -342,7 +352,7 @@ describe("calculator — v1 Pow bounds: exponent checked FIRST, then base, both 
 });
 
 describe("calculator — int results with |value| > 1e15 render as Python f'{:.6e}' (M4)", () => {
-  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, defaultContext);
 
   it("1000000000*10000000 = 1e16 -> '1.000000e+16' (JS toExponential(6) byte-matches Python :.6e here)", async () => {
     expect(await evalExpr("1000000000*10000000")).toBe("1.000000e+16");
@@ -389,7 +399,7 @@ describe("calculator through the real pi pipeline — typebox↔pi regression gu
     ]);
     try {
       const events = await runTurnThroughAdapter(mock, "6*7 是多少?", {
-        tools: toPiTools([calculatorTool], {}),
+        tools: toPiTools([calculatorTool], defaultContext),
       });
 
       const toolUse = events.find((e) => e.type === "tool_use")?.data as

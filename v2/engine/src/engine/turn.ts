@@ -311,7 +311,11 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
     initialState: {
       systemPrompt: settings.systemPrompt,
       model: setup.model,
-      tools: toPiTools(tools, {}),
+      tools: toPiTools(tools, {
+        allowedRepoPaths: [],
+        unsyncedRepoNames: [],
+        userId: null,
+      }),
       messages: initialMessages,
     },
     streamFn: setup.streamFn,
