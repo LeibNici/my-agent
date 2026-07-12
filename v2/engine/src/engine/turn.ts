@@ -66,6 +66,20 @@ const WRAPUP_PROMPT =
   "3. 还缺什么证据、下一步应该查什么\n" +
   "即使结论不完整也要如实汇报，这份汇报会直接展示给用户。";
 
+// v1's checkpoint-of-last-resort: when the wrap-up call streams no usable
+// text (empty completion OR an in-band error terminal — pi never throws),
+// this copy carries the turn instead. v1 gates on `not wrap_text.strip()`
+// (whitespace-only counts as empty) and the fallback REPLACES wrap_text, so
+// done.text is exactly this string.
+const WRAPUP_FALLBACK =
+  "本轮工具调用预算已用尽，且未能生成阶段性汇报。" +
+  "上面的工具调用记录包含了已经查到的信息，可点击「继续调查」在此基础上继续。";
+
+// v1's _WRAPUP_MAX_TOKENS: "a synthesis call, not another investigation
+// window" — caps ONLY the wrap-up request; loop calls keep settings.maxTokens
+// (riding on the Model object's own maxTokens field).
+const WRAPUP_MAX_TOKENS = 1200;
+
 /** Port of app/agent.py::_budget_reminder. `nextIteration` is the 0-based
  * call index of the LLM call ABOUT TO BE MADE (matches v1's `iteration + 1`
  * — computed once per completed iteration and read by the following call).
@@ -199,17 +213,47 @@ async function runWrapup(
     content: [{ type: "text", text: WRAPUP_PROMPT }],
     timestamp: Date.now(),
   };
+  const callStartMs = Date.now();
+  let firstTextDeltaMs: number | undefined;
   const stream = await setup.models.streamSimple(
     setup.model,
     { systemPrompt: settings.systemPrompt, messages: [...transcript, wrapupMessage], tools: [] },
-    { apiKey: settings.apiKey },
+    { apiKey: settings.apiKey, maxTokens: WRAPUP_MAX_TOKENS },
   );
   let text = "";
   for await (const event of stream) {
     if (event.type === "text_delta") {
+      if (firstTextDeltaMs === undefined) firstTextDeltaMs = Date.now();
       text += event.delta;
       channel.put({ type: "text_delta", data: { text: event.delta } });
     }
+  }
+  // result() resolves for BOTH terminal shapes (done => message, in-band
+  // error => the error AssistantMessage with zeroed usage) — pi's StreamFn
+  // contract means this await can't reject for LLM/transport failures.
+  const result = await stream.result();
+  // The wrap-up's own metrics row, numbered exactly like v1's wrap-up yield:
+  // `"iteration": settings.max_tool_iterations` — the loop's rows are 0-based
+  // 0..max-1, so the wrap-up continues the sequence at max. ttft/total are
+  // measured wall-clock the same way the event adapter does for loop calls
+  // (v1 hardcoded ttft_ms=None here; measuring is a deliberate v2 upgrade —
+  // see task-4-report.md).
+  channel.put({
+    type: "llm_metrics",
+    data: {
+      iteration: settings.maxToolIterations,
+      model: settings.model,
+      inputTokens: result.usage.input,
+      outputTokens: result.usage.output,
+      ttftMs: firstTextDeltaMs !== undefined ? firstTextDeltaMs - callStartMs : null,
+      totalMs: Date.now() - callStartMs,
+    },
+  });
+  // v1 order preserved: metrics first, THEN the fallback delta (if the
+  // stream produced nothing), then done carrying the same text.
+  if (!text.trim()) {
+    text = WRAPUP_FALLBACK;
+    channel.put({ type: "text_delta", data: { text } });
   }
   channel.put({ type: "done", data: { text, success: true, budgetExhausted: true } });
 }

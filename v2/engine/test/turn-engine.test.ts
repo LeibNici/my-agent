@@ -12,7 +12,7 @@ import { describe, it, expect } from "vitest";
 import { loadSettings, type Settings } from "../src/config.js";
 import { calculatorTool } from "../src/tools/calculator.js";
 import { runTurn } from "../src/engine/turn.js";
-import { startMock, textTurn, toolTurn, textThenToolTurn, type MockServer } from "./mock-anthropic.js";
+import { startMock, textTurn, toolTurn, textThenToolTurn, type MockServer, type SseEvent } from "./mock-anthropic.js";
 import type { DomainEvent } from "../src/domain.js";
 
 // loadSettings({}) yields every field at its documented default (no env,
@@ -151,6 +151,97 @@ describe("runTurn — turn engine (Task 4)", () => {
     expect(secondBody).not.toContain("第一轮问题");
     expect(secondBody).not.toContain("第一轮回复");
     expect(secondBody).toContain("第二轮问题");
+    await mock.close();
+  });
+});
+
+// v1-python-final:app/agent.py::_WRAPUP_FALLBACK, verbatim (byte-verified
+// against the tagged source via the same extraction script as the other
+// reminder strings — 180 bytes). Deliberately HARDCODED here rather than
+// imported from turn.ts: importing would make the assertion circular (a
+// typo in the production constant would pass its own echo).
+const WRAPUP_FALLBACK =
+  "本轮工具调用预算已用尽，且未能生成阶段性汇报。" +
+  "上面的工具调用记录包含了已经查到的信息，可点击「继续调查」在此基础上继续。";
+
+/** A scripted assistant turn that completes normally but streams NO text at
+ * all (no content blocks) — the Node twin of v1's `text_turn([])`, which is
+ * what test_wrapup_falls_back_when_first_attempt_streams_no_text drives:
+ * "completes successfully yet produces zero text" is NOT the error path. */
+function emptyTextTurn(): SseEvent[] {
+  return [
+    {
+      type: "message_start",
+      message: {
+        id: "m1",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: "mock",
+        usage: { input_tokens: 10, output_tokens: 0 },
+      },
+    },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } },
+    { type: "message_stop" },
+  ];
+}
+
+describe("runTurn — wrap-up v1 parity（review fix：fallback 文本、metrics 行、1200 token 上限）", () => {
+  it("wrap-up 零文本 ⇒ _WRAPUP_FALLBACK 逐字：单条 text_delta + done.text 都是 fallback（v1 test_wrapup_falls_back_when_first_attempt_streams_no_text）", async () => {
+    const turns = exhaustingTurns();
+    turns[8] = emptyTextTurn(); // wrap-up completes normally, streams no text
+    const mock = startMock(turns);
+    const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
+    const events = await collect(
+      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+    );
+    expect(mock.requests.length).toBe(9); // no retry — the attempt didn't fail
+    const textDeltas = events
+      .filter((e): e is Extract<DomainEvent, { type: "text_delta" }> => e.type === "text_delta")
+      .map((e) => e.data.text);
+    expect(textDeltas).toEqual([WRAPUP_FALLBACK]); // only the fallback was emitted, as ONE delta
+    const done = events.at(-1)!;
+    expect(done.type).toBe("done");
+    expect(done.data).toEqual({ text: WRAPUP_FALLBACK, success: true, budgetExhausted: true });
+    await mock.close();
+  });
+
+  it("wrap-up 有自己的 llm_metrics 行：共 maxToolIterations+1 条，末条 iteration === maxToolIterations（v1 的 numbering），usage 来自 wrap-up 响应", async () => {
+    const mock = startMock(exhaustingTurns());
+    const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
+    const events = await collect(
+      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+    );
+    const metrics = events.filter(
+      (e): e is Extract<DomainEvent, { type: "llm_metrics" }> => e.type === "llm_metrics",
+    );
+    expect(metrics.length).toBe(9); // 8 loop calls + 1 wrap-up
+    // Loop metrics keep the adapter's 0..7; the wrap-up row continues at
+    // exactly settings.max_tool_iterations — v1's literal
+    // `"iteration": settings.max_tool_iterations` in the wrap-up yield.
+    expect(metrics.map((m) => m.data.iteration)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    const wrap = metrics.at(-1)!.data;
+    expect(wrap.model).toBe("mock");
+    expect(wrap.inputTokens).toBe(10); // mock's message_start usage
+    expect(wrap.outputTokens).toBe(5); // mock's message_delta usage
+    expect(typeof wrap.totalMs).toBe("number");
+    expect(typeof wrap.ttftMs).toBe("number"); // text streamed ⇒ measured, adapter-style
+    // v1 event order around the wrap-up: …text_delta → llm_metrics → done
+    // (metrics is yielded right after the stream ends, before done).
+    expect(events.slice(-3).map((e) => e.type)).toEqual(["text_delta", "llm_metrics", "done"]);
+    await mock.close();
+  });
+
+  it("wrap-up 请求体 max_tokens === 1200（v1 _WRAPUP_MAX_TOKENS——收敛调用，不是又一轮调查窗口）；循环调用不受影响", async () => {
+    const mock = startMock(exhaustingTurns());
+    const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
+    await collect(
+      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+    );
+    const loopBody = mock.requests[0]?.body as { max_tokens?: number };
+    const wrapBody = mock.requests[8]?.body as { max_tokens?: number };
+    expect(loopBody.max_tokens).toBe(4096); // settings default rides the loop calls
+    expect(wrapBody.max_tokens).toBe(1200); // _WRAPUP_MAX_TOKENS caps only the wrap-up
     await mock.close();
   });
 });
