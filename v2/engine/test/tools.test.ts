@@ -10,6 +10,8 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { registerTool, listTools, type ToolDef } from "../src/tools/registry.js";
 import { calculatorTool } from "../src/tools/calculator.js";
 import { toPiTools } from "../src/engine/pi-tools.js";
+import { startMock, toolTurn, textTurn } from "./mock-anthropic.js";
+import { runTurnThroughAdapter } from "./agent-harness.js";
 
 // A minimal hand-built ToolDef for exercising registry/toPiTools in
 // isolation, without depending on calculator.ts's own registration side
@@ -84,8 +86,8 @@ describe("calculator — arithmetic (v1-parity: 1+1=2, 2*(3+4)=14, 10/4=2.5)", (
     expect(await evalExpr("((1+2)*3)")).toBe("9");
   });
 
-  it("supports decimals", async () => {
-    expect(await evalExpr("1.5+2.5")).toBe("4");
+  it("supports decimals — float result formatting matches Python str() (1.5+2.5 is two float literals, str(4.0) === \"4.0\", not bare \"4\") (H2)", async () => {
+    expect(await evalExpr("1.5+2.5")).toBe("4.0");
   });
 
   it("ignores surrounding/internal whitespace", async () => {
@@ -104,8 +106,8 @@ describe("calculator — errors are returned as text, never thrown (v1 registry 
     await expect(evalExpr("5/0")).resolves.toMatch(/^Error: division by zero$/);
   });
 
-  it("modulo by zero returns error text, does not throw", async () => {
-    await expect(evalExpr("5%0")).resolves.toMatch(/^Error: division by zero$/);
+  it("modulo by zero returns v1's exact ZeroDivisionError text for int%int ('integer modulo by zero'), not the generic /-by-zero message (H1)", async () => {
+    await expect(evalExpr("5%0")).resolves.toBe("Error: integer modulo by zero");
   });
 
   it("letters are rejected as illegal characters, returned as error text", async () => {
@@ -135,7 +137,7 @@ describe("calculator — errors are returned as text, never thrown (v1 registry 
   });
 
   it("never throws regardless of input — execute always resolves", async () => {
-    const inputs = ["", "   ", "((((", "1/0", "1%0", "@#$", "1..2", "()"];
+    const inputs = ["", "   ", "((((", "1/0", "1%0", "@#$", "1..2", "()", "1//0", "2**", "0**-1"];
     for (const expression of inputs) {
       await expect(evalExpr(expression)).resolves.toEqual(expect.any(String));
     }
@@ -197,5 +199,145 @@ describe("toPiTools — maps ToolDef[] to pi's AgentTool[] shape", () => {
     expect(calc).toBeDefined();
     const result = await calc!.execute("id", { expression: "1+1" } as never);
     expect(result.content).toEqual([{ type: "text", text: "2" }]);
+  });
+});
+
+// Fix-pass tests below (review findings H1/H2/M1/M2 — see Task 3 fix
+// report). Every target string/value was verified by actually running
+// `python3 -c` (or `python3 -c` + `ast.dump`/`repr(str(e))` for precision),
+// not recalled from memory, per the fix instructions.
+describe("calculator — float result formatting matches Python str() (H2)", () => {
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+
+  it("4/2 = 2.0, not 2 — true division (/) always yields float, even for an exact int/int result", async () => {
+    expect(await evalExpr("4/2")).toBe("2.0");
+  });
+
+  it("float contagion from either operand: int + float and float + int both render with a trailing .0", async () => {
+    expect(await evalExpr("2.0+3")).toBe("5.0");
+    expect(await evalExpr("2+3.0")).toBe("5.0");
+  });
+
+  it("int op int (no '.' literal anywhere) stays a bare int, no trailing .0", async () => {
+    expect(await evalExpr("7+2")).toBe("9");
+    expect(await evalExpr("7*2")).toBe("14");
+  });
+
+  it("negative-zero float keeps Python's sign in str() — str(-0.0) === \"-0.0\"; plain JS String(-0) silently drops it to \"0\"", async () => {
+    expect(await evalExpr("0/-1")).toBe("-0.0");
+  });
+});
+
+describe("calculator — per-operator, floatness-aware zero-division error text, verbatim from Python's ZeroDivisionError (H1)", () => {
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+
+  it("/ by zero: int/int -> 'division by zero', float-involved -> 'float division by zero'", async () => {
+    expect(await evalExpr("5/0")).toBe("Error: division by zero");
+    expect(await evalExpr("5.0/0")).toBe("Error: float division by zero");
+    expect(await evalExpr("5/0.0")).toBe("Error: float division by zero");
+  });
+
+  it("% by zero: int/int -> 'integer modulo by zero', float-involved -> 'float modulo' (no 'by zero' suffix on the float case — verified against real Python, not assumed)", async () => {
+    expect(await evalExpr("5%0")).toBe("Error: integer modulo by zero");
+    expect(await evalExpr("5.0%0")).toBe("Error: float modulo");
+    expect(await evalExpr("5%0.0")).toBe("Error: float modulo");
+  });
+
+  it("// by zero: int/int -> 'integer division or modulo by zero', float-involved -> 'float floor division by zero'", async () => {
+    expect(await evalExpr("5//0")).toBe("Error: integer division or modulo by zero");
+    expect(await evalExpr("5.0//0")).toBe("Error: float floor division by zero");
+    expect(await evalExpr("5//0.0")).toBe("Error: float floor division by zero");
+  });
+
+  it("0 ** negative exponent: Python raises ZeroDivisionError (not Infinity), same wording regardless of int/float typing", async () => {
+    expect(await evalExpr("0**-1")).toBe("Error: 0.0 cannot be raised to a negative power");
+    expect(await evalExpr("0.0**-1")).toBe("Error: 0.0 cannot be raised to a negative power");
+  });
+});
+
+describe("calculator — ** and // added to match v1's _SAFE_BINOPS exactly (M1)", () => {
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+
+  it("2**3 = 8 (int ** non-negative int -> int)", async () => {
+    expect(await evalExpr("2**3")).toBe("8");
+  });
+
+  it("2**0.5 matches Python's str(2**0.5) exactly (shortest-roundtrip float repr)", async () => {
+    expect(await evalExpr("2**0.5")).toBe("1.4142135623730951");
+  });
+
+  it("2**-1 = 0.5 — a negative int exponent still produces a float result even though neither operand is written as a float literal", async () => {
+    expect(await evalExpr("2**-1")).toBe("0.5");
+  });
+
+  it("10//3 = 3 (positive operands, floor === truncate here)", async () => {
+    expect(await evalExpr("10//3")).toBe("3");
+  });
+
+  it("-7//2 = -4 — Python floor division rounds toward negative infinity, not toward zero (truncation would give -3)", async () => {
+    expect(await evalExpr("-7//2")).toBe("-4");
+  });
+
+  it("7.0//2 = 3.0 — float-involved floor division still floors, but stays a float", async () => {
+    expect(await evalExpr("7.0//2")).toBe("3.0");
+  });
+
+  it("-2**2 = -4 — ** binds tighter than a LEADING unary minus (Python: factor := unary factor | power, power := primary ['**' factor]), so this is -(2**2), not (-2)**2", async () => {
+    expect(await evalExpr("-2**2")).toBe("-4");
+  });
+
+  it("2**3**2 = 512 — ** is right-associative (2**(3**2) = 512), not left-associative ((2**3)**2 would be 64)", async () => {
+    expect(await evalExpr("2**3**2")).toBe("512");
+  });
+});
+
+describe("calculator — % follows Python's floored-division sign (result takes the divisor's sign), not JS's native truncated-remainder %", () => {
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+
+  it("-7%2 = 1 in Python; JS's native -7 % 2 is -1 — ported by hand via the floor-division identity, not JS's % operator", async () => {
+    expect(await evalExpr("-7%2")).toBe("1");
+  });
+
+  it("7%-2 = -1 in Python; JS's native 7 % -2 is +1", async () => {
+    expect(await evalExpr("7%-2")).toBe("-1");
+  });
+});
+
+describe("calculator through the real pi pipeline — typebox↔pi regression guard (M2)", () => {
+  // registry.ts/calculator.ts build CalculatorParams from @sinclair/typebox
+  // @0.34.13 (v2/engine's own declared dependency), but
+  // @earendil-works/pi-agent-core / pi-ai depend on a *different*, unscoped
+  // typebox@1.1.38 package for their own TSchema/argument validation (see
+  // Task 3 report's "typebox vs pi's typebox" section — verified there with
+  // a throwaway probe that was never committed as a real test). `tsc
+  // --noEmit` alone only proves the two packages' *types* line up
+  // structurally; it can't prove pi's REAL runtime argument validator,
+  // built against ITS OWN typebox instance, actually accepts and correctly
+  // parses a schema object built from the OTHER package. This drives a real
+  // pi Agent (the Task 6/7 offline mock-Anthropic rig) through a scripted
+  // tool_use turn using the real calculatorTool mapped through the real
+  // toPiTools, proving the whole path end to end rather than only the
+  // type-level compatibility tsc already checks.
+  it("a scripted tool_use turn round-trips through toPiTools([calculatorTool]) with pi's own argument validation delivering correctly-typed args", async () => {
+    const mock = startMock([
+      toolTurn("calculator", { expression: "6*7" }, "tu_regress"),
+      textTurn("答案是 42"),
+    ]);
+
+    const events = await runTurnThroughAdapter(mock, "6*7 是多少?", {
+      tools: toPiTools([calculatorTool], {}),
+    });
+
+    const toolUse = events.find((e) => e.type === "tool_use")?.data as
+      | { id: string; name: string; input: Record<string, unknown> }
+      | undefined;
+    expect(toolUse).toEqual({ id: "tu_regress", name: "calculator", input: { expression: "6*7" } });
+
+    const toolResult = events.find((e) => e.type === "tool_result")?.data as
+      | { id: string; result: string }
+      | undefined;
+    expect(toolResult).toEqual({ id: "tu_regress", result: "42" });
+
+    await mock.close();
   });
 });
