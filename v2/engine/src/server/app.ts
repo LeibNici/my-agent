@@ -24,14 +24,20 @@ import { createToken, decodeToken, verifyPassword, AuthError } from "../auth.js"
 import { listTools } from "../tools/registry.js";
 import "../tools/calculator.js"; // side-effecting registration — this phase's one real tool
 import { chatEventStream, userOwnsSession, type ChatRequestBody, type CurrentUser } from "./sse.js";
+import { mountAdminRoutes, type SyncAndPersistFn } from "./admin-routes.js";
 
 export type BuildAppDeps = {
   db: DbClient;
   settings: Settings;
   engine: RunTurnFn;
+  // Task 7: injectable so tests can swap in repo-sync.ts's
+  // __internal.syncAndPersistUnvalidated (real git, no SSRF gate) against a
+  // local temp bare repo — production (src/server/main.ts) never sets this,
+  // so admin-routes.ts defaults to the real, SSRF-gated export.
+  syncAndPersist?: SyncAndPersistFn;
 };
 
-type Env = { Variables: { user: CurrentUser } };
+export type Env = { Variables: { user: CurrentUser } };
 
 // web/ lives at the repo root, two levels up from v2/engine
 // (<root>/v2/engine/src/server/app.ts -> <root>/web). Resolved from THIS
@@ -213,6 +219,23 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
       }
     });
   });
+
+  // ==================== Admin ====================
+  // Task 7: user/repo/permission CRUD, port of v1's
+  // `app/admin.py`'s users/repos/permissions sections. v1's `require_admin`
+  // dependency is a role check layered ON TOP of `get_current_user` (401
+  // for missing/invalid token, then 403 for an authenticated non-admin) —
+  // the /api/* auth middleware above already covers the 401 half for every
+  // /api/admin/* path (it's a subset of /api/*, checked first since it was
+  // registered first), so this middleware only needs the role check, with
+  // the same {detail: "Admin access required"} text v1's require_admin uses.
+  app.use("/api/admin/*", async (c, next) => {
+    if (c.get("user").role !== "admin") {
+      return c.json({ detail: "Admin access required" }, 403);
+    }
+    await next();
+  });
+  mountAdminRoutes(app, deps);
 
   // ==================== Static frontend ====================
   // Mirrors v1's `app.mount("/static", StaticFiles(directory="web"))` +
