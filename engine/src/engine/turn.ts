@@ -8,8 +8,7 @@
 // `git show v1-python-final:tests/test_agent_budget.py`.
 //
 // pi types are allowed in this file per the Phase-3 Global Constraints
-// amendment (docs/superpowers/plans/2026-07-12-pi-phase3-node-service.md) —
-// otherwise the three-layer isolation confines them to
+// amendment — otherwise the three-layer isolation confines them to
 // codec-pi.ts/event-adapter.ts.
 //
 // runTurn is deliberately pure: history in, DomainEvents out. Persisting

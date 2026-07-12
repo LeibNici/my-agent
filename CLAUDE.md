@@ -96,12 +96,6 @@ Schema ownership: with Python gone, **Node owns DDL** (Phase 3 adds
 
 ## Where decisions live
 
-- `docs/superpowers/plans/GATE.md` — the go decision for the pi engine,
-  with open-question closure evidence
-- `docs/superpowers/plans/2026-07-11-*.md` — phase plans (gates spike,
-  Phase 1 anticorruption layer, Phase 2 DB compat). Historical docs;
-  their "strangler/shadow" phasing predates the no-users pivot to a
-  straight rewrite.
 - `engine/README.md` — layer boundary rules, Phase-1 limitations,
   DB byte-compat facts and known gaps
 - `spikes/` — frozen evidence from the 0A/0B validation gates; never

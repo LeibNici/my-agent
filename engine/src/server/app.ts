@@ -2,8 +2,7 @@
 // session/auth/config/skills/repos APIs, static frontend. Port of
 // `git show v1-python-final:app/main.py` (routes) with the admin/issue/
 // feedback/code-viewer/repo-sync surface deliberately deferred to
-// Phase 4/5 (see docs/superpowers/plans/2026-07-12-pi-phase3-node-service.md's
-// self-review — those pages 404 for now, which is expected).
+// Phase 4/5 — those pages 404 for now, which is expected.
 //
 // engine is injected (RunTurnFn) rather than imported directly — this is
 // what lets the SSE route tests script a stub turn generator with no
