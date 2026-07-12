@@ -94,7 +94,7 @@ function stripTrailingSep(p: string): string {
  * symlink, and the tools would report "no index" forever even though
  * buildIndex succeeded.
  */
-function indexPath(repoPath: string): string {
+export function indexPath(repoPath: string): string {
   return stripTrailingSep(realpathOrResolve(repoPath)) + ".tags.json";
 }
 
@@ -161,7 +161,10 @@ export async function buildIndex(repoPath: string): Promise<boolean> {
 // _TAGS_CACHE / _load_tags port
 // ---------------------------------------------------------------------------
 
-type Tag = {
+// Exported (not just internal): chunking.ts (semantic-search Phase 4b) is a
+// genuine production consumer of this type, mirroring v1's `from
+// app.tools.symbol_index import _index_path as _tags_path, _load_tags`.
+export type Tag = {
   _type?: string;
   name: string;
   path: string;
@@ -183,7 +186,7 @@ const TAGS_CACHE = new Map<string, { mtimeMs: number; tags: Tag[] }>();
 
 /** null means "no index available" (ctags missing or never built),
  * distinct from an empty array (indexed, genuinely no symbols). */
-function loadTags(repoPath: string): Tag[] | null {
+export function loadTags(repoPath: string): Tag[] | null {
   const idxPath = indexPath(repoPath);
   let mtimeMs: number;
   try {
