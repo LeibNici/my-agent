@@ -29,9 +29,10 @@ legacy JSON (DB / 旧前端原始 dict，snake_case，tool_use_id/is_error)
 | `history-policy.ts` | `domain.ts` | legacy JSON、pi 类型 |
 | `codec-pi.ts` | `domain.ts` + pi 类型（`@earendil-works/pi-ai`） | legacy JSON 字段拼写 |
 | `event-adapter.ts` | `domain.ts` + pi 类型（`@earendil-works/pi-agent-core`/`pi-ai`） | legacy JSON 字段拼写 |
-| 其余消费方（Phase 2/3） | 只认 `domain.ts` 的 `DomainMessage`/`DomainEvent` | 不得直接 import pi 类型，也不得假设 legacy 字段拼写 |
+| `engine/pi-tools.ts`（Task 3 新增） | `tools/registry.ts` 的 `ToolDef`/`ToolContext` + pi 类型（`@earendil-works/pi-agent-core`） | legacy JSON 字段拼写 |
+| 其余消费方（Phase 2/3） | 只认 `domain.ts` 的 `DomainMessage`/`DomainEvent`；`tools/registry.ts`/`tools/calculator.ts` 只认 `ToolDef`（typebox + domain 术语） | 不得直接 import pi 类型，也不得假设 legacy 字段拼写 |
 
-即：pi 类型只允许出现在 `codec-pi.ts` 和 `event-adapter.ts`（及各自测试文件，`test/mock-anthropic.ts`/`test/agent-harness.ts`/`test/event-adapter.test.ts`/`test/integration.test.ts`）；domain 类型（`toolUseId`/`isError`，camelCase）是其它所有地方唯一认识的形状；legacy JSON 字段拼写（`tool_use_id`/`is_error`，snake_case）只在 `codec-legacy.ts` 内部出现，一旦跨过 `legacyToDomain`/`domainToLegacy` 这条边界就已经是 `DomainMessage`。
+即：pi 类型只允许出现在 `codec-pi.ts`、`event-adapter.ts` 和 `engine/pi-tools.ts`（及各自测试文件，`test/mock-anthropic.ts`/`test/agent-harness.ts`/`test/event-adapter.test.ts`/`test/integration.test.ts`/`test/tools.test.ts`）；domain 类型（`toolUseId`/`isError`，camelCase）是其它所有地方唯一认识的形状；legacy JSON 字段拼写（`tool_use_id`/`is_error`，snake_case）只在 `codec-legacy.ts` 内部出现，一旦跨过 `legacyToDomain`/`domainToLegacy` 这条边界就已经是 `DomainMessage`。`tools/registry.ts` 的 `ToolDef` 只认 typebox（`@sinclair/typebox`）+ 纯字符串/Promise，不认 pi 类型——`engine/pi-tools.ts` 的 `toPiTools()` 是唯一的转换点（`ToolDef[] -> AgentTool[]`），typebox schema 直接喂给 pi 的 `parameters` 字段，无需转换（两个 typebox 包— 本仓库固定依赖的 `@sinclair/typebox@0.34.13` 和 pi 自己依赖的、不同的 unscoped `typebox@1.1.38` — 经 Task 3 验证类型和运行时均兼容，细节见 Task 3 report）。
 
 ## 本包导出什么
 
