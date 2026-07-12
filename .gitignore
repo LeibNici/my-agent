@@ -5,3 +5,4 @@ venv/
 .venv/
 .env
 .jwt_secret
+.ccg/
