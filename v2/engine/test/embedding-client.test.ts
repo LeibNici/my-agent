@@ -454,3 +454,43 @@ describe("embedAndSaveIndex — build timeout", () => {
     expect(capturedSignal?.aborted).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// embedAndSaveIndex — per-batch 60s timeout (v1's httpx timeout=60, ported
+// alongside the whole-build 1800s AbortController)
+// ---------------------------------------------------------------------------
+
+describe("embedAndSaveIndex — per-batch 60s timeout", () => {
+  it("单个 batch 挂起且从不响应，whole-build 信号从未触发 -> 该 batch 独立在 60s 处超时，不必等到 1800s；整体 build 远早于 1800s 就返回 false", async () => {
+    vi.useFakeTimers();
+    const settings = makeSettings();
+    let capturedSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((_url: string, init: { signal: AbortSignal }) => {
+      capturedSignal = init.signal;
+      // Never resolves on its own — the whole-build AbortController's 1800s
+      // timer is never advanced far enough to fire in this test, so the
+      // ONLY way this promise settles is the batch's own 60s timeout.
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const chunks = [makeChunk("a.ts", "foo", "aaa")];
+    const resultPromise = embedAndSaveIndex(repo, chunks, settings);
+
+    expect(capturedSignal?.aborted).not.toBe(true); // not aborted yet before the batch timeout elapses
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(capturedSignal?.aborted).not.toBe(true); // still short of the 60s per-batch bound
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(capturedSignal?.aborted).toBe(true); // fired at the 60s mark, NOT the 1800s whole-build mark
+
+    // Resolves to false having only simulated 60s total — nowhere near the
+    // 1800s whole-build bound (which was never advanced to and never fired).
+    await expect(resultPromise).resolves.toBe(false);
+  });
+});

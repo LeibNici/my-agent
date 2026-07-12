@@ -16,6 +16,7 @@ import { readEmbeddingIndex, writeEmbeddingIndex, type EmbeddingChunkMeta } from
 const EMBED_BATCH = 10; // DashScope text-embedding-v4 batch limit
 const CONCURRENCY = 4; // in-flight batch requests per build
 const BUILD_TIMEOUT_MS = 1800 * 1000;
+const BATCH_TIMEOUT_MS = 60 * 1000; // v1's per-request httpx timeout=60
 
 // ---------------------------------------------------------------------------
 // embeddingKeyOrFallback port
@@ -69,6 +70,27 @@ function embedInput(chunk: Chunk): string {
 type EmbedDataEntry = { index: number; embedding: number[] };
 
 /**
+ * Combines the whole-build AbortSignal with a fresh per-batch 60s bound,
+ * mirroring v1's per-request `httpx` `timeout=60` alongside this port's
+ * whole-build 1800s AbortController: whichever fires first wins. Built by
+ * hand with `setTimeout` + `AbortController` (rather than
+ * `AbortSignal.timeout()`, whose internal timer isn't driven by fake-timer
+ * mocking in tests) so it composes uniformly through `AbortSignal.any` and
+ * stays deterministically testable. Caller must invoke the returned `clear`
+ * once the request settles, so a fast batch doesn't leave a 60s timer
+ * dangling for the rest of the build.
+ */
+function withBatchTimeout(buildSignal: AbortSignal): { signal: AbortSignal; clear: () => void } {
+  const perBatch = new AbortController();
+  const timer = setTimeout(() => perBatch.abort(), BATCH_TIMEOUT_MS);
+  timer.unref?.();
+  return {
+    signal: AbortSignal.any([buildSignal, perBatch.signal]),
+    clear: () => clearTimeout(timer),
+  };
+}
+
+/**
  * POSTs one batch (<=EMBED_BATCH texts) to the embedding endpoint. Returns
  * the embeddings in REQUEST order (sorted by the response's `index` field,
  * matching v1's `sorted(data, key=lambda d: d["index"])`), or null on any
@@ -82,6 +104,7 @@ async function embedBatch(
   key: string,
   signal: AbortSignal,
 ): Promise<Float32Array[] | null> {
+  const { signal: requestSignal, clear } = withBatchTimeout(signal);
   let resp: Response;
   try {
     resp = await fetch(`${settings.embeddingBaseUrl}/embeddings`, {
@@ -96,12 +119,14 @@ async function embedBatch(
         dimensions: settings.embeddingDimensions,
         encoding_format: "float",
       }),
-      signal,
+      signal: requestSignal,
     });
   } catch {
-    // Network error, or the AbortSignal fired (timeout/abort) — either way
-    // this batch didn't complete.
+    // Network error, whole-build timeout/abort, or this batch's own 60s
+    // timeout — either way this batch didn't complete.
     return null;
+  } finally {
+    clear();
   }
   if (resp.status !== 200) return null;
 
