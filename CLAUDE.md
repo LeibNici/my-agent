@@ -44,13 +44,22 @@ memory.
 ```bash
 cd v2/engine
 npm install
+npm start           # the service: HTTP/SSE edge + real pi engine, port 8000 (APP_PORT)
 npm test            # vitest, all offline (mock Anthropic server)
 npm run typecheck
 ```
 
-There is no runnable service yet — Phase 3 (pure-Node service: HTTP/SSE
-edge + engine assembly) builds it. The frontend (`web/`, static HTML/JS/CSS,
-no build step) is unchanged and will be served by the Node edge.
+`npm start` runs `src/server/main.ts`: settings → `.jwt_secret` → schema DDL
+→ db worker → admin bootstrap (admin/admin123 unless `APP_ADMIN_PASSWORD`;
+loud warning on the default) → Hono app with the real `runTurn` engine.
+SQLite lives at the repo root (`agent_data.db`, override `APP_DB_PATH`);
+`.env` is read from the process cwd (`v2/engine` under `npm start`). Set
+`ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL` for the real
+provider (DashScope in production). Required-vars table:
+`v2/engine/README.md`'s 运行 section. Tool surface is calculator-only until
+Phase 4; the frontend (`web/`, static, no build step) is served by the Node
+edge at `/`, `/login`, `/admin`, `/static/*` — admin/issue/feedback pages
+404 until their Phase 4/5 routes return.
 
 ## Architecture (v2/engine)
 

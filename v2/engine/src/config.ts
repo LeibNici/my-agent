@@ -15,6 +15,7 @@ export interface Settings {
   maxHistoryMessages: number;
 
   // App settings
+  port: number;
   jwtSecret: string;
   tokenExpireHours: number;
   adminUsername: string;
@@ -102,6 +103,13 @@ export function loadSettings(env?: Record<string, string | undefined>): Settings
     maxHistoryMessages: getEnvNum("ANTHROPIC_MAX_HISTORY_MESSAGES", 60),
 
     // App settings
+    // v1 had no equivalent var — uvicorn's own `--port` CLI flag (see
+    // deploy/codeaxis.service: `--host 0.0.0.0 --port 8000`) was the only
+    // knob, nothing app.config.py-level. No name to reuse from
+    // `.env.example` (checked), so this is a genuinely new Node-service
+    // setting; `APP_*` keeps it consistent with the rest of the app-level
+    // (non-ANTHROPIC_*) settings below.
+    port: getEnvNum("APP_PORT", 8000),
     jwtSecret: getEnvStr("APP_JWT_SECRET", ""),
     tokenExpireHours: getEnvNum("APP_TOKEN_EXPIRE_HOURS", 24),
     adminUsername: getEnvStr("APP_ADMIN_USERNAME", "admin"),
