@@ -2,8 +2,27 @@
 // 非 ASCII 两边都原样保留（ensure_ascii=False ↔ JS 默认），可直接委托。
 function pyStr(s: string): string { return JSON.stringify(s); }
 
+/**
+ * Marks a number that must serialize the way Python's json.dumps renders a
+ * float — ALWAYS with a decimal point, even when the value happens to be
+ * whole (round(1.0, 4) -> 1.0 -> json "1.0", not "1"). JS has no separate
+ * int/float number type, so pythonJsonDumps's plain-number branch can't
+ * otherwise tell "this is conceptually a float that's currently whole"
+ * (semantic_search's cosine score, e.g. two axis-aligned unit vectors ->
+ * exactly 1.0) from "this is conceptually an int" (semantic_search's own
+ * start/end line numbers) — wrap only the former with PyFloat.
+ */
+export class PyFloat {
+  constructor(public readonly value: number) {
+    if (!Number.isFinite(value)) throw new Error("non-finite number cannot be stored");
+  }
+}
+
 export function pythonJsonDumps(value: unknown): string {
   if (value === null) return "null";
+  if (value instanceof PyFloat) {
+    return Number.isInteger(value.value) ? `${value.value}.0` : String(value.value);
+  }
   if (typeof value === "string") return pyStr(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "number") {

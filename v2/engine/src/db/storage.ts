@@ -104,6 +104,25 @@ export type FullRepoRow = RepoRow & {
   last_sync_sha: string | null;
 };
 
+// Phase 4b Task 4: semantic_search's best-effort recall-quality log row —
+// v1's _log_search (app/tools/semantic_index.py) INSERT, ported field for
+// field. repoId is deliberately `number | null`, NOT the raw repo_id string
+// semantic-search.ts computes hits with (see that file's repoIdForLog) —
+// v1 stores `int(top1["repo_id"]) if ... isdigit() else None` into this
+// column despite the column itself being an untyped SQLite INTEGER FK that
+// was never actually enforced against `repositories.id`; the caller does
+// the string->int-or-null conversion, this method just takes the already-
+// resolved value.
+export type RecordSemanticSearchLogRow = {
+  userId: number | null;
+  repoId: number | null;
+  query: string;
+  resultCount: number;
+  top1Score: number | null;
+  resultsJson: string;
+  durationMs: number;
+};
+
 // list_permissions' JOIN row — username/repo_name resolved through
 // users/repositories so callers don't need a second round-trip.
 export type PermissionRow = {
@@ -145,6 +164,7 @@ export type Storage = {
   grantPermission(userId: number, repoId: number, accessLevel: string): number;
   revokePermission(userId: number, repoId: number): void;
   listPermissions(): PermissionRow[];
+  recordSemanticSearchLog(row: RecordSemanticSearchLogRow): void;
   close(): void;
 };
 
@@ -638,6 +658,27 @@ export function openStorage(dbPath: string): Storage {
         )
         .all();
       return rows as PermissionRow[];
+    },
+
+    // v1's _log_search INSERT — created_at generated here (like every other
+    // write method in this file), not accepted from the caller, so every
+    // row's timestamp source stays consistent regardless of who's calling.
+    recordSemanticSearchLog(row: RecordSemanticSearchLogRow): void {
+      const now = pyLocalIsoNow();
+      db.prepare(
+        "INSERT INTO semantic_search_log " +
+          "(user_id, repo_id, query, result_count, top1_score, results_json, duration_ms, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).run(
+        row.userId,
+        row.repoId,
+        row.query,
+        row.resultCount,
+        row.top1Score,
+        row.resultsJson,
+        row.durationMs,
+        now
+      );
     },
 
     close(): void {

@@ -146,9 +146,18 @@ async function embedBatch(
 // ---------------------------------------------------------------------------
 // L2 normalization — write-time port of v1's
 // `norms[norms == 0] = 1.0; vectors = vectors / norms`
+//
+// Exported (Phase 4b Task 4): semantic-search.ts's query-time normalization
+// needs the identical zero-vector-safe division — v1 spells the query-time
+// version slightly differently (`qn = norm(q); if qn > 0: q = q / qn`,
+// leaving a zero vector unchanged rather than dividing by a safe 1.0
+// denominator), but the two are numerically identical for every input
+// (dividing the zero vector by 1.0 IS the zero vector), so semantic-search.ts
+// reuses this rather than carrying a second copy of the same normalization
+// loop.
 // ---------------------------------------------------------------------------
 
-function l2Normalize(vec: Float32Array): Float32Array {
+export function l2Normalize(vec: Float32Array): Float32Array {
   let sumSq = 0;
   for (let i = 0; i < vec.length; i++) sumSq += vec[i] * vec[i];
   const norm = Math.sqrt(sumSq);

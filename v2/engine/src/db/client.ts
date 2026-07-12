@@ -10,6 +10,7 @@ import type {
   CreateRepoFields,
   UpdateRepoFields,
   PermissionRow,
+  RecordSemanticSearchLogRow,
 } from "./storage.js";
 
 export type DbClient = {
@@ -44,6 +45,7 @@ export type DbClient = {
   grantPermission(userId: number, repoId: number, accessLevel: string): Promise<number>;
   revokePermission(userId: number, repoId: number): Promise<void>;
   listPermissions(): Promise<PermissionRow[]>;
+  recordSemanticSearchLog(row: RecordSemanticSearchLogRow): Promise<void>;
   close(): Promise<void>;
 };
 
@@ -170,6 +172,7 @@ export function createDbClient(dbPath: string): DbClient {
       call<number>("grantPermission", [userId, repoId, accessLevel]),
     revokePermission: (userId, repoId) => call<void>("revokePermission", [userId, repoId]),
     listPermissions: () => call<PermissionRow[]>("listPermissions", []),
+    recordSemanticSearchLog: (row) => call<void>("recordSemanticSearchLog", [row]),
     close: () => {
       // 幂等：第二次及以后的 close() 返回同一个 promise（resolve-as-noop），不再发 RPC。
       if (!closePromise) {

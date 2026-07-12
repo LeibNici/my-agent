@@ -19,6 +19,7 @@
 // (see registerTool/listTools below) without every call site fighting
 // strictFunctionTypes contravariance.
 import type { TSchema, Static } from "@sinclair/typebox";
+import type { DbClient } from "../db/client.js";
 
 /** Per-call tool context with repo-scoped access permissions (Phase 4).
  * Values arrive from the per-turn turn.ts caller (Task 8 wires real values;
@@ -27,6 +28,13 @@ export type ToolContext = {
   allowedRepoPaths: string[]; // already realpath'd repo root directories
   unsyncedRepoNames: string[]; // permitted but never synced (local_path empty)
   userId: number | null; // current turn's user id, or null if unauthed
+  /** Optional DB handle for tools that log their own activity (Phase 4b:
+   * semantic_search's best-effort recall-quality log). Optional so every
+   * existing tool/call site that never passes it keeps compiling and
+   * behaving exactly as before — only a tool that explicitly checks
+   * `ctx.db` needs it, and it must degrade silently (no log, no error)
+   * when absent, matching v1's "logging is best-effort" design. */
+  db?: DbClient;
 };
 
 export type ToolDef<T extends TSchema = TSchema> = {

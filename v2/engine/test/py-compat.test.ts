@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { pythonJsonDumps, pyLocalIsoNow } from "../src/db/py-compat.js";
+import { pythonJsonDumps, pyLocalIsoNow, PyFloat } from "../src/db/py-compat.js";
 
 describe("pythonJsonDumps（json.dumps ensure_ascii=False 字节对齐）", () => {
   it("分隔符带空格 + unicode 原样", () => {
@@ -19,6 +19,32 @@ describe("pythonJsonDumps（json.dumps ensure_ascii=False 字节对齐）", () =
   });
   it("非有限数抛错（Python 会产出非法 JSON 的 NaN/Infinity，禁止进库）", () => {
     expect(() => pythonJsonDumps([{ x: NaN }])).toThrow();
+  });
+});
+
+// Phase 4b Task 4 self-review fix: semantic_search's resultsJson embeds a
+// rounded cosine score (a Python float that's frequently whole-valued —
+// e.g. two axis-aligned unit vectors -> exactly 1.0). Plain JS numbers have
+// no separate int/float type, so the generic number branch above can't
+// distinguish "this is conceptually a float" from "this is conceptually an
+// int" — PyFloat is the opt-in marker for the former.
+describe("PyFloat（Python float 的 json.dumps 渲染：整数值也带 .0）", () => {
+  it("整数值的 float 仍带 .0", () => {
+    expect(pythonJsonDumps(new PyFloat(1))).toBe("1.0");
+    expect(pythonJsonDumps(new PyFloat(0))).toBe("0.0");
+    expect(pythonJsonDumps(new PyFloat(-1))).toBe("-1.0");
+  });
+  it("非整数值原样渲染（本就带小数点）", () => {
+    expect(pythonJsonDumps(new PyFloat(0.856))).toBe("0.856");
+    expect(pythonJsonDumps(new PyFloat(-0.6))).toBe("-0.6");
+  });
+  it("嵌套在对象/数组里同样生效，与普通 int 字段区分开", () => {
+    expect(pythonJsonDumps([{ start: 1, end: 2, score: new PyFloat(1) }]))
+      .toBe('[{"start": 1, "end": 2, "score": 1.0}]');
+  });
+  it("非有限数在构造时就抛错，而不是延迟到序列化", () => {
+    expect(() => new PyFloat(NaN)).toThrow();
+    expect(() => new PyFloat(Infinity)).toThrow();
   });
 });
 

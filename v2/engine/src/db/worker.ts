@@ -166,6 +166,12 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.listPermissions() });
         break;
       }
+      case "recordSemanticSearchLog": {
+        const [row] = args as [Parameters<typeof storage.recordSemanticSearchLog>[0]];
+        storage.recordSemanticSearchLog(row);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
       case "close": {
         storage.close();
         reply({ id, ok: true, result: undefined });
