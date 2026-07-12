@@ -20,8 +20,13 @@ Type=simple
 # account, not able to touch the rest of the host.
 User=codeaxis
 Group=codeaxis
-WorkingDirectory=/home/my-agent
-ExecStart=/home/my-agent/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+# engine/, not the repo root: `npm start` execs tsx from here (root
+# CLAUDE.md's Running section), and config.ts's dotenv load is
+# cwd-relative — .env must live at engine/.env, not the repo root's.
+# agent_data.db/.jwt_secret/web/ are all resolved by the app itself via
+# import.meta.url, not cwd, so they still land at the repo root regardless.
+WorkingDirectory=/home/my-agent/engine
+ExecStart=/usr/bin/npm start
 Restart=always
 RestartSec=3
 # .env is read by the app itself from WorkingDirectory; nothing needed here.

@@ -18,7 +18,7 @@ import { loadSettings, type Settings } from "../src/config.js";
 import { writeEmbeddingIndex, readEmbeddingIndex } from "../src/tools/embed-store.js";
 import type { Chunk } from "../src/tools/chunking.js";
 import { chunkHash } from "../src/tools/chunking.js";
-import { embeddingKeyOrFallback, embedAndSaveIndex } from "../src/tools/embedding-client.js";
+import { embeddingKeyOrFallback, embedAndSaveIndex, __internal } from "../src/tools/embedding-client.js";
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -270,7 +270,9 @@ describe("embedAndSaveIndex — incremental reuse", () => {
     const changedNewChunk = makeChunk("b.ts", "bar", "function bar() { return 999; }"); // text changed -> new hash
 
     // Seed an old index as if a previous build already ran, with vectors at
-    // the CURRENT dims (so the unchanged chunk's hash is reusable).
+    // the CURRENT dims (so the unchanged chunk's hash is reusable) — plus a
+    // matching model fingerprint, or the reuse gate below treats it as
+    // possibly-different-model and forces a full re-embed regardless of hash.
     writeEmbeddingIndex(repo, {
       dims,
       vectors: [new Float32Array([0.5, 0.5, 0.5, 0.5]), new Float32Array([0.1, 0.2, 0.3, 0.4])],
@@ -279,6 +281,7 @@ describe("embedAndSaveIndex — incremental reuse", () => {
         { path: "b.ts", start: 1, end: 1, name: "bar", hash: chunkHash(changedOldChunk) },
       ],
     });
+    __internal.writeModelFingerprint(repo, __internal.currentModelFingerprint(settings));
 
     const fetchMock = makeFetchMock({ dims });
     vi.stubGlobal("fetch", fetchMock);
@@ -327,6 +330,52 @@ describe("embedAndSaveIndex — incremental reuse", () => {
     const loaded = readEmbeddingIndex(repo)!;
     expect(loaded.dims).toBe(dims);
     expect(loaded.vectors[0].length).toBe(dims);
+  });
+
+  it("模型指纹不匹配（换了 embedding 模型）-> 即使哈希+维度都命中也强制重新 embed，不混用不同模型的向量空间", async () => {
+    const dims = 4;
+    const oldSettings = makeSettings({ APP_EMBEDDING_MODEL: "text-embedding-v3", APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const newSettings = makeSettings({ APP_EMBEDDING_MODEL: "text-embedding-v4", APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const chunk = makeChunk("a.ts", "foo", "function foo() { return 1; }");
+
+    // Old index at the SAME dims, hash would hit — only the model differs.
+    writeEmbeddingIndex(repo, {
+      dims,
+      vectors: [new Float32Array([0.5, 0.5, 0.5, 0.5])],
+      meta: [{ path: "a.ts", start: 1, end: 1, name: "foo", hash: chunkHash(chunk) }],
+    });
+    __internal.writeModelFingerprint(repo, __internal.currentModelFingerprint(oldSettings));
+
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const ok = await embedAndSaveIndex(repo, [chunk], newSettings);
+    expect(ok).toBe(true);
+
+    // Must have gone through the API despite the hash+dims match, because
+    // the old index was built with a different embedding model.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("旧索引没有指纹侧车文件（这次修复之前建的）-> 视为不匹配，强制重新 embed 而不是默认信任", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const chunk = makeChunk("a.ts", "foo", "function foo() { return 1; }");
+
+    // No __internal.writeModelFingerprint call — simulates an index
+    // written before this fingerprint check existed.
+    writeEmbeddingIndex(repo, {
+      dims,
+      vectors: [new Float32Array([0.5, 0.5, 0.5, 0.5])],
+      meta: [{ path: "a.ts", start: 1, end: 1, name: "foo", hash: chunkHash(chunk) }],
+    });
+
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const ok = await embedAndSaveIndex(repo, [chunk], settings);
+    expect(ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

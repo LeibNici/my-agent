@@ -376,6 +376,23 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
       (err: unknown) => channel.close(err),
     );
 
-  yield* channel.drain();
-  await run;
+  // If the consumer stops iterating early (sse.ts's raceAbort calling
+  // engineIter.return() on client disconnect), yield*'s delegation makes
+  // this generator perform its own return right here — without this
+  // finally, `await run` below is simply never reached, so the in-flight
+  // agent.prompt() (LLM call + tool loop) keeps running server-side with
+  // nothing consuming its output. agent.abort() is a documented no-op if
+  // the run has already finished normally, so this is safe on every exit
+  // path, not just the early one. `run` itself can't reject (its own
+  // .then(onFulfilled, onRejected) above already funnels every failure,
+  // abort included, into channel.close(err)) — the .catch is defensive
+  // only, so callers awaiting engineIter.return() see this fully settled
+  // before their own await resolves.
+  try {
+    yield* channel.drain();
+    await run;
+  } finally {
+    agent.abort();
+    await run.catch(() => {});
+  }
 }

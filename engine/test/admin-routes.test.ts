@@ -178,6 +178,19 @@ describe("users CRUD", () => {
     expect(row!.is_active).toBe(0);
   });
 
+  it("PATCH with valid password + invalid is_active → 422, password left untouched (validate before write)", async () => {
+    const { token } = await seedUser("admin");
+    const targetId = await client.createUser("bob", "oldhash", "user");
+    const app = buildTestApp();
+    const resp = await authed(app, token, `/api/admin/users/${targetId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ password: "newlongpassword", is_active: "not-a-boolean" }),
+    });
+    expect(resp.status).toBe(422);
+    const row = await client.getUserById(targetId);
+    expect(row!.password_hash).toBe("oldhash");
+  });
+
   it("PATCH nonexistent user → 404", async () => {
     const { token } = await seedUser("admin");
     const app = buildTestApp();

@@ -8,15 +8,44 @@
 //
 // Uses Node's global `fetch` (built-in since Node 18) — no new dependency,
 // same choice v1 made with httpx for the equivalent client.
+import * as fs from "node:fs";
 import type { Settings } from "../config.js";
 import type { Chunk } from "./chunking.js";
 import { chunkHash } from "./chunking.js";
-import { readEmbeddingIndex, writeEmbeddingIndex, type EmbeddingChunkMeta } from "./embed-store.js";
+import { readEmbeddingIndex, writeEmbeddingIndex, embPath, type EmbeddingChunkMeta } from "./embed-store.js";
 
 const EMBED_BATCH = 10; // DashScope text-embedding-v4 batch limit
 const CONCURRENCY = 4; // in-flight batch requests per build
 const BUILD_TIMEOUT_MS = 1800 * 1000;
 const BATCH_TIMEOUT_MS = 60 * 1000; // v1's per-request httpx timeout=60
+
+// Which (base URL, model) produced a repo's .emb.v1.bin — embed-store.ts's
+// binary format is model-agnostic by design (it just stores vectors +
+// content hashes), so this identity lives in its own tiny sidecar rather
+// than in that format. Without it, reuse-by-content-hash below would
+// happily reuse vectors from a DIFFERENT embedding model after an
+// APP_EMBEDDING_MODEL/APP_EMBEDDING_BASE_URL change, as long as the new
+// model's output dimensionality happened to match — mixing two unrelated
+// vector spaces in the same cosine comparison with no error or warning.
+function modelFingerprintPath(repoPath: string): string {
+  return embPath(repoPath) + ".model";
+}
+
+function currentModelFingerprint(settings: Settings): string {
+  return `${settings.embeddingBaseUrl}|${settings.embeddingModel}`;
+}
+
+function readModelFingerprint(repoPath: string): string | null {
+  try {
+    return fs.readFileSync(modelFingerprintPath(repoPath), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function writeModelFingerprint(repoPath: string, fingerprint: string): void {
+  fs.writeFileSync(modelFingerprintPath(repoPath), fingerprint, "utf8");
+}
 
 // ---------------------------------------------------------------------------
 // embeddingKeyOrFallback port
@@ -70,22 +99,26 @@ function embedInput(chunk: Chunk): string {
 type EmbedDataEntry = { index: number; embedding: number[] };
 
 /**
- * Combines the whole-build AbortSignal with a fresh per-batch 60s bound,
- * mirroring v1's per-request `httpx` `timeout=60` alongside this port's
- * whole-build 1800s AbortController: whichever fires first wins. Built by
- * hand with `setTimeout` + `AbortController` (rather than
+ * A fresh `timeoutMs` bound, optionally combined with an outer AbortSignal
+ * (whichever fires first wins) — shared by embedding-client.ts's per-batch
+ * 60s bound (mirroring v1's per-request `httpx` `timeout=60` alongside this
+ * port's whole-build 1800s AbortController) and semantic-search.ts's
+ * one-shot query timeout, which has no outer signal to combine with. Built
+ * by hand with `setTimeout` + `AbortController` (rather than
  * `AbortSignal.timeout()`, whose internal timer isn't driven by fake-timer
  * mocking in tests) so it composes uniformly through `AbortSignal.any` and
  * stays deterministically testable. Caller must invoke the returned `clear`
- * once the request settles, so a fast batch doesn't leave a 60s timer
- * dangling for the rest of the build.
+ * once the request settles, so a fast call doesn't leave a timer dangling.
  */
-function withBatchTimeout(buildSignal: AbortSignal): { signal: AbortSignal; clear: () => void } {
-  const perBatch = new AbortController();
-  const timer = setTimeout(() => perBatch.abort(), BATCH_TIMEOUT_MS);
+export function withTimeout(
+  timeoutMs: number,
+  outerSignal?: AbortSignal,
+): { signal: AbortSignal; clear: () => void } {
+  const ownController = new AbortController();
+  const timer = setTimeout(() => ownController.abort(), timeoutMs);
   timer.unref?.();
   return {
-    signal: AbortSignal.any([buildSignal, perBatch.signal]),
+    signal: outerSignal ? AbortSignal.any([outerSignal, ownController.signal]) : ownController.signal,
     clear: () => clearTimeout(timer),
   };
 }
@@ -104,7 +137,7 @@ async function embedBatch(
   key: string,
   signal: AbortSignal,
 ): Promise<Float32Array[] | null> {
-  const { signal: requestSignal, clear } = withBatchTimeout(signal);
+  const { signal: requestSignal, clear } = withTimeout(BATCH_TIMEOUT_MS, signal);
   let resp: Response;
   try {
     resp = await fetch(`${settings.embeddingBaseUrl}/embeddings`, {
@@ -186,7 +219,12 @@ async function doEmbedAndSave(
   // APP_EMBEDDING_DIMENSIONS or embedding_model change) it must be
   // re-embedded like any other new chunk, not left as a stale-shape vector
   // that silently passes the hash check on every future rebuild too.
-  const oldIndex = readEmbeddingIndex(repoPath);
+  // Same reasoning for the model fingerprint: a same-dimension model swap
+  // wouldn't be caught by the dims check above, so gate reuse on it too —
+  // an unknown/missing fingerprint (pre-existing index from before this
+  // check existed) is treated as a mismatch, not an automatic pass.
+  const modelMatches = readModelFingerprint(repoPath) === currentModelFingerprint(settings);
+  const oldIndex = modelMatches ? readEmbeddingIndex(repoPath) : null;
   const reusable = new Map<string, Float32Array>();
   if (oldIndex !== null) {
     for (let i = 0; i < oldIndex.meta.length; i++) {
@@ -250,6 +288,7 @@ async function doEmbedAndSave(
   }));
 
   writeEmbeddingIndex(repoPath, { dims, vectors: normalized, meta });
+  writeModelFingerprint(repoPath, currentModelFingerprint(settings));
   return true;
 }
 
@@ -285,3 +324,9 @@ export async function embedAndSaveIndex(
     clearTimeout(timer);
   }
 }
+
+// Test-only escape hatch (matches symbol-index.ts's buildIndexWithBin /
+// semantic-search.ts's __internal pattern) — lets reuse tests seed a
+// fingerprint sidecar matching the settings they pass to embedAndSaveIndex,
+// without duplicating the fingerprint string format in the test itself.
+export const __internal = { currentModelFingerprint, writeModelFingerprint };

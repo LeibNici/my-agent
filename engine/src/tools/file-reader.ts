@@ -55,6 +55,18 @@ export function realpathOrResolve(p: string): string {
   }
 }
 
+// Shared by code-search.ts and symbol-index.ts (both need "is this a real,
+// currently-accessible directory" before shelling out to rg/ctags on it) —
+// hoisted here rather than duplicated, since file-reader.ts is already the
+// shared low-level fs-helpers module both of them import from.
+export function isDirSafe(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve a path to an absolute one. Relative paths (as returned by
  * code_search, which strips the repo prefix) are resolved against each

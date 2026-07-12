@@ -38,6 +38,10 @@ describe("PyFloat（Python float 的 json.dumps 渲染：整数值也带 .0）",
     expect(pythonJsonDumps(new PyFloat(0.856))).toBe("0.856");
     expect(pythonJsonDumps(new PyFloat(-0.6))).toBe("-0.6");
   });
+  it("负零渲染为 -0.0，而不是和正零一样的 0.0（Python repr(-0.0) == '-0.0'）", () => {
+    expect(pythonJsonDumps(new PyFloat(-0))).toBe("-0.0");
+    expect(pythonJsonDumps(new PyFloat(0))).toBe("0.0");
+  });
   it("嵌套在对象/数组里同样生效，与普通 int 字段区分开", () => {
     expect(pythonJsonDumps([{ start: 1, end: 2, score: new PyFloat(1) }]))
       .toBe('[{"start": 1, "end": 2, "score": 1.0}]');

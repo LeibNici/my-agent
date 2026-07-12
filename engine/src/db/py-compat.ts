@@ -21,6 +21,12 @@ export class PyFloat {
 export function pythonJsonDumps(value: unknown): string {
   if (value === null) return "null";
   if (value instanceof PyFloat) {
+    // Object.is distinguishes -0 from 0 (=== and template-literal
+    // stringification don't: `${-0}` is "0", matching JS's String(-0), not
+    // Python's repr(-0.0) == "-0.0"). semantic_search's rounded cosine
+    // score can legitimately land on -0.0, and py-roundtrip.test.ts's
+    // byte-identical-DB-row guarantee depends on matching that exactly.
+    if (Object.is(value.value, -0)) return "-0.0";
     return Number.isInteger(value.value) ? `${value.value}.0` : String(value.value);
   }
   if (typeof value === "string") return pyStr(value);

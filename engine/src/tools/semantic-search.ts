@@ -37,7 +37,7 @@ import * as path from "node:path";
 import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef, type ToolContext } from "./registry.js";
 import { getAllowedPaths, getToolUserId, noAccessReason } from "./access.js";
-import { embeddingKeyOrFallback, l2Normalize } from "./embedding-client.js";
+import { embeddingKeyOrFallback, l2Normalize, withTimeout } from "./embedding-client.js";
 import { readEmbeddingIndex } from "./embed-store.js";
 import { truncateChars } from "./chunking.js";
 import { loadSettings, type Settings } from "../config.js";
@@ -84,22 +84,8 @@ function zeroHitsMessage(query: string): string {
 // is left unguarded too, matching v1's unguarded resp.json()["data"][0].
 // ---------------------------------------------------------------------------
 
-// Manual setTimeout+AbortController+unref, NOT AbortSignal.timeout() —
-// mirroring embedding-client.ts's withBatchTimeout, whose doc comment
-// records why: AbortSignal.timeout()'s internal timer isn't driven by
-// fake-timer mocking in tests, and (unlike this hand-rolled version) is
-// never explicitly cleared, so it can leave a real dangling 30s timer per
-// call. unref() ensures a stray uncleared timer never keeps the process
-// alive; the explicit clear() in the finally below is the normal path.
-function withQueryTimeout(): { signal: AbortSignal; clear: () => void } {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), QUERY_TIMEOUT_MS);
-  timer.unref?.();
-  return { signal: controller.signal, clear: () => clearTimeout(timer) };
-}
-
 async function fetchQueryEmbedding(query: string, settings: Settings, key: string): Promise<{ status: number; json: () => Promise<unknown> }> {
-  const { signal, clear } = withQueryTimeout();
+  const { signal, clear } = withTimeout(QUERY_TIMEOUT_MS);
   try {
     return await fetch(`${settings.embeddingBaseUrl}/embeddings`, {
       method: "POST",

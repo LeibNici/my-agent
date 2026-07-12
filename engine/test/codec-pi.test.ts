@@ -38,6 +38,14 @@ describe("domainToPi（注③）", () => {
     const pi = domainToPi(withReminder, OPTS);
     expect(pi.map(m => m.role)).toEqual(["assistant", "toolResult", "user"]);
   });
+  it("text 块出现在 tool_result 之前 → CodecError（不静默重排，legacy 从不产生这种形状）", () => {
+    const textFirst = legacyListToDomain([
+      legacyToolTurn[1],
+      { role: "user", content: [
+        { type: "text", text: "本轮调查已过半" },
+        { type: "tool_result", tool_use_id: "tu_1", content: "2" } ] }]);
+    expect(() => domainToPi(textFirst, OPTS)).toThrow(CodecError);
+  });
   it("image 块 → CodecError（Phase-1 限制）", () => {
     const withImage = legacyListToDomain([{ role: "user", content: [
       { type: "image", source: { type: "base64", media_type: "image/png", data: "AAA" } } ] }]);

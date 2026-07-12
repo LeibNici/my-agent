@@ -18,6 +18,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { loadTags, type Tag } from "./symbol-index.js";
+import { realpathOrResolve } from "./file-reader.js";
 
 export type Chunk = { path: string; start: number; end: number; name: string; text: string };
 
@@ -84,7 +85,17 @@ export function truncateChars(text: string, maxChars: number): string {
  */
 function chunkFileBySymbols(repoPath: string, relPath: string, fileTags: Tag[]): Chunk[] {
   const absPath = path.join(repoPath, relPath);
-  const lines = readLines(absPath);
+  // ctags follows symlinks during its `-R .` scan (no `--links=no` in
+  // CTAGS_ARGS), so a symlink committed into the repo can make relPath
+  // resolve outside repoPath — reject exactly like scanMapperXml already
+  // does for MyBatis XML, instead of trusting Tag.path and reading through
+  // the link (see that function's leak.xml -> /etc/passwd comment).
+  const realAbsPath = realpathOrResolve(absPath);
+  const realRepoPath = realpathOrResolve(repoPath);
+  if (realAbsPath !== realRepoPath && !realAbsPath.startsWith(realRepoPath + path.sep)) {
+    return [];
+  }
+  const lines = readLines(realAbsPath);
   if (lines.length === 0) return [];
 
   // Dedup by line, keeping the LAST tag's name for a given line (matches

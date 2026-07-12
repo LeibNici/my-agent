@@ -19,7 +19,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef } from "./registry.js";
 import type { ToolContext } from "./registry.js";
 import { getAllowedPaths, isWithinAllowedPaths, noAccessReason } from "./access.js";
-import { resolvePath, realpathOrResolve } from "./file-reader.js";
+import { resolvePath, realpathOrResolve, isDirSafe } from "./file-reader.js";
 
 // ---------------------------------------------------------------------------
 // ctags detection — mirrors code-search.ts's _RG_BIN `which`-detection
@@ -57,14 +57,6 @@ const CTAGS_ARGS = [
 ];
 
 const BUILD_TIMEOUT_MS = 90_000;
-
-function isDirSafe(p: string): boolean {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // _index_path port

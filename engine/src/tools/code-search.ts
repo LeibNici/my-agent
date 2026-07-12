@@ -20,7 +20,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef } from "./registry.js";
 import type { ToolContext } from "./registry.js";
 import { getAllowedPaths, isWithinAllowedPaths, noAccessReason } from "./access.js";
-import { expandUser, realpathOrResolve } from "./file-reader.js";
+import { expandUser, realpathOrResolve, isDirSafe } from "./file-reader.js";
 
 // ---------------------------------------------------------------------------
 // rg detection
@@ -106,14 +106,6 @@ export function buildSearchArgv(
 // ---------------------------------------------------------------------------
 // _search_one_repo port
 // ---------------------------------------------------------------------------
-
-function isDirSafe(p: string): boolean {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
 
 function isFileSafe(p: string): boolean {
   try {

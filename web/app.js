@@ -565,25 +565,20 @@ async function sendMessage() {
         // activity log tucked at the end instead of interrupting it.
         let messageToolGroup = null;
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
+        // Named so it can be invoked once more after the read loop below,
+        // for a final line the server wrote without its trailing "\n" (see
+        // that call site's comment).
+        const processSseLine = (line) => {
                 if (line.startsWith("event:")) {
                     eventType = line.slice(6).trim();
                 } else if (line.startsWith("data:")) {
                     const dataStr = line.slice(5).trim();
                     if (!dataStr) {
                         eventType = "message"; // reset on empty data
-                        continue;
+                        return;
                     }
                     let data;
-                    try { data = JSON.parse(dataStr); } catch { continue; }
+                    try { data = JSON.parse(dataStr); } catch { return; }
 
                     if (eventType === "session") {
                         // Fires once, right at the start of the turn — learn the
@@ -691,7 +686,27 @@ async function sendMessage() {
                     // Blank line = SSE event boundary, reset event type
                     eventType = "message";
                 }
+        };
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+                processSseLine(line);
             }
+        }
+        if (buffer) {
+            // The connection can close right after a final data:/event: line
+            // without its trailing "\n" ever arriving (abrupt disconnect
+            // during a slow write) — process whatever's left instead of
+            // silently dropping the last event, often "done" carrying
+            // session_id/message_id.
+            processSseLine(buffer);
         }
     } catch (err) {
         hideThinking(contentEl);
@@ -906,7 +921,14 @@ function appendAssistantMessage(content, toolResults = {}, submissionsById = {},
     } else if (Array.isArray(content)) {
         content.forEach(block => {
             if (block.type === "text") {
-                contentEl.innerHTML += renderMarkdown(block.text || "");
+                // A dedicated child per text run, never `contentEl.innerHTML +=`:
+                // that reflows the whole subtree, and appendToolBlock's
+                // toolHeader.onclick (a JS property, set below) doesn't survive
+                // being serialized to a string and reparsed — same reasoning as
+                // the live-streaming path's textRuns (see that code's comment).
+                const textEl = document.createElement("div");
+                textEl.innerHTML = renderMarkdown(block.text || "");
+                contentEl.appendChild(textEl);
             } else if (block.type === "tool_use") {
                 const result = toolResults[block.id];
                 appendToolBlock(contentEl, block.name, block.input, result !== undefined ? result : "completed");
@@ -1041,13 +1063,15 @@ if (typeof marked !== "undefined") {
 }
 
 function renderMarkdown(text) {
-    if (typeof marked !== "undefined") {
-        const rawHtml = marked.parse(text);
-        if (typeof DOMPurify !== "undefined") {
-            return DOMPurify.sanitize(rawHtml);
-        }
-        return rawHtml.replace(/<[^>]*>/g, "");
+    if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
+        return DOMPurify.sanitize(marked.parse(text));
     }
+    // No regex can reliably strip HTML tags (an unterminated `<img src=x
+    // onerror=...` has no closing `>` for a tag-stripping regex to match,
+    // but the browser's parser still instantiates it as a live element) —
+    // if DOMPurify didn't load, fall back to the same plain-text escape
+    // used when marked itself isn't loaded, rather than rendering
+    // unsanitized HTML from marked.
     return escapeHtml(text).replace(/\n/g, "<br>");
 }
 

@@ -24,13 +24,14 @@ import { createToken, decodeToken, verifyPassword, AuthError } from "../auth.js"
 import { listTools } from "../tools/registry.js";
 // Side-effecting registrations (Task 8 closes Phase 4a): each of these
 // files calls registerTool() at import time — calculator (Phase 3's one
-// tool) plus the repo-scoped file/code/symbol tools Phase 4a adds
-// (file_reader, code_search + list_directory, find_symbol +
-// list_file_symbols). Six tools total; chat requests now reach real repos.
+// tool) plus the repo-scoped file/code/symbol/semantic tools Phase 4a/4b
+// add (file_reader, code_search + list_directory, find_symbol +
+// list_file_symbols, semantic_search). Chat requests now reach real repos.
 import "../tools/calculator.js";
 import "../tools/file-reader.js";
 import "../tools/code-search.js";
 import "../tools/symbol-index.js";
+import "../tools/semantic-search.js";
 import { chatEventStream, userOwnsSession, type ChatRequestBody, type CurrentUser } from "./sse.js";
 import { mountAdminRoutes, type SyncAndPersistFn } from "./admin-routes.js";
 
@@ -67,6 +68,27 @@ const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const MAX_IMAGES_PER_MESSAGE = 5;
 const MAX_IMAGE_BASE64_CHARS = 6_000_000;
 
+// v1 app/main.py:164-178 — in-memory login throttle, ported verbatim:
+// per-process only (won't coordinate across replicas), but meaningfully
+// raises the cost of a scripted attack against a known username. Every
+// login call counts as an attempt (even before credentials are checked);
+// a successful login clears the counter for that username.
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 300_000;
+const loginAttempts = new Map<string, number[]>();
+
+function checkLoginRateLimit(username: string): boolean {
+  const now = Date.now();
+  const attempts = (loginAttempts.get(username) ?? []).filter((t) => now - t < LOGIN_WINDOW_MS);
+  if (attempts.length >= LOGIN_MAX_ATTEMPTS) {
+    loginAttempts.set(username, attempts);
+    return false;
+  }
+  attempts.push(now);
+  loginAttempts.set(username, attempts);
+  return true;
+}
+
 export function buildApp(deps: BuildAppDeps): Hono<Env> {
   const app = new Hono<Env>();
   // Registered once at app-build time, not per-request — Phase 3 shipped
@@ -88,11 +110,11 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
   // ==================== Auth ====================
   // One blanket middleware over /api/* (except the login route itself,
   // which must be reachable without a token) instead of v1's per-route
-  // `Depends(get_current_user)` — same effect, one place. Deliberately
-  // does NOT re-verify the user against the DB on every request the way
-  // v1's get_current_user does (disabled/deleted users, role changes) —
-  // out of this task's scope; the JWT payload is trusted as-is for the
-  // lifetime of the token.
+  // `Depends(get_current_user)` — same effect, one place. Re-fetches the
+  // user by id on every request (like v1's get_current_user) rather than
+  // trusting the JWT payload's role/is_active for the token's whole
+  // lifetime — otherwise a disabled or demoted user keeps full access
+  // until the token naturally expires.
 
   app.use("/api/*", async (c, next) => {
     if (c.req.path === "/api/auth/login") {
@@ -103,9 +125,10 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     if (!header || !header.startsWith("Bearer ")) {
       return c.json({ detail: "Not authenticated" }, 401);
     }
+    let userId: number;
     try {
       const decoded = decodeToken(header.slice("Bearer ".length), deps.settings);
-      c.set("user", { id: decoded.user_id, username: decoded.username, role: decoded.role });
+      userId = decoded.user_id;
     } catch (err) {
       // v1's decode_token: expired vs. anything-else-invalid both collapse
       // to 401 at the HTTP layer (only the `detail` text differs) — AuthError
@@ -113,6 +136,11 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
       const message = err instanceof AuthError ? err.message : "Invalid token";
       return c.json({ detail: message }, 401);
     }
+    const user = await deps.db.getUserById(userId);
+    if (!user || !user.is_active) {
+      return c.json({ detail: "Not authenticated" }, 401);
+    }
+    c.set("user", { id: user.id, username: user.username, role: user.role });
     await next();
   });
 
@@ -126,6 +154,9 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     if (typeof body.username !== "string" || typeof body.password !== "string") {
       return c.json({ detail: "username and password are required" }, 422);
     }
+    if (!checkLoginRateLimit(body.username)) {
+      return c.json({ detail: "Too many login attempts. Try again later." }, 429);
+    }
     const user = await deps.db.getUserByUsername(body.username);
     if (!user || !(await verifyPassword(body.password, user.password_hash))) {
       return c.json({ detail: "Invalid credentials" }, 401);
@@ -133,6 +164,7 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     if (!user.is_active) {
       return c.json({ detail: "Account disabled" }, 403);
     }
+    loginAttempts.delete(body.username);
     const token = createToken({ id: user.id, username: user.username, role: user.role }, deps.settings);
     return c.json({ token, user: { id: user.id, username: user.username, role: user.role } });
   });

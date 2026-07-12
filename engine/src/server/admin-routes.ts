@@ -104,17 +104,23 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     const body = await parseBody<{ password?: unknown; is_active?: unknown }>(c);
     if (body === null) return c.json({ detail: "Invalid JSON body" }, 422);
 
-    if (body.password !== undefined && body.password !== null) {
-      if (typeof body.password !== "string" || body.password.length < 8) {
-        return c.json({ detail: "password must be at least 8 characters" }, 422);
-      }
-      await deps.db.updateUserPassword(userId, await hashPassword(body.password));
+    // Validate the whole body BEFORE writing anything — a request with a
+    // valid password but an invalid is_active must not leave the password
+    // changed while still returning 422 for the rest of the payload.
+    const hasPassword = body.password !== undefined && body.password !== null;
+    if (hasPassword && (typeof body.password !== "string" || body.password.length < 8)) {
+      return c.json({ detail: "password must be at least 8 characters" }, 422);
     }
-    if (body.is_active !== undefined && body.is_active !== null) {
-      if (typeof body.is_active !== "boolean") {
-        return c.json({ detail: "is_active must be a boolean" }, 422);
-      }
-      await deps.db.setUserActive(userId, body.is_active);
+    const hasIsActive = body.is_active !== undefined && body.is_active !== null;
+    if (hasIsActive && typeof body.is_active !== "boolean") {
+      return c.json({ detail: "is_active must be a boolean" }, 422);
+    }
+
+    if (hasPassword) {
+      await deps.db.updateUserPassword(userId, await hashPassword(body.password as string));
+    }
+    if (hasIsActive) {
+      await deps.db.setUserActive(userId, body.is_active as boolean);
     }
     return c.json({ ok: true });
   });

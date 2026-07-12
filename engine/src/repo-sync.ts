@@ -52,10 +52,23 @@ function credentialHeaderArgs(
   credToken?: string | null
 ): string[] {
   if (!credUsername && !credToken) return [];
-  const userpass = credUsername ? `${credUsername}:${credToken ?? ""}` : (credToken as string);
+  // RFC 7617 Basic auth is `user-id ":" password` — even the token-as-bare-
+  // username convention needs the trailing colon (an empty password), or
+  // the decoded header has no separator at all and hosts that parse it
+  // strictly reject/misread it.
+  const userpass = credUsername ? `${credUsername}:${credToken ?? ""}` : `${credToken}:`;
   const encoded = Buffer.from(userpass).toString("base64");
   return ["-c", `http.extraheader=Authorization: Basic ${encoded}`];
 }
+
+// Disables git's default redirect-following on the actual clone/pull
+// connection. validateUrl's SSRF check only vets the URL/host once, up
+// front; without this, a host that passes validation could still 302 the
+// real request into a private/internal address and git would follow it
+// there unseen. Doesn't close the DNS-rebinding variant (a TOCTOU between
+// validateUrl's lookup and git's own later resolution) — that would need
+// pinning the validated IP into the actual connection, a bigger change.
+const NO_REDIRECT_ARGS = ["-c", "http.followRedirects=false"];
 
 export function getRepoLocalPath(reposDir: string, repoId: number): string {
   return path.join(reposDir, String(repoId));
@@ -197,7 +210,7 @@ async function cloneRepoCore(
 
   fs.mkdirSync(reposDir, { recursive: true });
 
-  const gitArgs = [...credentialHeaderArgs(credUsername, credToken), "clone", "--depth", "1"];
+  const gitArgs = [...NO_REDIRECT_ARGS, ...credentialHeaderArgs(credUsername, credToken), "clone", "--depth", "1"];
   if (branch) gitArgs.push("--branch", branch);
   gitArgs.push(url, tmpPath); // 干净的 url —— 从不携带嵌入的凭证
 
@@ -256,7 +269,7 @@ export async function pullRepo(
     return { ok: false, message: `Repository not found at ${localPath}` };
   }
 
-  const gitArgs = [...credentialHeaderArgs(credUsername, credToken), "pull", "--ff-only"];
+  const gitArgs = [...NO_REDIRECT_ARGS, ...credentialHeaderArgs(credUsername, credToken), "pull", "--ff-only"];
   const { code, stdout, stderr } = await runGit(gitArgs, localPath);
 
   if (code !== 0) {

@@ -7,7 +7,9 @@ import type { Settings } from "./config.js";
 // solid for the whole call) — this is a real Node HTTP service (Phase 3),
 // so async is the right default even though v1's Python bcrypt.hashpw was
 // effectively synchronous either way.
-const BCRYPT_ROUNDS = 10;
+// 12 matches v1's cost factor (Python bcrypt.gensalt()'s default) — keep
+// the two implementations at the same brute-force-resistance cost.
+const BCRYPT_ROUNDS = 12;
 
 export async function hashPassword(password: string): Promise<string> {
   return hash(password, BCRYPT_ROUNDS);

@@ -90,10 +90,21 @@ export function domainToPi(
     // toolResult message (rule 3); any text blocks trailing them become a
     // separate trailing user message (rule 4, D1 default: pi's own
     // double-user shape, no manual merge — see Task 1 REPORT-phase1.md).
+    // This assumes legacy's invariant that text never precedes tool_result
+    // in the same message (app/agent.py always builds
+    // tool_result_blocks + [reminder_text]) — enforced below rather than
+    // silently reordered, matching this switch's fail-loud handling of
+    // every other invalid shape (tool_use/image in a user message).
     const trailingText: PiTextContent[] = [];
+    let seenText = false;
     for (const block of blocks) {
       switch (block.type) {
         case "tool_result": {
+          if (seenText) {
+            throw new CodecError(
+              "tool_result block found after a text block in the same user message"
+            );
+          }
           const toolName = toolNameById.get(block.toolUseId);
           if (toolName === undefined) {
             throw new CodecError(
@@ -112,6 +123,7 @@ export function domainToPi(
           break;
         }
         case "text":
+          seenText = true;
           trailingText.push({ type: "text", text: block.text });
           break;
         case "image":

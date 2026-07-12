@@ -100,15 +100,40 @@ export function writeEmbeddingIndex(repoPath: string, index: EmbeddingIndex): vo
   fs.renameSync(tmpPath, finalPath);
 }
 
+// In-process cache keyed by sidecar path -> (mtime, parsed index), mirroring
+// symbol-index.ts's TAGS_CACHE for the identical problem: semantic_search
+// can call readEmbeddingIndex several times per turn (once per allowed
+// repo, possibly several turns' worth of iterations), and this file's
+// vectors+meta can be multi-MB — re-reading and re-parsing (including a
+// fresh Float32Array per row) on every call is avoidable churn.
+// writeEmbeddingIndex always replaces the file via fs.renameSync, which
+// changes its mtime, so a rebuilt index is picked up on the next call
+// without any explicit invalidation. Module-level and unlocked: worst case
+// under a race is one extra redundant parse, never stale/corrupt data.
+const EMB_CACHE = new Map<string, { mtimeMs: number; index: EmbeddingIndex }>();
+
 /**
  * Read an EmbeddingIndex previously written by writeEmbeddingIndex. Missing
  * file, magic/version mismatch, or any other corruption -> null. Never
  * throws — callers treat null as "no index yet, (re)build it".
  */
 export function readEmbeddingIndex(repoPath: string): EmbeddingIndex | null {
+  const idxPath = embPath(repoPath);
+  let mtimeMs: number;
+  try {
+    mtimeMs = fs.statSync(idxPath).mtimeMs;
+  } catch {
+    return null;
+  }
+
+  const cached = EMB_CACHE.get(idxPath);
+  if (cached && cached.mtimeMs === mtimeMs) {
+    return cached.index;
+  }
+
   let buf: Buffer;
   try {
-    buf = fs.readFileSync(embPath(repoPath));
+    buf = fs.readFileSync(idxPath);
   } catch {
     return null;
   }
@@ -162,7 +187,9 @@ export function readEmbeddingIndex(repoPath: string): EmbeddingIndex | null {
     }
     const meta = parsed as EmbeddingChunkMeta[];
 
-    return { dims, vectors, meta };
+    const index: EmbeddingIndex = { dims, vectors, meta };
+    EMB_CACHE.set(idxPath, { mtimeMs, index });
+    return index;
   } catch {
     return null;
   }
