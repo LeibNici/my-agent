@@ -211,8 +211,26 @@ function applyFloorDiv(a: PyNumber, b: PyNumber): PyNumber {
   return checkFinite({ value: Math.floor(a.value / b.value), isFloat: eitherFloat(a, b) });
 }
 
-// Power (M1, Python's `**` / operator.pow). Two rules beyond the usual
-// float-contagion one, both confirmed via python3 rather than assumed:
+// v1's Pow magnitude bound (MAX_EXPONENT = 10000) — one constant guards
+// BOTH operands, exactly as in the tagged source (`abs(right) > MAX_EXPONENT`
+// then `abs(left) > MAX_EXPONENT`, same constant in both messages; strict >,
+// so ±10000 itself is allowed).
+const MAX_EXPONENT = 10000;
+
+// Power (M1+M3, Python's `**` / operator.pow with v1's own bounds on top).
+// Check order is load-bearing and copied from the tagged v1 source, then
+// confirmed by executing it (Task 3 fix report, M3/M4 oracle transcript):
+//   1. |exponent| > 10000 -> "Exponent too large (<v>, max ±10000)"
+//   2. |base|     > 10000 -> "Base too large (<v>, max ±10000)"
+//   3. only then the pow itself, whose 0**negative raises ZeroDivisionError
+// So `20000**20000` reports the EXPONENT (both out of bounds, exponent
+// checked first) and `0**-20000` also reports the exponent bound — the
+// ZeroDivisionError below is unreachable for out-of-bounds operands. The
+// offending value renders through formatResult (= Python str()), which is
+// exactly what v1's f-string `{right}`/`{left}` interpolation produces:
+// "20000.0" for a float base, "-10001" for a negative int exponent.
+// Two more rules beyond the usual float-contagion one, both confirmed via
+// python3 rather than assumed:
 //   - int ** int stays int ONLY when the exponent is >= 0; a negative
 //     integer exponent still produces a float (2**-1 == 0.5) even though
 //     neither operand is written as a float literal.
@@ -220,6 +238,12 @@ function applyFloorDiv(a: PyNumber, b: PyNumber): PyNumber {
 //     Infinity/NaN — same wording ("0.0 cannot be raised to a negative
 //     power") regardless of int/float typing on either operand.
 function applyPow(a: PyNumber, b: PyNumber): PyNumber {
+  if (Math.abs(b.value) > MAX_EXPONENT) {
+    throw new CalcError(`Exponent too large (${formatResult(b)}, max ±${MAX_EXPONENT})`);
+  }
+  if (Math.abs(a.value) > MAX_EXPONENT) {
+    throw new CalcError(`Base too large (${formatResult(a)}, max ±${MAX_EXPONENT})`);
+  }
   if (a.value === 0 && b.value < 0) {
     throw new CalcError("0.0 cannot be raised to a negative power");
   }
@@ -361,20 +385,60 @@ function evaluate(expression: string): PyNumber {
   return new Parser(tokens).parse();
 }
 
-// Formats a PyNumber exactly like Python's str() would (H2).
+// Formats a PyNumber exactly like Python's str() would (H2), plus v1's own
+// final display rule for huge ints (M4).
 function formatResult(n: PyNumber): string {
   if (!n.isFloat) {
+    if (Math.abs(n.value) > 1e15) {
+      // v1's calculator() final step, ported with its exact gate:
+      // `if isinstance(result, int) and abs(result) > 1e15: return
+      // f"{result:.6e}"` — INT results only (floats fall through to the
+      // str() path below regardless of magnitude), strictly greater (a
+      // result of exactly 1e15 keeps plain digits). JS's toExponential(6)
+      // is byte-identical to Python's :.6e here: same 6-digit mantissa
+      // rounding and, because |value| > 1e15 forces a >=2-digit exponent,
+      // Python's zero-padded exponent ("e+05") vs JS's unpadded ("e+5")
+      // difference can never show — verified side-by-side for every test
+      // golden (1e16, ±2**100, 1e15+1, 2**53, 3**40) via python3 + node.
+      // Residual divergence (documented, not chased): CPython formats the
+      // EXACT bignum while JS formats the double approximation, so a true
+      // value sitting within 1 double-ulp of a 7th-significant-digit
+      // rounding boundary could round differently — none of this grammar's
+      // goldens are near such a boundary.
+      return n.value.toExponential(6);
+    }
     // Python int -> str is exact-precision base-10 digits (arbitrary-
-    // precision bignum). JS numbers are IEEE-754 doubles: this matches for
-    // every value reachable within double's safe range; a result whose true
-    // (Python bignum) magnitude would need more precision than a double
-    // carries, or exceeds ~1e21 (where JS's own Number#toString switches to
-    // exponential notation while Python ints never do), is a residual
-    // divergence accepted per the fix brief rather than reimplementing
-    // bignum arithmetic — v1 itself only ever bounds *digit count* for
-    // display (MAX_RESULT_DIGITS), it doesn't chase exact string fidelity
-    // either, and that bound was already deliberately not ported (Task 3
-    // report: not reachable from this narrowed grammar).
+    // precision bignum). Every JS int-typed value that reaches this branch
+    // is <= 1e15 in magnitude, well inside double-exact territory, so
+    // String() matches Python digits-for-digits WHEN the value itself is
+    // exact. Residual divergence inherited from using doubles as the eval
+    // type: an intermediate result beyond 2**53 (e.g. `(2**60+1)//2`-shaped
+    // chains) may already have lost low-order precision that Python's
+    // bignums keep, and results that overflow the double range surface as
+    // "result is infinity or NaN" where v1 raises its own digit-count texts
+    // instead — see the checkFinite note below. Accepted per the fix brief
+    // rather than reimplementing bignum arithmetic.
+    //
+    // Two more residual-divergence footnotes (reviewer-listed, verified by
+    // executing the tagged v1 source, not assumed):
+    //   - Scientific-notation LITERALS: v1 parses `1e5` via ast.parse into
+    //     the float 100000.0 -> "100000.0"; this tokenizer's character
+    //     whitelist has no 'e', so v2 returns "Error: unexpected character
+    //     'e'". A grammar-scope difference from the original Task 3
+    //     narrowing, not a formatting bug.
+    //   - Huge pow results inside the M3 bounds: v1 computes real bignums
+    //     and fails on their DISPLAY size — `2**10000` -> "Error: Result
+    //     too large (3011 digits, max 1000)" (_bound_result's
+    //     MAX_RESULT_DIGITS check), and `9999**9999` trips CPython 3.11+'s
+    //     int->str conversion guard INSIDE that check first -> "Error:
+    //     Exceeds the limit (4300 digits) for integer string conversion;
+    //     use sys.set_int_max_str_digits() to increase the limit" (yes,
+    //     really — the digit-count check itself calls str() on the bignum).
+    //     v2's doubles just overflow to Infinity, so both come back as
+    //     "Error: result is infinity or NaN". Same refusal outcome,
+    //     deliberately different text — matching v1 here would mean porting
+    //     bignum arithmetic AND a Python-version-specific interpreter
+    //     message.
     return String(n.value);
   }
   if (Object.is(n.value, -0)) {

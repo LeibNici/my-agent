@@ -303,6 +303,70 @@ describe("calculator — % follows Python's floored-division sign (result takes 
   });
 });
 
+describe("calculator — v1 Pow bounds: exponent checked FIRST, then base, both max ±10000 (M3)", () => {
+  // Every expected string below is the byte-exact output of the REAL v1
+  // calculator() (tagged source executed via python3 with the registry
+  // import stubbed), not derived from reading its f-strings — see Task 3
+  // fix report (M3/M4 pass) for the oracle transcript.
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+
+  it("|base| > 10000 -> Base error, v1 template verbatim (value rendered int-style)", async () => {
+    expect(await evalExpr("20000**2")).toBe("Error: Base too large (20000, max ±10000)");
+  });
+
+  it("|exponent| > 10000 -> Exponent error, v1 template verbatim", async () => {
+    expect(await evalExpr("2**10001")).toBe("Error: Exponent too large (10001, max ±10000)");
+  });
+
+  it("both out of bounds -> Exponent wins (v1 checks exponent before base — order proof)", async () => {
+    expect(await evalExpr("20000**20000")).toBe("Error: Exponent too large (20000, max ±10000)");
+  });
+
+  it("bounds fire before the 0**negative ZeroDivisionError check (v1 order: bounds, then operator.pow)", async () => {
+    expect(await evalExpr("0**-20000")).toBe("Error: Exponent too large (-20000, max ±10000)");
+  });
+
+  it("rendered value is int/float-aware like the rest of the calculator: float base shows trailing .0", async () => {
+    expect(await evalExpr("20000.0**2")).toBe("Error: Base too large (20000.0, max ±10000)");
+    expect(await evalExpr("2**10000.5")).toBe("Error: Exponent too large (10000.5, max ±10000)");
+  });
+
+  it("negative out-of-bounds exponent renders with its sign", async () => {
+    expect(await evalExpr("2**-10001")).toBe("Error: Exponent too large (-10001, max ±10000)");
+  });
+
+  it("bound is strict (>): exactly ±10000 is still allowed on both sides", async () => {
+    expect(await evalExpr("9999**2")).toBe("99980001");
+    expect(await evalExpr("10000**2")).toBe("100000000");
+  });
+});
+
+describe("calculator — int results with |value| > 1e15 render as Python f'{:.6e}' (M4)", () => {
+  const evalExpr = (expression: string) => calculatorTool.execute({ expression }, {});
+
+  it("1000000000*10000000 = 1e16 -> '1.000000e+16' (JS toExponential(6) byte-matches Python :.6e here)", async () => {
+    expect(await evalExpr("1000000000*10000000")).toBe("1.000000e+16");
+  });
+
+  it("2**100 -> '1.267651e+30' (rounding at the 7th significant digit matches CPython's bignum :.6e)", async () => {
+    expect(await evalExpr("2**100")).toBe("1.267651e+30");
+  });
+
+  it("negative big int keeps its sign: -2**100 -> '-1.267651e+30'", async () => {
+    expect(await evalExpr("-2**100")).toBe("-1.267651e+30");
+  });
+
+  it("threshold is strict (>): exactly 1e15 stays plain digits; 1e15+1 reformats", async () => {
+    expect(await evalExpr("1000000000000000")).toBe("1000000000000000");
+    expect(await evalExpr("1000000000000001")).toBe("1.000000e+15");
+  });
+
+  it("float results are exempt — v1 gates on isinstance(result, int): 2.0**53 stays str()-rendered, 2**53 (int) reformats", async () => {
+    expect(await evalExpr("2.0**53")).toBe("9007199254740992.0");
+    expect(await evalExpr("2**53")).toBe("9.007199e+15");
+  });
+});
+
 describe("calculator through the real pi pipeline — typebox↔pi regression guard (M2)", () => {
   // registry.ts/calculator.ts build CalculatorParams from @sinclair/typebox
   // @0.34.13 (v2/engine's own declared dependency), but
@@ -323,21 +387,23 @@ describe("calculator through the real pi pipeline — typebox↔pi regression gu
       toolTurn("calculator", { expression: "6*7" }, "tu_regress"),
       textTurn("答案是 42"),
     ]);
+    try {
+      const events = await runTurnThroughAdapter(mock, "6*7 是多少?", {
+        tools: toPiTools([calculatorTool], {}),
+      });
 
-    const events = await runTurnThroughAdapter(mock, "6*7 是多少?", {
-      tools: toPiTools([calculatorTool], {}),
-    });
+      const toolUse = events.find((e) => e.type === "tool_use")?.data as
+        | { id: string; name: string; input: Record<string, unknown> }
+        | undefined;
+      expect(toolUse).toEqual({ id: "tu_regress", name: "calculator", input: { expression: "6*7" } });
 
-    const toolUse = events.find((e) => e.type === "tool_use")?.data as
-      | { id: string; name: string; input: Record<string, unknown> }
-      | undefined;
-    expect(toolUse).toEqual({ id: "tu_regress", name: "calculator", input: { expression: "6*7" } });
-
-    const toolResult = events.find((e) => e.type === "tool_result")?.data as
-      | { id: string; result: string }
-      | undefined;
-    expect(toolResult).toEqual({ id: "tu_regress", result: "42" });
-
-    await mock.close();
+      const toolResult = events.find((e) => e.type === "tool_result")?.data as
+        | { id: string; result: string }
+        | undefined;
+      expect(toolResult).toEqual({ id: "tu_regress", result: "42" });
+    } finally {
+      // A failed assertion above must not leak the listening mock server.
+      await mock.close();
+    }
   });
 });
