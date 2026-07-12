@@ -254,4 +254,190 @@ describe("listRepos / listReposForUser（v1 database.py list_repos/get_user_repo
     expect(storage.listReposForUser(uid1)).toMatchObject([{ name: "demo-repo", access_level: "write" }]);
     expect(storage.listReposForUser(uid2)).toEqual([]);
   });
+
+  it("getUserRepos 与 listReposForUser 同语义（v1 get_user_repos 的独立命名）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const db = new Database(dbPath);
+    seedRepoWithPermission(db, uid, "admin");
+    db.close();
+    expect(storage.getUserRepos(uid)).toEqual(storage.listReposForUser(uid));
+    expect(storage.getUserRepos(uid)).toMatchObject([{ name: "demo-repo", access_level: "admin" }]);
+  });
+});
+
+describe("getUserById / listUsers / updateUserPassword / setUserActive / deleteUser（v1 database.py 同语义，Task 1）", () => {
+  it("create → getById → list → updatePassword → setActive → delete 全链路", () => {
+    const id = storage.createUser("alice", "hashed-pw", "user");
+
+    const byId = storage.getUserById(id);
+    expect(byId).toMatchObject({ id, username: "alice", password_hash: "hashed-pw", role: "user", is_active: 1 });
+
+    const listed = storage.listUsers();
+    expect(listed).toContainEqual({ id, username: "alice", role: "user", is_active: 1, created_at: byId!.created_at });
+    // password_hash 必须被排除在 SELECT 之外，而不是取回后再删
+    expect(listed.every((u) => !("password_hash" in u))).toBe(true);
+
+    storage.updateUserPassword(id, "new-hash");
+    expect(storage.getUserById(id)!.password_hash).toBe("new-hash");
+
+    storage.setUserActive(id, false);
+    expect(storage.getUserById(id)!.is_active).toBe(0);
+    storage.setUserActive(id, true);
+    expect(storage.getUserById(id)!.is_active).toBe(1);
+
+    storage.deleteUser(id);
+    expect(storage.getUserById(id)).toBeNull();
+  });
+
+  it("getUserById 查无此人 ⇒ null", () => {
+    expect(storage.getUserById(999)).toBeNull();
+  });
+
+  it("listUsers 按 id 排序，空表返回 []", () => {
+    expect(storage.listUsers()).toEqual([]);
+    const id1 = storage.createUser("zed", "pw");
+    const id2 = storage.createUser("amy", "pw");
+    expect(storage.listUsers().map((u) => u.id)).toEqual([id1, id2]);
+  });
+
+  it("deleteUser 级联清掉该用户的 permissions（FK CASCADE），不影响 sessions 之外的数据完整性", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "r1", url: "https://example.com/r1.git" });
+    storage.grantPermission(uid, repoId, "read");
+    expect(storage.listPermissions().length).toBe(1);
+    storage.deleteUser(uid);
+    expect(storage.listPermissions().length).toBe(0);
+  });
+});
+
+describe("getRepo / createRepo / updateRepo / deleteRepo（v1 database.py 同语义，Task 1）", () => {
+  it("create → get → update(动态字段) → delete 级联清 permissions", () => {
+    const repoId = storage.createRepo({
+      name: "demo",
+      url: "https://example.com/demo.git",
+      description: "desc",
+      branch: "main",
+      credUsername: "bot",
+      credToken: "secret",
+    });
+    expect(typeof repoId).toBe("number");
+
+    const got = storage.getRepo(repoId);
+    expect(got).toMatchObject({ id: repoId, name: "demo", url: "https://example.com/demo.git", description: "desc", branch: "main", access_level: null });
+
+    // 只传部分字段：未传字段必须原样保留（动态 SET builder 语义）
+    storage.updateRepo(repoId, { name: "demo-renamed" });
+    expect(storage.getRepo(repoId)).toMatchObject({ name: "demo-renamed", url: "https://example.com/demo.git", branch: "main" });
+
+    // sync 相关字段（last_sync_* / index_status / local_path）不在 RepoRow 的公开列里，直接查库验证落库
+    storage.updateRepo(repoId, {
+      localPath: "/data/repos/demo",
+      lastSyncAt: "2020-01-01T00:00:00.000000",
+      lastSyncStatus: "ok",
+      lastSyncMessage: "synced",
+      indexStatus: "indexed",
+      lastSyncSha: "abc123",
+    });
+    const db = new Database(dbPath);
+    const raw = db.prepare("SELECT * FROM repositories WHERE id = ?").get(repoId) as any;
+    db.close();
+    expect(raw).toMatchObject({
+      local_path: "/data/repos/demo",
+      last_sync_at: "2020-01-01T00:00:00.000000",
+      last_sync_status: "ok",
+      last_sync_message: "synced",
+      index_status: "indexed",
+      last_sync_sha: "abc123",
+    });
+
+    // branch/credUsername/credToken 传空字符串 ⇒ 落库为 NULL（对照 v1 的 `x or None`）
+    storage.updateRepo(repoId, { branch: "", credUsername: "", credToken: "" });
+    const db2 = new Database(dbPath);
+    const raw2 = db2.prepare("SELECT branch, cred_username, cred_token FROM repositories WHERE id = ?").get(repoId) as any;
+    db2.close();
+    expect(raw2).toEqual({ branch: null, cred_username: null, cred_token: null });
+
+    storage.deleteRepo(repoId);
+    expect(storage.getRepo(repoId)).toBeNull();
+  });
+
+  it("createRepo 省略可选字段：description 默认为空串，branch/cred 默认为 null", () => {
+    const repoId = storage.createRepo({ name: "bare", url: "https://example.com/bare.git" });
+    const db = new Database(dbPath);
+    const raw = db.prepare("SELECT * FROM repositories WHERE id = ?").get(repoId) as any;
+    db.close();
+    expect(raw).toMatchObject({ description: "", branch: null, cred_username: null, cred_token: null, local_path: null });
+  });
+
+  it("updateRepo 不传任何字段 ⇒ no-op（不炸，也不改动任何列）", () => {
+    const repoId = storage.createRepo({ name: "untouched", url: "https://example.com/u.git" });
+    const before = storage.getRepo(repoId);
+    storage.updateRepo(repoId, {});
+    expect(storage.getRepo(repoId)).toEqual(before);
+  });
+
+  it("getRepo 查无此仓库 ⇒ null", () => {
+    expect(storage.getRepo(999)).toBeNull();
+  });
+
+  it("deleteRepo 级联删除 permissions（显式两条 DELETE，先 permissions 后 repositories）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo", url: "https://example.com/demo.git" });
+    storage.grantPermission(uid, repoId, "read");
+    expect(storage.listPermissions().length).toBe(1);
+    storage.deleteRepo(repoId);
+    expect(storage.getRepo(repoId)).toBeNull();
+    expect(storage.listPermissions().length).toBe(0);
+  });
+});
+
+describe("grantPermission / listPermissions / revokePermission（v1 database.py 同语义，Task 1）", () => {
+  it("grant → list(JOIN 出 username/repo_name) → revoke", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+
+    const permId = storage.grantPermission(uid, repoId, "read");
+    expect(typeof permId).toBe("number");
+
+    const perms = storage.listPermissions();
+    expect(perms).toMatchObject([
+      { user_id: uid, username: "alice", repo_id: repoId, repo_name: "demo-repo", access_level: "read" },
+    ]);
+    expect(perms[0].created_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+
+    storage.revokePermission(uid, repoId);
+    expect(storage.listPermissions()).toEqual([]);
+  });
+
+  it("grantPermission 对已存在的 (user, repo) 是 UPSERT：更新 access_level 而不是报 UNIQUE 冲突", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    storage.grantPermission(uid, repoId, "read");
+    storage.grantPermission(uid, repoId, "admin");
+    const perms = storage.listPermissions();
+    expect(perms.length).toBe(1);
+    expect(perms[0].access_level).toBe("admin");
+  });
+
+  it("revokePermission 对不存在的授权是 no-op（不炸）", () => {
+    expect(() => storage.revokePermission(999, 999)).not.toThrow();
+  });
+
+  it("listPermissions 按 username, repo_name 排序，空表返回 []", () => {
+    expect(storage.listPermissions()).toEqual([]);
+    const uidZ = storage.createUser("zed", "pw");
+    const uidA = storage.createUser("amy", "pw");
+    const repoId = storage.createRepo({ name: "r1", url: "https://example.com/r1.git" });
+    storage.grantPermission(uidZ, repoId, "read");
+    storage.grantPermission(uidA, repoId, "read");
+    expect(storage.listPermissions().map((p) => p.username)).toEqual(["amy", "zed"]);
+  });
+
+  it("FK 约束真实生效：对不存在的 user_id/repo_id 授权直接炸 FOREIGN KEY（DB 层不做业务层 404，交给调用方）", () => {
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    expect(() => storage.grantPermission(999, repoId, "read")).toThrow(/FOREIGN KEY/i);
+
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    expect(() => storage.grantPermission(uid, 999, "read")).toThrow(/FOREIGN KEY/i);
+  });
 });

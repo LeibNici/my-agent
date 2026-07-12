@@ -1,13 +1,27 @@
 import { Worker } from "node:worker_threads";
 import { once } from "node:events";
-import type { StoredMessageRow, LlmMetricsRow, UserRow, SessionRow, RepoRow } from "./storage.js";
+import type {
+  StoredMessageRow,
+  LlmMetricsRow,
+  UserRow,
+  SessionRow,
+  RepoRow,
+  CreateRepoFields,
+  UpdateRepoFields,
+  PermissionRow,
+} from "./storage.js";
 
 export type DbClient = {
   addMessage(sessionId: string, role: string, content: string | unknown[]): Promise<number>;
   getMessages(sessionId: string): Promise<StoredMessageRow[]>;
   recordLlmCallMetrics(rows: LlmMetricsRow[]): Promise<void>;
   getUserByUsername(username: string): Promise<UserRow | null>;
+  getUserById(userId: number): Promise<UserRow | null>;
   createUser(username: string, passwordHash: string, role?: string): Promise<number>;
+  listUsers(): Promise<Omit<UserRow, "password_hash">[]>;
+  updateUserPassword(userId: number, passwordHash: string): Promise<void>;
+  setUserActive(userId: number, active: boolean): Promise<void>;
+  deleteUser(userId: number): Promise<void>;
   createSession(title: string, ownerId: number | null): Promise<string>;
   listSessions(ownerId: number | null): Promise<SessionRow[]>;
   getSession(sessionId: string): Promise<SessionRow | null>;
@@ -15,6 +29,14 @@ export type DbClient = {
   deleteSession(sessionId: string): Promise<void>;
   listRepos(): Promise<RepoRow[]>;
   listReposForUser(userId: number): Promise<RepoRow[]>;
+  getUserRepos(userId: number): Promise<RepoRow[]>;
+  getRepo(repoId: number): Promise<RepoRow | null>;
+  createRepo(fields: CreateRepoFields): Promise<number>;
+  updateRepo(repoId: number, fields: UpdateRepoFields): Promise<void>;
+  deleteRepo(repoId: number): Promise<void>;
+  grantPermission(userId: number, repoId: number, accessLevel: string): Promise<number>;
+  revokePermission(userId: number, repoId: number): Promise<void>;
+  listPermissions(): Promise<PermissionRow[]>;
   close(): Promise<void>;
 };
 
@@ -116,6 +138,12 @@ export function createDbClient(dbPath: string): DbClient {
     getUserByUsername: (username) => call<UserRow | null>("getUserByUsername", [username]),
     createUser: (username, passwordHash, role) =>
       call<number>("createUser", [username, passwordHash, role]),
+    getUserById: (userId) => call<UserRow | null>("getUserById", [userId]),
+    listUsers: () => call<Omit<UserRow, "password_hash">[]>("listUsers", []),
+    updateUserPassword: (userId, passwordHash) =>
+      call<void>("updateUserPassword", [userId, passwordHash]),
+    setUserActive: (userId, active) => call<void>("setUserActive", [userId, active]),
+    deleteUser: (userId) => call<void>("deleteUser", [userId]),
     createSession: (title, ownerId) => call<string>("createSession", [title, ownerId]),
     listSessions: (ownerId) => call<SessionRow[]>("listSessions", [ownerId]),
     getSession: (sessionId) => call<SessionRow | null>("getSession", [sessionId]),
@@ -123,6 +151,15 @@ export function createDbClient(dbPath: string): DbClient {
     deleteSession: (sessionId) => call<void>("deleteSession", [sessionId]),
     listRepos: () => call<RepoRow[]>("listRepos", []),
     listReposForUser: (userId) => call<RepoRow[]>("listReposForUser", [userId]),
+    getUserRepos: (userId) => call<RepoRow[]>("getUserRepos", [userId]),
+    getRepo: (repoId) => call<RepoRow | null>("getRepo", [repoId]),
+    createRepo: (fields) => call<number>("createRepo", [fields]),
+    updateRepo: (repoId, fields) => call<void>("updateRepo", [repoId, fields]),
+    deleteRepo: (repoId) => call<void>("deleteRepo", [repoId]),
+    grantPermission: (userId, repoId, accessLevel) =>
+      call<number>("grantPermission", [userId, repoId, accessLevel]),
+    revokePermission: (userId, repoId) => call<void>("revokePermission", [userId, repoId]),
+    listPermissions: () => call<PermissionRow[]>("listPermissions", []),
     close: () => {
       // 幂等：第二次及以后的 close() 返回同一个 promise（resolve-as-noop），不再发 RPC。
       if (!closePromise) {

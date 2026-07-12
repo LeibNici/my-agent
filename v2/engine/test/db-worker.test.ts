@@ -102,4 +102,50 @@ describe("createDbClient", () => {
     await client.updateSessionTitle(sid, "衍生出的标题");
     expect((await client.getSession(sid))!.title).toBe("衍生出的标题");
   });
+
+  it("getUserById / listUsers / updateUserPassword / setUserActive / deleteUser 经 worker 的写读回环（Task 1）", async () => {
+    const id = await client.createUser("alice", "hashed-pw", "user");
+    expect((await client.getUserById(id))!.password_hash).toBe("hashed-pw");
+
+    const listed = await client.listUsers();
+    expect(listed).toContainEqual(expect.objectContaining({ id, username: "alice" }));
+    expect(listed.every((u) => !("password_hash" in u))).toBe(true);
+
+    await client.updateUserPassword(id, "new-hash");
+    expect((await client.getUserById(id))!.password_hash).toBe("new-hash");
+
+    await client.setUserActive(id, false);
+    expect((await client.getUserById(id))!.is_active).toBe(0);
+
+    await client.deleteUser(id);
+    expect(await client.getUserById(id)).toBeNull();
+  });
+
+  it("repo CRUD 经 worker 的写读回环：createRepo → getRepo → updateRepo → getUserRepos → deleteRepo（Task 1）", async () => {
+    const uid = await client.createUser("alice", "hashed-pw", "user");
+    const repoId = await client.createRepo({ name: "demo", url: "https://example.com/demo.git" });
+    expect((await client.getRepo(repoId))!.name).toBe("demo");
+
+    await client.updateRepo(repoId, { name: "demo-renamed" });
+    expect((await client.getRepo(repoId))!.name).toBe("demo-renamed");
+
+    await client.grantPermission(uid, repoId, "write");
+    expect(await client.getUserRepos(uid)).toMatchObject([{ id: repoId, access_level: "write" }]);
+
+    await client.revokePermission(uid, repoId);
+    expect(await client.getUserRepos(uid)).toEqual([]);
+
+    await client.deleteRepo(repoId);
+    expect(await client.getRepo(repoId)).toBeNull();
+  });
+
+  it("listPermissions 经 worker 的 JOIN 回环；grantPermission 对不存在的 repo 经 worker 仍 reject 为 FOREIGN KEY（Task 1）", async () => {
+    const uid = await client.createUser("alice", "hashed-pw", "user");
+    const repoId = await client.createRepo({ name: "demo", url: "https://example.com/demo.git" });
+    await client.grantPermission(uid, repoId, "read");
+    const perms = await client.listPermissions();
+    expect(perms).toMatchObject([{ username: "alice", repo_name: "demo", access_level: "read" }]);
+
+    await expect(client.grantPermission(uid, 999, "read")).rejects.toThrow(/FOREIGN KEY/i);
+  });
 });

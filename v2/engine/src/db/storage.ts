@@ -56,12 +56,59 @@ export type RepoRow = {
   access_level: string | null;
 };
 
+// create_repo's writable fields (Task 1 / v1's create_repo — local_path is
+// deliberately excluded: it's populated later by the sync process, not at
+// creation time).
+export type CreateRepoFields = {
+  name: string;
+  url: string;
+  description?: string;
+  branch?: string | null;
+  credUsername?: string | null;
+  credToken?: string | null;
+};
+
+// update_repo's dynamic SET builder — every field is optional-and-omittable
+// (undefined = "leave column untouched"); branch/credUsername/credToken
+// additionally fold "" to NULL on write, matching v1's `x or None`.
+export type UpdateRepoFields = Partial<{
+  name: string;
+  url: string;
+  description: string;
+  localPath: string;
+  branch: string | null;
+  credUsername: string | null;
+  credToken: string | null;
+  lastSyncAt: string;
+  lastSyncStatus: string;
+  lastSyncMessage: string;
+  indexStatus: string;
+  lastSyncSha: string | null;
+}>;
+
+// list_permissions' JOIN row — username/repo_name resolved through
+// users/repositories so callers don't need a second round-trip.
+export type PermissionRow = {
+  id: number;
+  user_id: number;
+  username: string;
+  repo_id: number;
+  repo_name: string;
+  access_level: string;
+  created_at: string;
+};
+
 export type Storage = {
   addMessage(sessionId: string, role: string, content: string | unknown[]): number;
   getMessages(sessionId: string): StoredMessageRow[];
   recordLlmCallMetrics(rows: LlmMetricsRow[]): void;
   getUserByUsername(username: string): UserRow | null;
+  getUserById(userId: number): UserRow | null;
   createUser(username: string, passwordHash: string, role?: string): number;
+  listUsers(): Omit<UserRow, "password_hash">[];
+  updateUserPassword(userId: number, passwordHash: string): void;
+  setUserActive(userId: number, active: boolean): void;
+  deleteUser(userId: number): void;
   createSession(title: string, ownerId: number | null): string;
   listSessions(ownerId: number | null): SessionRow[];
   getSession(sessionId: string): SessionRow | null;
@@ -69,6 +116,14 @@ export type Storage = {
   deleteSession(sessionId: string): void;
   listRepos(): RepoRow[];
   listReposForUser(userId: number): RepoRow[];
+  getUserRepos(userId: number): RepoRow[];
+  getRepo(repoId: number): RepoRow | null;
+  createRepo(fields: CreateRepoFields): number;
+  updateRepo(repoId: number, fields: UpdateRepoFields): void;
+  deleteRepo(repoId: number): void;
+  grantPermission(userId: number, repoId: number, accessLevel: string): number;
+  revokePermission(userId: number, repoId: number): void;
+  listPermissions(): PermissionRow[];
   close(): void;
 };
 
@@ -169,7 +224,10 @@ export function openStorage(dbPath: string): Storage {
   // Check schema
   checkSchema(db);
 
-  return {
+  // `storage` is bound to the object below, but its methods only read the
+  // binding at call time (not during literal construction) — self-reference
+  // (getUserRepos delegating to listReposForUser) is safe.
+  const storage: Storage = {
     addMessage(sessionId: string, role: string, content: string | unknown[]): number {
       const now = pyLocalIsoNow();
       const contentStr =
@@ -277,6 +335,37 @@ export function openStorage(dbPath: string): Storage {
       return Number(res.lastInsertRowid);
     },
 
+    getUserById(userId: number): UserRow | null {
+      const row = db
+        .prepare("SELECT * FROM users WHERE id = ?")
+        .get(userId) as UserRow | undefined;
+      return row ?? null;
+    },
+
+    // v1's list_users: password_hash deliberately excluded from the SELECT
+    // (not just stripped after the fact) — never round-trips through this path.
+    listUsers(): Omit<UserRow, "password_hash">[] {
+      const rows = db
+        .prepare("SELECT id, username, role, is_active, created_at FROM users ORDER BY id")
+        .all();
+      return rows as Omit<UserRow, "password_hash">[];
+    },
+
+    updateUserPassword(userId: number, passwordHash: string): void {
+      db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(passwordHash, userId);
+    },
+
+    setUserActive(userId: number, active: boolean): void {
+      db.prepare("UPDATE users SET is_active = ? WHERE id = ?").run(active ? 1 : 0, userId);
+    },
+
+    // No explicit permissions/sessions cleanup here — matches v1's single
+    // DELETE FROM users; the schema's FKs (permissions.user_id ON DELETE
+    // CASCADE, sessions.owner_id ON DELETE SET NULL) do the rest.
+    deleteUser(userId: number): void {
+      db.prepare("DELETE FROM users WHERE id = ?").run(userId);
+    },
+
     // v1's create_session: mint uuid4()[:8] (first 8 hex chars — the
     // segment before the first '-' in a v4 UUID string), retry up to 5x on
     // the rare PK collision, then give up loudly rather than hang forever.
@@ -370,8 +459,124 @@ export function openStorage(dbPath: string): Storage {
       return rows as RepoRow[];
     },
 
+    // v1's get_user_repos — same JOIN as listReposForUser, exposed under
+    // its own v1-matching name for the admin API (Task 1 brief). Delegates
+    // rather than re-running the query so the JOIN has one source of truth.
+    getUserRepos(userId: number): RepoRow[] {
+      return storage.listReposForUser(userId);
+    },
+
+    // Admin single-repo lookup. Mirrors listRepos' public column set
+    // (access_level always null, no permissions JOIN) rather than v1's
+    // `SELECT *` — the credential/sync-status columns stay internal to
+    // updateRepo's dynamic SET builder per the Task 1 brief's signature.
+    getRepo(repoId: number): RepoRow | null {
+      const row = db
+        .prepare("SELECT id, name, url, description, branch FROM repositories WHERE id = ?")
+        .get(repoId) as Omit<RepoRow, "access_level"> | undefined;
+      return row ? { ...row, access_level: null } : null;
+    },
+
+    // v1's create_repo — local_path intentionally omitted from the writable
+    // fields (Task 1 brief): it's populated later by the sync process, not
+    // at creation time.
+    createRepo(fields: CreateRepoFields): number {
+      const now = pyLocalIsoNow();
+      const res = db
+        .prepare(
+          "INSERT INTO repositories (name, url, description, branch, cred_username, cred_token, created_at) " +
+            "VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run(
+          fields.name,
+          fields.url,
+          fields.description ?? "",
+          fields.branch ?? null,
+          fields.credUsername ?? null,
+          fields.credToken ?? null,
+          now
+        );
+      return Number(res.lastInsertRowid);
+    },
+
+    // v1's update_repo: dynamic SET builder — only fields actually passed
+    // (undefined) are touched; a no-op call (no fields) skips the UPDATE
+    // entirely. branch/credUsername/credToken fold "" to NULL on write,
+    // matching v1's `x or None`.
+    updateRepo(repoId: number, fields: UpdateRepoFields): void {
+      const setClauses: string[] = [];
+      const values: unknown[] = [];
+      const set = (column: string, value: unknown) => {
+        setClauses.push(`${column} = ?`);
+        values.push(value);
+      };
+
+      if (fields.name !== undefined) set("name", fields.name);
+      if (fields.url !== undefined) set("url", fields.url);
+      if (fields.branch !== undefined) set("branch", fields.branch || null);
+      if (fields.credUsername !== undefined) set("cred_username", fields.credUsername || null);
+      if (fields.credToken !== undefined) set("cred_token", fields.credToken || null);
+      if (fields.description !== undefined) set("description", fields.description);
+      if (fields.localPath !== undefined) set("local_path", fields.localPath);
+      if (fields.lastSyncAt !== undefined) set("last_sync_at", fields.lastSyncAt);
+      if (fields.lastSyncStatus !== undefined) set("last_sync_status", fields.lastSyncStatus);
+      if (fields.lastSyncMessage !== undefined) set("last_sync_message", fields.lastSyncMessage);
+      if (fields.indexStatus !== undefined) set("index_status", fields.indexStatus);
+      if (fields.lastSyncSha !== undefined) set("last_sync_sha", fields.lastSyncSha);
+
+      if (setClauses.length === 0) return;
+      values.push(repoId);
+      db.prepare(`UPDATE repositories SET ${setClauses.join(", ")} WHERE id = ?`).run(...values);
+    },
+
+    // Explicit two DELETEs (permissions then repositories), matching v1's
+    // delete_repo exactly, both in one transaction for atomicity.
+    deleteRepo(repoId: number): void {
+      const txn = db.transaction(() => {
+        db.prepare("DELETE FROM permissions WHERE repo_id = ?").run(repoId);
+        db.prepare("DELETE FROM repositories WHERE id = ?").run(repoId);
+      });
+      txn();
+    },
+
+    // v1's grant_permission: INSERT ... ON CONFLICT(user_id, repo_id) DO
+    // UPDATE — re-granting an existing (user, repo) pair updates its
+    // access_level in place rather than erroring on the UNIQUE constraint.
+    grantPermission(userId: number, repoId: number, accessLevel: string): number {
+      const now = pyLocalIsoNow();
+      const res = db
+        .prepare(
+          "INSERT INTO permissions (user_id, repo_id, access_level, created_at) VALUES (?, ?, ?, ?) " +
+            "ON CONFLICT(user_id, repo_id) DO UPDATE SET access_level = excluded.access_level"
+        )
+        .run(userId, repoId, accessLevel, now);
+      return Number(res.lastInsertRowid);
+    },
+
+    revokePermission(userId: number, repoId: number): void {
+      db.prepare("DELETE FROM permissions WHERE user_id = ? AND repo_id = ?").run(userId, repoId);
+    },
+
+    // v1's list_permissions — JOINed through users/repositories so callers
+    // get username/repo_name without a second round-trip.
+    listPermissions(): PermissionRow[] {
+      const rows = db
+        .prepare(
+          `SELECT p.id, p.user_id, u.username, p.repo_id, r.name as repo_name,
+                  p.access_level, p.created_at
+           FROM permissions p
+           JOIN users u ON p.user_id = u.id
+           JOIN repositories r ON p.repo_id = r.id
+           ORDER BY u.username, r.name`
+        )
+        .all();
+      return rows as PermissionRow[];
+    },
+
     close(): void {
       db.close();
     },
   };
+
+  return storage;
 }

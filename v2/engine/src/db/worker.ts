@@ -47,6 +47,33 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.createUser(username, passwordHash, role) });
         break;
       }
+      case "getUserById": {
+        const [userId] = args as [number];
+        reply({ id, ok: true, result: storage.getUserById(userId) });
+        break;
+      }
+      case "listUsers": {
+        reply({ id, ok: true, result: storage.listUsers() });
+        break;
+      }
+      case "updateUserPassword": {
+        const [userId, passwordHash] = args as [number, string];
+        storage.updateUserPassword(userId, passwordHash);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "setUserActive": {
+        const [userId, active] = args as [number, boolean];
+        storage.setUserActive(userId, active);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "deleteUser": {
+        const [userId] = args as [number];
+        storage.deleteUser(userId);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
       case "createSession": {
         const [title, ownerId] = args as [string, number | null];
         reply({ id, ok: true, result: storage.createSession(title, ownerId) });
@@ -81,6 +108,48 @@ parentPort.on("message", (req: Request) => {
       case "listReposForUser": {
         const [userId] = args as [number];
         reply({ id, ok: true, result: storage.listReposForUser(userId) });
+        break;
+      }
+      case "getUserRepos": {
+        const [userId] = args as [number];
+        reply({ id, ok: true, result: storage.getUserRepos(userId) });
+        break;
+      }
+      case "getRepo": {
+        const [repoId] = args as [number];
+        reply({ id, ok: true, result: storage.getRepo(repoId) });
+        break;
+      }
+      case "createRepo": {
+        const [fields] = args as [Parameters<typeof storage.createRepo>[0]];
+        reply({ id, ok: true, result: storage.createRepo(fields) });
+        break;
+      }
+      case "updateRepo": {
+        const [repoId, fields] = args as [number, Parameters<typeof storage.updateRepo>[1]];
+        storage.updateRepo(repoId, fields);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "deleteRepo": {
+        const [repoId] = args as [number];
+        storage.deleteRepo(repoId);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "grantPermission": {
+        const [userId, repoId, accessLevel] = args as [number, number, string];
+        reply({ id, ok: true, result: storage.grantPermission(userId, repoId, accessLevel) });
+        break;
+      }
+      case "revokePermission": {
+        const [userId, repoId] = args as [number, number];
+        storage.revokePermission(userId, repoId);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "listPermissions": {
+        reply({ id, ok: true, result: storage.listPermissions() });
         break;
       }
       case "close": {
