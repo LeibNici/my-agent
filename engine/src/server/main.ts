@@ -55,14 +55,14 @@ function toSyncDescriptors(rows: FullRepoRow[]): RepoSyncDescriptor[] {
   }));
 }
 
-// This file lives at <repoRoot>/v2/engine/src/server/main.ts — four `..`
+// This file lives at <repoRoot>/engine/src/server/main.ts — three `..`
 // hops off its own directory lands on repo root, the exact same derivation
 // app.ts's WEB_ROOT uses for `web/` (see that file's comment for why this
 // must be import.meta.url-derived rather than process.cwd()-relative:
-// `npm start` runs with cwd=v2/engine, not the repo root, so anything
+// `npm start` runs with cwd=engine, not the repo root, so anything
 // cwd-relative would silently break the moment someone launches this any
 // other way, e.g. a systemd unit with a different WorkingDirectory).
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
 // v1 had no APP_DB_PATH-equivalent: `DB_PATH` was a Python module constant
 // (`"agent_data.db"`, implicitly cwd-relative — safe there only because

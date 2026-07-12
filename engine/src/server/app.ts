@@ -47,14 +47,14 @@ export type BuildAppDeps = {
 
 export type Env = { Variables: { user: CurrentUser } };
 
-// web/ lives at the repo root, two levels up from v2/engine
-// (<root>/v2/engine/src/server/app.ts -> <root>/web). Resolved from THIS
+// web/ lives at the repo root, two levels up from engine
+// (<root>/engine/src/server/app.ts -> <root>/web). Resolved from THIS
 // file's own location (import.meta.url), never process.cwd():
 // @hono/node-server's serveStatic resolves a RELATIVE root against cwd
 // (see its own .d.ts comment), which would silently break the moment the
 // process is launched from anywhere but the repo root — an absolute root
 // sidesteps that entirely.
-const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../web");
+const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../web");
 
 // v1 app/main.py:80-83 — static client-side limits, unrelated to any
 // specific request; kept here (not in sse.ts) since GET /api/config is a

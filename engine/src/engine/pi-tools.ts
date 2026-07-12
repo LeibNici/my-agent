@@ -1,6 +1,6 @@
 // Domain ToolDef[] -> pi's AgentTool[] shape.
 //
-// pi-type-bearing by design (see v2/engine/README.md's layer-boundary
+// pi-type-bearing by design (see engine/README.md's layer-boundary
 // table, which names codec-pi.ts and event-adapter.ts as the only files
 // allowed to import @earendil-works/pi-agent-core/pi-ai types) — Task 3
 // adds this file as a third, explicitly carved out for the same reason:

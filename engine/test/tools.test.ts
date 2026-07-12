@@ -379,7 +379,7 @@ describe("calculator — int results with |value| > 1e15 render as Python f'{:.6
 
 describe("calculator through the real pi pipeline — typebox↔pi regression guard (M2)", () => {
   // registry.ts/calculator.ts build CalculatorParams from @sinclair/typebox
-  // @0.34.13 (v2/engine's own declared dependency), but
+  // @0.34.13 (engine's own declared dependency), but
   // @earendil-works/pi-agent-core / pi-ai depend on a *different*, unscoped
   // typebox@1.1.38 package for their own TSchema/argument validation (see
   // Task 3 report's "typebox vs pi's typebox" section — verified there with

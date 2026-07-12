@@ -1,8 +1,8 @@
 {
-  "name": "codex-v2-engine",
+  "name": "codeaxis-engine",
   "version": "0.1.0",
   "type": "module",
-  "description": "CodeAxis v2 domain DTO layer and event codec",
+  "description": "CodeAxis domain DTO layer and event codec",
   "scripts": {
     "start": "exec tsx src/server/main.ts",
     "test": "vitest run",

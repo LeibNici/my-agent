@@ -42,7 +42,7 @@ memory.
 ## Running
 
 ```bash
-cd v2/engine
+cd engine
 npm install
 npm start           # the service: HTTP/SSE edge + real pi engine, port 8000 (APP_PORT)
 npm test            # vitest, all offline (mock Anthropic server)
@@ -53,15 +53,15 @@ npm run typecheck
 → db worker → admin bootstrap (admin/admin123 unless `APP_ADMIN_PASSWORD`;
 loud warning on the default) → Hono app with the real `runTurn` engine.
 SQLite lives at the repo root (`agent_data.db`, override `APP_DB_PATH`);
-`.env` is read from the process cwd (`v2/engine` under `npm start`). Set
+`.env` is read from the process cwd (`engine` under `npm start`). Set
 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL` for the real
 provider (DashScope in production). Required-vars table:
-`v2/engine/README.md`'s 运行 section. Tool surface is calculator-only until
+`engine/README.md`'s 运行 section. Tool surface is calculator-only until
 Phase 4; the frontend (`web/`, static, no build step) is served by the Node
 edge at `/`, `/login`, `/admin`, `/static/*` — admin/issue/feedback pages
 404 until their Phase 4/5 routes return.
 
-## Architecture (v2/engine)
+## Architecture (engine)
 
 Three-layer DTO isolation (a Codex-review global constraint): **pi types may
 only appear in `src/codec-pi.ts` and `src/event-adapter.ts`** — everything
@@ -102,7 +102,7 @@ Schema ownership: with Python gone, **Node owns DDL** (Phase 3 adds
   Phase 1 anticorruption layer, Phase 2 DB compat). Historical docs;
   their "strangler/shadow" phasing predates the no-users pivot to a
   straight rewrite.
-- `v2/engine/README.md` — layer boundary rules, Phase-1 limitations,
+- `engine/README.md` — layer boundary rules, Phase-1 limitations,
   DB byte-compat facts and known gaps
 - `spikes/` — frozen evidence from the 0A/0B validation gates; never
   import from or modify these

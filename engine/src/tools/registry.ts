@@ -1,6 +1,6 @@
 // Tool registry — domain-terms tool definitions + registration/lookup.
 //
-// No pi types here (see v2/engine/README.md's layer-boundary table): a
+// No pi types here (see engine/README.md's layer-boundary table): a
 // ToolDef speaks only typebox + plain strings/promises. The mapping to
 // pi's AgentTool shape lives in src/engine/pi-tools.ts, which is the file
 // allowed to import pi types for this task.
