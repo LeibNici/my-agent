@@ -70,6 +70,20 @@ function adminRepoView(repo: FullRepoRow): Record<string, unknown> {
 
 const ACCESS_LEVELS = new Set(["read", "write", "admin"]);
 
+// BUG-001 (QA report): repeat/double-click submissions of the same repo URL
+// silently created duplicate rows — no uniqueness check existed anywhere
+// (v1 had none either, git show v1-python-final:app/database.py's
+// create_repo; confirmed not a v2 regression). Trailing-slash/`.git`-suffix
+// differences are the realistic "same repo, slightly different spelling"
+// case (not case-folded — git hosts are commonly case-sensitive on the
+// path segment, only case-INsensitive on the host, and collapsing that
+// would risk conflating two genuinely different repos).
+function normalizeRepoUrl(url: string): string {
+  let u = url.trim().replace(/\/+$/, "");
+  if (u.toLowerCase().endsWith(".git")) u = u.slice(0, -4);
+  return u;
+}
+
 export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
   const sync: SyncAndPersistFn = deps.syncAndPersist ?? realSyncAndPersist;
 
@@ -173,6 +187,18 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     const branch = typeof body.branch === "string" ? body.branch : null;
     const credUsername = typeof body.cred_username === "string" ? body.cred_username : null;
     const credToken = typeof body.cred_token === "string" ? body.cred_token : null;
+
+    // BUG-001 (QA report): reject an obvious duplicate before cloning — see
+    // normalizeRepoUrl's comment. A check-then-insert has a narrow TOCTOU
+    // window between two truly simultaneous requests, but this is an
+    // admin-only, human-driven action (not a hot path); the frontend's
+    // disable-on-submit (web/admin.js) covers the realistic case (an
+    // impatient double-click), and this covers a deliberate re-submission.
+    const normalizedNewUrl = normalizeRepoUrl(body.url);
+    const existingRepos = await deps.db.listRepos();
+    if (existingRepos.some((r) => normalizeRepoUrl(r.url) === normalizedNewUrl)) {
+      return c.json({ detail: "A repository with this URL already exists" }, 409);
+    }
 
     const id = await deps.db.createRepo({
       name: body.name,

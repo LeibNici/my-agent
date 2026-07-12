@@ -6,6 +6,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import {
+  getActiveRepo,
   getAllowedPaths,
   getToolUserId,
   isWithinAllowedPaths,
@@ -229,5 +230,61 @@ describe("noAccessReason", () => {
       "Access denied: you have permission to repo1, repo2 " +
       "but it hasn't synced successfully yet (ask an admin to check the repo's clone status)";
     expect(reason).toBe(expected);
+  });
+});
+
+describe("getActiveRepo", () => {
+  it("returns null when grantedRepos is undefined (never wired for this call site)", () => {
+    const ctx: ToolContext = {
+      allowedRepoPaths: [],
+      unsyncedRepoNames: [],
+      userId: null,
+    };
+    expect(getActiveRepo(ctx)).toBeNull();
+  });
+
+  it("returns null when grantedRepos is an empty array (zero visible repos)", () => {
+    const ctx: ToolContext = {
+      allowedRepoPaths: [],
+      unsyncedRepoNames: [],
+      userId: null,
+      grantedRepos: [],
+    };
+    expect(getActiveRepo(ctx)).toBeNull();
+  });
+
+  it("returns the single entry when grantedRepos has exactly one repo (the unambiguous case)", () => {
+    const repo = { id: 1, name: "demo", localPath: "/repos/demo" };
+    const ctx: ToolContext = {
+      allowedRepoPaths: [],
+      unsyncedRepoNames: [],
+      userId: null,
+      grantedRepos: [repo],
+    };
+    expect(getActiveRepo(ctx)).toEqual(repo);
+  });
+
+  it("returns the single entry even when its localPath is null (granted but never synced)", () => {
+    const repo = { id: 2, name: "unsynced-demo", localPath: null };
+    const ctx: ToolContext = {
+      allowedRepoPaths: [],
+      unsyncedRepoNames: ["unsynced-demo"],
+      userId: null,
+      grantedRepos: [repo],
+    };
+    expect(getActiveRepo(ctx)).toEqual(repo);
+  });
+
+  it("returns null when grantedRepos has two or more entries (ambiguous — the tool must ask, not guess)", () => {
+    const ctx: ToolContext = {
+      allowedRepoPaths: [],
+      unsyncedRepoNames: [],
+      userId: null,
+      grantedRepos: [
+        { id: 1, name: "demo1", localPath: "/repos/demo1" },
+        { id: 2, name: "demo2", localPath: "/repos/demo2" },
+      ],
+    };
+    expect(getActiveRepo(ctx)).toBeNull();
   });
 });

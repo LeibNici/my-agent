@@ -111,7 +111,12 @@ export function decodeToken(token: string, settings: Settings): DecodedToken {
  */
 export interface UserStore {
   getUserByUsername(username: string): unknown;
-  createUser(username: string, passwordHash: string, role?: string): unknown;
+  createUser(
+    username: string,
+    passwordHash: string,
+    role?: string,
+    mustChangePassword?: boolean
+  ): unknown;
 }
 
 /**
@@ -119,19 +124,27 @@ export interface UserStore {
  * second call finds the existing user and no-ops (no warning, no re-create,
  * no UNIQUE constraint error). Warning copy is verbatim v1's
  * app/main.py:ensure_admin_user startup print.
+ *
+ * BUG-003 (QA report): the default password is well-known and was staying
+ * usable indefinitely — bootstrapping with it now also flags the account
+ * must_change_password, which the login route surfaces so the frontend can
+ * block on a mandatory change before letting the user past the login
+ * screen. An operator-supplied APP_ADMIN_PASSWORD is trusted as already
+ * deliberate and does NOT set the flag.
  */
 export async function ensureAdminUser(store: UserStore, settings: Settings): Promise<void> {
   const existing = await store.getUserByUsername(settings.adminUsername);
   if (existing) {
     return;
   }
-  if (settings.adminPassword === "admin123") {
+  const usingDefaultPassword = settings.adminPassword === "admin123";
+  if (usingDefaultPassword) {
     console.log("=".repeat(60));
     console.log("⚠️  WARNING: Using default admin password 'admin123'!");
     console.log("   Set APP_ADMIN_PASSWORD in .env for production use.");
     console.log("=".repeat(60));
   }
   const passwordHash = await hashPassword(settings.adminPassword);
-  await store.createUser(settings.adminUsername, passwordHash, "admin");
+  await store.createUser(settings.adminUsername, passwordHash, "admin", usingDefaultPassword);
   console.log(`Admin user '${settings.adminUsername}' created`);
 }

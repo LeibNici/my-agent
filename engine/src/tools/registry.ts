@@ -35,6 +35,15 @@ export type ToolContext = {
    * `ctx.db` needs it, and it must degrade silently (no log, no error)
    * when absent, matching v1's "logging is best-effort" design. */
   db?: DbClient;
+  /** This turn's visible repos with id/name/localPath (Phase 5) — the same
+   * `granted` set resolveToolContext (src/server/sse.ts) already computes
+   * for allowedRepoPaths/unsyncedRepoNames, just not yet collapsed away.
+   * Optional for the same reason as `db`: many existing call sites (tests
+   * included) construct a ToolContext literal without it and must keep
+   * compiling. draft_issue/manage_issue (src/tools/github-issue.ts) use
+   * this via access.ts's getActiveRepo to figure out which repo an issue
+   * targets when the user hasn't said so explicitly. */
+  grantedRepos?: { id: number; name: string; localPath: string | null }[];
 };
 
 export type ToolDef<T extends TSchema = TSchema> = {

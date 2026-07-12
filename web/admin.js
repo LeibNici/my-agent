@@ -162,7 +162,7 @@ async function loadRepos() {
     } catch {}
 })();
 
-async function createRepo() {
+async function createRepo(btn) {
     const name = document.getElementById("new-repo-name").value.trim();
     const url = document.getElementById("new-repo-url").value.trim();
     const branch = document.getElementById("new-repo-branch").value.trim();
@@ -170,23 +170,30 @@ async function createRepo() {
     const credToken = document.getElementById("new-repo-cred-token").value.trim();
     const desc = document.getElementById("new-repo-desc").value.trim();
     if (!name || !url) return showMsg("请填写名称和 URL", false);
-    const { ok, data } = await apiRequest("/api/admin/repos", {
-        method: "POST",
-        body: JSON.stringify({
-            name, url, branch: branch || null,
-            cred_username: credUsername || null, cred_token: credToken || null,
-            description: desc,
-        }),
-    });
-    if (!ok) return showMsg(data.detail || "创建失败", false);
-    showMsg(`仓库 ${name} 添加成功`);
-    document.getElementById("new-repo-name").value = "";
-    document.getElementById("new-repo-url").value = "";
-    document.getElementById("new-repo-branch").value = "";
-    document.getElementById("new-repo-cred-username").value = "";
-    document.getElementById("new-repo-cred-token").value = "";
-    document.getElementById("new-repo-desc").value = "";
-    loadRepos();
+    // 防止手速快/网络慢时重复点击在后端去重检查生效前就已经并发提交两次
+    // （克隆本身也要跑好几秒，双击窗口不小）。
+    btn.disabled = true;
+    try {
+        const { ok, data } = await apiRequest("/api/admin/repos", {
+            method: "POST",
+            body: JSON.stringify({
+                name, url, branch: branch || null,
+                cred_username: credUsername || null, cred_token: credToken || null,
+                description: desc,
+            }),
+        });
+        if (!ok) return showMsg(data.detail || "创建失败", false);
+        showMsg(`仓库 ${name} 添加成功`);
+        document.getElementById("new-repo-name").value = "";
+        document.getElementById("new-repo-url").value = "";
+        document.getElementById("new-repo-branch").value = "";
+        document.getElementById("new-repo-cred-username").value = "";
+        document.getElementById("new-repo-cred-token").value = "";
+        document.getElementById("new-repo-desc").value = "";
+        loadRepos();
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 async function openRepoEdit(id) {

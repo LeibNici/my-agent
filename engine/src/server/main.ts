@@ -34,6 +34,7 @@ import {
   configureIndexing,
   type RepoSyncDescriptor,
 } from "../repo-sync.js";
+import { periodicTrackingLoop } from "../issue-tracker.js";
 import { buildApp } from "./app.js";
 
 // listReposFull() returns the admin/internal full row shape (snake_case,
@@ -195,6 +196,15 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
     settings.reposDir
   );
 
+  // Issue-tracking poller (Phase 5) — same fire-and-forget shape as
+  // repoSync above, and the same reason: v1's lifespan starts
+  // periodic_tracking_loop as its own background task alongside
+  // periodic_sync_loop, not sequenced with it. A non-positive
+  // issueTrackIntervalMinutes disables it (periodicTrackingLoop's own
+  // guard), matching v1's `if not interval_minutes or interval_minutes <=
+  // 0: return`.
+  const issueTracking = periodicTrackingLoop(settings.issueTrackIntervalMinutes, db, settings);
+
   // engine: runTurn already IS a RunTurnFn — `(deps: RunTurnDeps, req) =>
   // AsyncGenerator<DomainEvent>` — with no wrapping needed here. buildApp
   // (src/server/app.ts) registers the tool list itself (side-effecting
@@ -224,6 +234,11 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
         // is synchronous (just clears the pending timer, see
         // repo-sync.ts's periodicSyncLoop) — nothing to await here.
         repoSync.stop();
+        // Same reasoning for the issue-tracking poller (periodicTrackingLoop
+        // copies periodicSyncLoop's exact shape) — it must be cancelled
+        // before the db/server it would otherwise keep polling against are
+        // torn down.
+        issueTracking.stop();
         await new Promise<void>((resolve, reject) => {
           server.close((err) => (err ? reject(err) : resolve()));
           // On Node >=19, server.close() already closes IDLE keep-alive

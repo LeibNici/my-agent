@@ -8,10 +8,12 @@ import type {
   AssistantMessage as PiAssistantMessage,
   ToolResultMessage as PiToolResultMessage,
   TextContent as PiTextContent,
+  ImageContent as PiImageContent,
+  ThinkingContent as PiThinkingContent,
   ToolCall as PiToolCall,
   Usage as PiUsage,
 } from "@earendil-works/pi-ai";
-import { DomainMessage, DomainBlock, ToolUseBlock, CodecError } from "./domain.js";
+import { DomainMessage, DomainBlock, ToolUseBlock, ThinkingBlock, CodecError } from "./domain.js";
 
 const ZERO_USAGE: PiUsage = {
   input: 0,
@@ -44,11 +46,19 @@ export function domainToPi(
     const blocks = toDomainBlocks(msg.content);
 
     if (msg.role === "assistant") {
-      const content: (PiTextContent | PiToolCall)[] = [];
+      const content: (PiTextContent | PiThinkingContent | PiToolCall)[] = [];
       for (const block of blocks) {
         switch (block.type) {
           case "text":
             content.push({ type: "text", text: block.text });
+            break;
+          case "thinking":
+            content.push({
+              type: "thinking",
+              thinking: block.thinking,
+              thinkingSignature: block.thinkingSignature,
+              redacted: block.redacted,
+            });
             break;
           case "tool_use":
             content.push({
@@ -60,9 +70,12 @@ export function domainToPi(
             toolNameById.set(block.id, block.name);
             break;
           case "image":
-            throw new CodecError(
-              "Image blocks in assistant messages are not supported in Phase 1"
-            );
+            // Not a Phase-1 gap (unlike the old user-message throw this
+            // codec used to have) — pi-ai's own AssistantMessage.content
+            // type structurally excludes ImageContent (only
+            // TextContent|ThinkingContent|ToolCall), matching Anthropic
+            // itself never emitting an image block in an assistant turn.
+            throw new CodecError("Unexpected image block in assistant message");
           case "tool_result":
             throw new CodecError("Unexpected tool_result block in assistant message");
           default: {
@@ -87,15 +100,20 @@ export function domainToPi(
     }
 
     // role === "user": tool_result blocks each become an independent
-    // toolResult message (rule 3); any text blocks trailing them become a
-    // separate trailing user message (rule 4, D1 default: pi's own
-    // double-user shape, no manual merge — see Task 1 REPORT-phase1.md).
-    // This assumes legacy's invariant that text never precedes tool_result
-    // in the same message (app/agent.py always builds
-    // tool_result_blocks + [reminder_text]) — enforced below rather than
-    // silently reordered, matching this switch's fail-loud handling of
-    // every other invalid shape (tool_use/image in a user message).
-    const trailingText: PiTextContent[] = [];
+    // toolResult message (rule 3); any text/image blocks trailing them
+    // become a separate trailing user message (rule 4, D1 default: pi's
+    // own double-user shape, no manual merge — see Task 1
+    // REPORT-phase1.md). This assumes legacy's invariant that text never
+    // precedes tool_result in the same message (app/agent.py always
+    // builds tool_result_blocks + [reminder_text]) — enforced below
+    // rather than silently reordered, matching this switch's fail-loud
+    // handling of every other invalid shape (tool_use in a user message).
+    // Images are always fresh user input (sse.ts puts them before the
+    // text block, matching v1's `user_content = [image blocks..., text]`)
+    // — they never coexist with a tool_result in the same domain message,
+    // but nothing here assumes that; an image just accumulates into the
+    // same trailing array as text, in whatever order it appears.
+    const trailingContent: (PiTextContent | PiImageContent)[] = [];
     let seenText = false;
     for (const block of blocks) {
       switch (block.type) {
@@ -124,24 +142,34 @@ export function domainToPi(
         }
         case "text":
           seenText = true;
-          trailingText.push({ type: "text", text: block.text });
+          trailingContent.push({ type: "text", text: block.text });
           break;
         case "image":
-          throw new CodecError(
-            "Image blocks in user messages are not supported in Phase 1"
-          );
+          // pi-ai's ImageContent field names are data/mimeType, not
+          // base64Data/mediaType — a rename, not a structural change; pi's
+          // own Anthropic provider re-wraps this into the
+          // {type:"image",source:{type:"base64",media_type,data}} shape
+          // internally (see anthropic-messages.js's convertContentBlocks).
+          trailingContent.push({ type: "image", data: block.base64Data, mimeType: block.mediaType });
+          break;
         case "tool_use":
           throw new CodecError("Unexpected tool_use block in user message");
+        case "thinking":
+          // Structurally assistant-only; this case exists purely to satisfy
+          // the exhaustiveness check now that ThinkingBlock is part of
+          // DomainBlock — should never fire against data this codec itself
+          // produces.
+          throw new CodecError("Unexpected thinking block in user message");
         default: {
           const _exhaustive: never = block;
           throw new CodecError(`Unknown domain block type: ${_exhaustive}`);
         }
       }
     }
-    if (trailingText.length > 0) {
+    if (trailingContent.length > 0) {
       const user: PiUserMessage = {
         role: "user",
-        content: trailingText,
+        content: trailingContent,
         timestamp: nextTimestamp(),
       };
       out.push(user);
@@ -169,10 +197,15 @@ export function piAssistantToDomain(m: PiAssistantMessage): {
         };
         return toolUse;
       }
-      case "thinking":
-        throw new CodecError(
-          "Thinking blocks are not supported in Phase 1 (no domain equivalent)"
-        );
+      case "thinking": {
+        const thinking: ThinkingBlock = {
+          type: "thinking",
+          thinking: block.thinking,
+          thinkingSignature: block.thinkingSignature,
+          redacted: block.redacted,
+        };
+        return thinking;
+      }
       default: {
         const _exhaustive: never = block;
         throw new CodecError(`Unknown pi content type: ${_exhaustive}`);

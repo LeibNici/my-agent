@@ -5,6 +5,7 @@ import {
   ImageBlock,
   ToolUseBlock,
   ToolResultBlock,
+  ThinkingBlock,
   CodecError,
 } from "./domain.js";
 
@@ -118,6 +119,25 @@ function convertLegacyBlockToDomain(block: unknown): DomainBlock {
         isError,
       } as ToolResultBlock;
     }
+    case "thinking": {
+      if (typeof b.thinking !== "string") {
+        throw new CodecError("Thinking block missing or invalid 'thinking' field");
+      }
+      const block: ThinkingBlock = { type: "thinking", thinking: b.thinking };
+      if (b.thinking_signature !== undefined) {
+        if (typeof b.thinking_signature !== "string") {
+          throw new CodecError("Thinking block 'thinking_signature' must be a string if present");
+        }
+        block.thinkingSignature = b.thinking_signature;
+      }
+      if (b.redacted !== undefined) {
+        if (typeof b.redacted !== "boolean") {
+          throw new CodecError("Thinking block 'redacted' must be boolean if present");
+        }
+        block.redacted = b.redacted;
+      }
+      return block;
+    }
     default:
       throw new CodecError(`Unknown block type: ${type}`);
   }
@@ -152,6 +172,20 @@ function convertDomainBlockToLegacy(block: DomainBlock): Record<string, unknown>
       // Omit is_error if false (the default)
       if (block.isError) {
         result.is_error = true;
+      }
+      return result;
+    }
+    case "thinking": {
+      // Omit thinking_signature/redacted when absent/false (is_error's
+      // convention) — required, not stylistic: pythonJsonDumps has no case
+      // for JS `undefined` and throws if a key is ever explicitly assigned
+      // undefined instead of omitted.
+      const result: Record<string, unknown> = { type: "thinking", thinking: block.thinking };
+      if (block.thinkingSignature !== undefined) {
+        result.thinking_signature = block.thinkingSignature;
+      }
+      if (block.redacted) {
+        result.redacted = true;
       }
       return result;
     }

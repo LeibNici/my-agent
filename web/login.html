@@ -216,7 +216,7 @@
     </aside>
 
     <main class="form-panel">
-        <div class="login-card">
+        <div class="login-card" id="login-card">
             <h1>Welcome back.</h1>
             <p class="sub">登录以进入你的工作区</p>
             <form onsubmit="handleLogin(event)">
@@ -230,6 +230,31 @@
                 </div>
                 <button type="submit" class="login-btn" id="login-btn">登录</button>
                 <div class="error-msg" id="error-msg"></div>
+            </form>
+        </div>
+
+        <!-- BUG-003: shown instead of redirecting when the login response
+             carries must_change_password:true (currently only the
+             bootstrap admin account, still on the well-known default
+             password) — the account is unusable until this succeeds. -->
+        <div class="login-card" id="change-password-card" style="display:none">
+            <h1>请修改密码</h1>
+            <p class="sub">首次登录使用的是默认密码，需修改后才能继续</p>
+            <form onsubmit="handleChangePassword(event)">
+                <div class="form-group">
+                    <label for="current-password">当前密码</label>
+                    <input type="password" id="current-password" required autocomplete="current-password">
+                </div>
+                <div class="form-group">
+                    <label for="new-password">新密码</label>
+                    <input type="password" id="new-password" required autocomplete="new-password" minlength="8">
+                </div>
+                <div class="form-group">
+                    <label for="new-password-confirm">确认新密码</label>
+                    <input type="password" id="new-password-confirm" required autocomplete="new-password" minlength="8">
+                </div>
+                <button type="submit" class="login-btn" id="change-password-btn">修改密码并继续</button>
+                <div class="error-msg" id="change-password-error"></div>
             </form>
         </div>
     </main>
@@ -259,6 +284,10 @@
             }
             localStorage.setItem("token", data.token);
             localStorage.setItem("user", JSON.stringify(data.user));
+            if (data.user.must_change_password) {
+                showChangePasswordCard();
+                return;
+            }
             // Redirect based on role
             window.location.href = data.user.role === "admin" ? "/admin" : "/";
         } catch (err) {
@@ -267,11 +296,66 @@
         }
     }
 
-    // If already logged in, redirect
+    function showChangePasswordCard() {
+        document.getElementById("login-card").style.display = "none";
+        document.getElementById("change-password-card").style.display = "block";
+    }
+
+    // BUG-003: mandatory gate — must_change_password only clears once
+    // /api/auth/change-password actually succeeds (storage.ts's
+    // updateUserPassword clears it server-side in the same statement).
+    async function handleChangePassword(e) {
+        e.preventDefault();
+        const btn = document.getElementById("change-password-btn");
+        const errEl = document.getElementById("change-password-error");
+        const newPassword = document.getElementById("new-password").value;
+        const confirmPassword = document.getElementById("new-password-confirm").value;
+        errEl.textContent = "";
+        if (newPassword !== confirmPassword) {
+            errEl.textContent = "两次输入的新密码不一致";
+            return;
+        }
+        btn.disabled = true;
+
+        try {
+            const resp = await fetch("/api/auth/change-password", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${localStorage.getItem("token")}`,
+                },
+                body: JSON.stringify({
+                    current_password: document.getElementById("current-password").value,
+                    new_password: newPassword,
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                errEl.textContent = data.detail || "修改失败";
+                btn.disabled = false;
+                return;
+            }
+            const user = JSON.parse(localStorage.getItem("user"));
+            user.must_change_password = false;
+            localStorage.setItem("user", JSON.stringify(user));
+            window.location.href = user.role === "admin" ? "/admin" : "/";
+        } catch (err) {
+            errEl.textContent = "网络错误，请重试";
+            btn.disabled = false;
+        }
+    }
+
+    // If already logged in, redirect — unless a password change is still
+    // mandatory, in which case show that gate immediately rather than
+    // letting a stale must_change_password:true session bypass it.
     if (localStorage.getItem("token")) {
         try {
             const user = JSON.parse(localStorage.getItem("user"));
-            window.location.href = user.role === "admin" ? "/admin" : "/";
+            if (user.must_change_password) {
+                showChangePasswordCard();
+            } else {
+                window.location.href = user.role === "admin" ? "/admin" : "/";
+            }
         } catch { /* ignore */ }
     }
     </script>

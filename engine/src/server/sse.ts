@@ -30,30 +30,70 @@ import type { LlmMetricsRow } from "../db/storage.js";
 import type { Settings } from "../config.js";
 import type { RunTurnFn, RunTurnDeps } from "../engine/turn.js";
 import type { ToolDef, ToolContext } from "../tools/registry.js";
-import type { DomainBlock } from "../domain.js";
+import type { DomainBlock, ImageBlock } from "../domain.js";
 import { domainToLegacy } from "../codec-legacy.js";
 
 // v1 app/main.py:75 — verbatim.
 export const MAX_MESSAGE_LENGTH = 10000;
+
+// v1 app/main.py:77-83 — verbatim. Canonical home for these (moved from
+// app.ts, which only re-exports MAX_IMAGES_PER_MESSAGE/MAX_IMAGE_BASE64_CHARS
+// for /api/config now) since this is where they're actually enforced,
+// matching MAX_MESSAGE_LENGTH living wherever it's checked.
+export const MAX_IMAGES_PER_MESSAGE = 5;
+export const MAX_IMAGE_BASE64_CHARS = 6_000_000;
+const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+export type ChatImage = { media_type: string; data: string };
 
 export type ChatRequestBody = {
   session_id?: string | null;
   message: string;
   // Accepted for wire-shape compatibility with the frontend's POST body
   // (web/app.js always sends these). skills/tools are calculator-only with
-  // no skill gating (GET /api/skills returns [] — see app.ts); current-turn
-  // image blocks are a known pre-existing gap (codec-pi.ts's domainToPi
-  // throws on image DomainBlocks; RunTurnRequest.userText is plain string
-  // only — Task 4 never extended it) and stay silently ignored, not
-  // rejected — v1's MAX_MESSAGE_LENGTH check is the only "reject" path this
-  // phase ports. repo_id DOES act on something as of Task 8: it narrows
-  // resolveToolContext's granted-repo set to a single repo (v1's
+  // no skill gating (GET /api/skills returns [] — see app.ts). repo_id
+  // narrows resolveToolContext's granted-repo set to a single repo (v1's
   // `if req.repo_id: granted_repos = [r for r in all_repos if r["id"] ==
   // req.repo_id]`).
   active_skills?: string[];
   repo_id?: number | null;
-  images?: unknown[];
+  images?: ChatImage[];
 };
+
+/** v1's `_validate_images` (app/main.py:86-102) — returns an error message
+ * if the image attachments are invalid, else null. The base64-well-formedness
+ * check matters for more than "is this a real image": this data later gets
+ * interpolated into a `<img src="data:...">` string on the frontend, so
+ * malformed input here is a stored-XSS vector, not just a broken image. */
+function validateImages(images: ChatImage[]): string | null {
+  if (images.length > MAX_IMAGES_PER_MESSAGE) {
+    return `Too many images (${images.length}). Max ${MAX_IMAGES_PER_MESSAGE} per message.`;
+  }
+  for (const img of images) {
+    if (!ALLOWED_IMAGE_TYPES.has(img.media_type)) {
+      return `Unsupported image type: ${img.media_type}. Allowed: ${[...ALLOWED_IMAGE_TYPES].sort().join(", ")}.`;
+    }
+    if (img.data.length > MAX_IMAGE_BASE64_CHARS) {
+      const maxMb = Math.round(((MAX_IMAGE_BASE64_CHARS * 3) / 4 / 1_000_000) * 10) / 10;
+      return `Image too large (max ~${maxMb}MB decoded).`;
+    }
+    if (!isWellFormedBase64(img.data)) {
+      return "Image data is not valid base64.";
+    }
+  }
+  return null;
+}
+
+// Node has no base64 "validate: true" option like Python's base64.b64decode
+// — Buffer.from(str, "base64") silently ignores invalid characters instead
+// of throwing, so well-formedness needs an explicit shape check: base64
+// alphabet only, length a multiple of 4, at most two trailing `=` padding
+// characters (RFC 4648 §4). Round-tripping through Buffer and re-encoding
+// would also work but is O(n) allocation just to validate shape; a regex
+// is equivalent and cheaper for a check that runs on every message.
+function isWellFormedBase64(s: string): boolean {
+  return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(s);
+}
 
 export type SseFrame = { event: string; data: string };
 
@@ -101,6 +141,8 @@ export async function resolveToolContext(db: DbClient, user: CurrentUser, repoId
     allowedRepoPaths: granted.filter((r) => r.local_path).map((r) => r.local_path as string),
     unsyncedRepoNames: granted.filter((r) => !r.local_path).map((r) => r.name),
     userId: user.id,
+    db,
+    grantedRepos: granted.map((r) => ({ id: r.id, name: r.name, localPath: r.local_path })),
   };
 }
 
@@ -178,6 +220,22 @@ export async function* chatEventStream(
     return;
   }
 
+  const images = req.images ?? [];
+  const imageError = validateImages(images);
+  if (imageError) {
+    yield* sseReject(imageError);
+    return;
+  }
+  // Domain-shaped (mediaType/base64Data), always ordered before the text
+  // block — matches v1's `user_content = [image blocks..., text]`
+  // (app/main.py:413-420). Both the DB-persisted content and the fresh
+  // turn's RunTurnRequest.images below are built from this same array.
+  const domainImages: ImageBlock[] = images.map((img) => ({
+    type: "image",
+    mediaType: img.media_type,
+    base64Data: img.data,
+  }));
+
   // Distinguishes, for the client, WHY session_id might differ from what it
   // sent — "new" (no id was sent), "not_found" (the id it sent no longer
   // exists), "resolved" (that thread's task is already done). null when the
@@ -209,7 +267,14 @@ export async function* chatEventStream(
   yield { event: "session", data: JSON.stringify({ session_id: sessionId, reason: switchReason }) };
 
   const history = await db.getMessages(sessionId);
-  await db.addMessage(sessionId, "user", req.message);
+  // v1 persists the SAME content it sends the model: images (if any) first,
+  // then the text block, only when non-blank (app/main.py:413-420) — a
+  // plain string when there's no image, matching the existing/common case.
+  const userContent: string | unknown[] =
+    domainImages.length > 0
+      ? [...legacyContent(domainImages), ...(req.message ? [{ type: "text", text: req.message }] : [])]
+      : req.message;
+  await db.addMessage(sessionId, "user", userContent);
 
   let fullText = "";
   // Text streamed since the last fully-persisted tool exchange — the
@@ -228,7 +293,12 @@ export async function* chatEventStream(
   // resolveToolContext's own comment for the v1 correspondence.
   const ctx = await resolveToolContext(db, user, req.repo_id);
   const runTurnDeps: RunTurnDeps = { db, settings, tools, ctx };
-  const engineIter = engine(runTurnDeps, { sessionId, history, userText: req.message })[Symbol.asyncIterator]();
+  const engineIter = engine(runTurnDeps, {
+    sessionId,
+    history,
+    userText: req.message,
+    images: domainImages.length > 0 ? domainImages : undefined,
+  })[Symbol.asyncIterator]();
 
   try {
     for (;;) {

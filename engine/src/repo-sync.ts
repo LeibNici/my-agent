@@ -114,8 +114,10 @@ async function isDisallowedHost(host: string): Promise<boolean> {
 
 const ALLOWED_PROTOCOLS = ["https://", "http://", "git://"];
 
-/** URL 不安全时返回错误信息，否则返回 null。 */
-async function validateUrl(url: string): Promise<string | null> {
+/** URL 不安全时返回错误信息，否则返回 null。 Exported so issue-tracker-client.ts
+ * can reuse the same SSRF gate when computing a GitLab project's API base
+ * URL from its git URL, instead of reimplementing host validation. */
+export async function validateUrl(url: string): Promise<string | null> {
   if (!ALLOWED_PROTOCOLS.some((p) => url.startsWith(p))) {
     return "Invalid URL protocol: only https://, http://, and git:// are allowed";
   }

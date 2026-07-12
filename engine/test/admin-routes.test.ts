@@ -253,6 +253,61 @@ describe("repos", () => {
     }
   });
 
+  it("POST 同一 URL 重复提交 → 409，不产生第二条仓库记录（BUG-001）", async () => {
+    // 本地不存在的路径（同 "PATCH url 变更导致 resync 失败" 用例的写法）——
+    // sync 会失败但 POST 本身仍返回 200（只有 PATCH 才在 resync 失败时 502），
+    // 而且失败得够快，不用等真正的网络/git 超时。
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const url = join(reposDir, "dup-test-repo");
+    const first = await authed(app, token, "/api/admin/repos", {
+      method: "POST",
+      body: JSON.stringify({ name: "r1", url }),
+    });
+    expect(first.status).toBe(200);
+
+    const second = await authed(app, token, "/api/admin/repos", {
+      method: "POST",
+      body: JSON.stringify({ name: "r1-again", url }),
+    });
+    expect(second.status).toBe(409);
+    expect(await second.json()).toEqual({ detail: "A repository with this URL already exists" });
+
+    const all = await client.listRepos();
+    expect(all.filter((r) => r.url === url)).toHaveLength(1);
+  });
+
+  it("POST 同一仓库但 URL 只差末尾斜杠 → 仍判定重复 → 409", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const url = join(reposDir, "dup-test-repo2");
+    const first = await authed(app, token, "/api/admin/repos", {
+      method: "POST",
+      body: JSON.stringify({ name: "r1", url }),
+    });
+    expect(first.status).toBe(200);
+
+    const second = await authed(app, token, "/api/admin/repos", {
+      method: "POST",
+      body: JSON.stringify({ name: "r1-slash", url: `${url}/` }),
+    });
+    expect(second.status).toBe(409);
+  });
+
+  it("POST 真正不同的 URL → 正常创建，不受重复检查影响", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    await authed(app, token, "/api/admin/repos", {
+      method: "POST",
+      body: JSON.stringify({ name: "r1", url: join(reposDir, "dup-test-repo3a") }),
+    });
+    const second = await authed(app, token, "/api/admin/repos", {
+      method: "POST",
+      body: JSON.stringify({ name: "r2", url: join(reposDir, "dup-test-repo3b") }),
+    });
+    expect(second.status).toBe(200);
+  });
+
   it("GET list applies _admin_repo_view: has_token bool, no cred_token, masked url", async () => {
     const { token } = await seedUser("admin");
     const repoId = await client.createRepo({

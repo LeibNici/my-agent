@@ -71,7 +71,8 @@ JSON shapes confined to the `src/codec-legacy.ts` boundary.
 - `src/domain.ts` — typed message/event model, `CodecError`
 - `src/codec-legacy.ts` — legacy JSON dict shapes ↔ domain (validating boundary)
 - `src/codec-pi.ts` — domain ↔ pi messages (toolName backfill by tool_use_id;
-  throws on image/thinking blocks — known Phase-1 limitations, see README)
+  throws on an image block in an assistant message — a real pi-ai/Anthropic
+  library constraint, not a gap, see README)
 - `src/event-adapter.ts` — pi AgentEvent stream → domain event sequence
   (text_delta/llm_metrics/tool_use/tool_result/tool_exchange/done/error).
   pi has NO error event: errors surface as message_end with

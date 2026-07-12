@@ -11,6 +11,23 @@ import type {
   UpdateRepoFields,
   PermissionRow,
   RecordSemanticSearchLogRow,
+  RecordIssueSubmissionFields,
+  IssueSubmissionRow,
+  TrackableSubmissionRow,
+  UpdateIssueTrackingFields,
+  UpsertFixReportFields,
+  UnverifiedFixReportRow,
+  MyIssueSubmissionRow,
+  IssueTrackingOverview,
+  RecordIssueActionFields,
+  IssueActionRow,
+  UsageSummary,
+  UsageByUserRow,
+  FeedbackSummary,
+  NegativeFeedbackRow,
+  RecentLlmCallRow,
+  SemanticSearchStats,
+  SemanticSearchRecentRow,
 } from "./storage.js";
 
 export type DbClient = {
@@ -19,7 +36,12 @@ export type DbClient = {
   recordLlmCallMetrics(rows: LlmMetricsRow[]): Promise<void>;
   getUserByUsername(username: string): Promise<UserRow | null>;
   getUserById(userId: number): Promise<UserRow | null>;
-  createUser(username: string, passwordHash: string, role?: string): Promise<number>;
+  createUser(
+    username: string,
+    passwordHash: string,
+    role?: string,
+    mustChangePassword?: boolean
+  ): Promise<number>;
   listUsers(): Promise<Omit<UserRow, "password_hash">[]>;
   updateUserPassword(userId: number, passwordHash: string): Promise<void>;
   setUserActive(userId: number, active: boolean): Promise<void>;
@@ -46,6 +68,30 @@ export type DbClient = {
   revokePermission(userId: number, repoId: number): Promise<void>;
   listPermissions(): Promise<PermissionRow[]>;
   recordSemanticSearchLog(row: RecordSemanticSearchLogRow): Promise<void>;
+  markSessionResolved(sessionId: string): Promise<void>;
+  recordIssueSubmission(fields: RecordIssueSubmissionFields): Promise<number>;
+  getIssueSubmissionsForSession(sessionId: string): Promise<IssueSubmissionRow[]>;
+  getTrackableSubmissions(): Promise<TrackableSubmissionRow[]>;
+  updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields): Promise<void>;
+  upsertFixReport(fields: UpsertFixReportFields): Promise<number>;
+  getUnverifiedFixReports(): Promise<UnverifiedFixReportRow[]>;
+  setFixReportVerified(reportId: number, verified: boolean): Promise<void>;
+  getMyIssueSubmissions(userId: number, limit?: number): Promise<MyIssueSubmissionRow[]>;
+  getMyUnreadIssueCount(userId: number): Promise<number>;
+  markMyIssuesSeen(userId: number): Promise<void>;
+  getIssueTrackingOverview(limit?: number): Promise<IssueTrackingOverview>;
+  recordIssueAction(fields: RecordIssueActionFields): Promise<number>;
+  getIssueActionsForSession(sessionId: string): Promise<IssueActionRow[]>;
+  getUsageSummary(): Promise<UsageSummary>;
+  getUsageByUser(): Promise<UsageByUserRow[]>;
+  getMessageSessionId(messageId: number): Promise<string | null>;
+  setMessageFeedback(messageId: number, sessionId: string, userId: number, rating: number): Promise<void>;
+  getFeedbackForSession(sessionId: string, userId: number): Promise<Record<number, number>>;
+  getFeedbackSummary(): Promise<FeedbackSummary>;
+  getRecentNegativeFeedback(limit?: number): Promise<NegativeFeedbackRow[]>;
+  getRecentLlmCalls(limit?: number): Promise<RecentLlmCallRow[]>;
+  getSemanticSearchStats(): Promise<SemanticSearchStats>;
+  getSemanticSearchRecent(limit?: number, lowScoreOnly?: boolean): Promise<SemanticSearchRecentRow[]>;
   close(): Promise<void>;
 };
 
@@ -145,8 +191,8 @@ export function createDbClient(dbPath: string): DbClient {
     getMessages: (sessionId) => call<StoredMessageRow[]>("getMessages", [sessionId]),
     recordLlmCallMetrics: (rows) => call<void>("recordLlmCallMetrics", [rows]),
     getUserByUsername: (username) => call<UserRow | null>("getUserByUsername", [username]),
-    createUser: (username, passwordHash, role) =>
-      call<number>("createUser", [username, passwordHash, role]),
+    createUser: (username, passwordHash, role, mustChangePassword) =>
+      call<number>("createUser", [username, passwordHash, role, mustChangePassword]),
     getUserById: (userId) => call<UserRow | null>("getUserById", [userId]),
     listUsers: () => call<Omit<UserRow, "password_hash">[]>("listUsers", []),
     updateUserPassword: (userId, passwordHash) =>
@@ -173,6 +219,39 @@ export function createDbClient(dbPath: string): DbClient {
     revokePermission: (userId, repoId) => call<void>("revokePermission", [userId, repoId]),
     listPermissions: () => call<PermissionRow[]>("listPermissions", []),
     recordSemanticSearchLog: (row) => call<void>("recordSemanticSearchLog", [row]),
+    markSessionResolved: (sessionId) => call<void>("markSessionResolved", [sessionId]),
+    recordIssueSubmission: (fields) => call<number>("recordIssueSubmission", [fields]),
+    getIssueSubmissionsForSession: (sessionId) =>
+      call<IssueSubmissionRow[]>("getIssueSubmissionsForSession", [sessionId]),
+    getTrackableSubmissions: () => call<TrackableSubmissionRow[]>("getTrackableSubmissions", []),
+    updateIssueTracking: (submissionId, fields) =>
+      call<void>("updateIssueTracking", [submissionId, fields]),
+    upsertFixReport: (fields) => call<number>("upsertFixReport", [fields]),
+    getUnverifiedFixReports: () => call<UnverifiedFixReportRow[]>("getUnverifiedFixReports", []),
+    setFixReportVerified: (reportId, verified) =>
+      call<void>("setFixReportVerified", [reportId, verified]),
+    getMyIssueSubmissions: (userId, limit) =>
+      call<MyIssueSubmissionRow[]>("getMyIssueSubmissions", [userId, limit]),
+    getMyUnreadIssueCount: (userId) => call<number>("getMyUnreadIssueCount", [userId]),
+    markMyIssuesSeen: (userId) => call<void>("markMyIssuesSeen", [userId]),
+    getIssueTrackingOverview: (limit) => call<IssueTrackingOverview>("getIssueTrackingOverview", [limit]),
+    recordIssueAction: (fields) => call<number>("recordIssueAction", [fields]),
+    getIssueActionsForSession: (sessionId) =>
+      call<IssueActionRow[]>("getIssueActionsForSession", [sessionId]),
+    getUsageSummary: () => call<UsageSummary>("getUsageSummary", []),
+    getUsageByUser: () => call<UsageByUserRow[]>("getUsageByUser", []),
+    getMessageSessionId: (messageId) => call<string | null>("getMessageSessionId", [messageId]),
+    setMessageFeedback: (messageId, sessionId, userId, rating) =>
+      call<void>("setMessageFeedback", [messageId, sessionId, userId, rating]),
+    getFeedbackForSession: (sessionId, userId) =>
+      call<Record<number, number>>("getFeedbackForSession", [sessionId, userId]),
+    getFeedbackSummary: () => call<FeedbackSummary>("getFeedbackSummary", []),
+    getRecentNegativeFeedback: (limit) =>
+      call<NegativeFeedbackRow[]>("getRecentNegativeFeedback", [limit]),
+    getRecentLlmCalls: (limit) => call<RecentLlmCallRow[]>("getRecentLlmCalls", [limit]),
+    getSemanticSearchStats: () => call<SemanticSearchStats>("getSemanticSearchStats", []),
+    getSemanticSearchRecent: (limit, lowScoreOnly) =>
+      call<SemanticSearchRecentRow[]>("getSemanticSearchRecent", [limit, lowScoreOnly]),
     close: () => {
       // 幂等：第二次及以后的 close() 返回同一个 promise（resolve-as-noop），不再发 RPC。
       if (!closePromise) {

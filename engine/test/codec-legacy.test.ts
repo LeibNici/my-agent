@@ -26,6 +26,57 @@ describe("codec-legacy", () => {
     expect((d.content as any)[0]).toEqual({ type: "image", mediaType: "image/png", base64Data: "AAA" });
     expect(domainToLegacy(d)).toEqual(legacyImageMsg);
   });
+  it("thinking 块字段换名双向（thinkingSignature ↔ thinking_signature）", () => {
+    const raw = {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "先算一下这两个数", thinking_signature: "sig_abc123" }],
+    };
+    const d = legacyToDomain(raw);
+    expect((d.content as any)[0]).toEqual({
+      type: "thinking",
+      thinking: "先算一下这两个数",
+      thinkingSignature: "sig_abc123",
+    });
+    expect(domainToLegacy(d)).toEqual(raw);
+  });
+  it("thinking 块 redacted:true + 空正文 + 有签名 → 双向保真", () => {
+    const raw = {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "", thinking_signature: "redacted_opaque_blob", redacted: true }],
+    };
+    const d = legacyToDomain(raw);
+    expect((d.content as any)[0]).toEqual({
+      type: "thinking",
+      thinking: "",
+      thinkingSignature: "redacted_opaque_blob",
+      redacted: true,
+    });
+    expect(domainToLegacy(d)).toEqual(raw);
+  });
+  it("thinking 块 thinking_signature/redacted 缺省时双向省略（同 is_error 惯例）", () => {
+    const raw = { role: "assistant", content: [{ type: "thinking", thinking: "嗯" }] };
+    const d = legacyToDomain(raw);
+    expect((d.content as any)[0]).toEqual({ type: "thinking", thinking: "嗯" });
+    expect(domainToLegacy(d)).toEqual(raw); // 回程不多出 thinking_signature/redacted 字段
+  });
+  it("thinking_signature 非字符串 throw CodecError (fail-loud)", () => {
+    expect(() =>
+      legacyToDomain({
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "x", thinking_signature: 123 }],
+      })
+    ).toThrow(CodecError);
+  });
+  it("redacted 非布尔值 throw CodecError (fail-loud)", () => {
+    expect(() =>
+      legacyToDomain({ role: "assistant", content: [{ type: "thinking", thinking: "x", redacted: "yes" }] })
+    ).toThrow(CodecError);
+  });
+  it("thinking 块缺少 'thinking' 字段 throw CodecError", () => {
+    expect(() =>
+      legacyToDomain({ role: "assistant", content: [{ type: "thinking" }] })
+    ).toThrow(CodecError);
+  });
   it("unicode 原样（不合格评审）", () => {
     const raw = { role: "assistant", content: legacyUnicodeBlocks };
     expect(domainToLegacy(legacyToDomain(raw))).toEqual(raw);

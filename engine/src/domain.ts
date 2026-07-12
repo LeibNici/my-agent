@@ -5,7 +5,8 @@ export type TextBlock = { type: "text"; text: string };
 export type ImageBlock = { type: "image"; mediaType: string; base64Data: string };
 export type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
 export type ToolResultBlock = { type: "tool_result"; toolUseId: string; content: string; isError: boolean };
-export type DomainBlock = TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock;
+export type ThinkingBlock = { type: "thinking"; thinking: string; thinkingSignature?: string; redacted?: boolean };
+export type DomainBlock = TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock;
 
 export type DomainMessage = { role: "user" | "assistant"; content: string | DomainBlock[] };
 

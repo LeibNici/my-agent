@@ -180,6 +180,7 @@ describe("initSchema", () => {
       .all() as Array<{ name: string }>;
     const userColumnNames = usersColumns.map((c) => c.name);
     expect(userColumnNames).toContain("my_issues_seen_at");
+    expect(userColumnNames).toContain("must_change_password");
 
     // Check repositories has migration columns
     const reposColumns = db
@@ -211,6 +212,39 @@ describe("initSchema", () => {
     expect(indexNames).toContain("idx_issue_actions_session");
     expect(indexNames).toContain("idx_sessions_owner");
     expect(indexNames).toContain("idx_semantic_search_log_created");
+  });
+
+  it("BUG-003: retrofits must_change_password onto a pre-existing users table (a prior real deployment) via ALTER TABLE, without losing existing rows", () => {
+    // Simulates the 244 machine's already-deployed db: a `users` table
+    // created BEFORE this column existed. CREATE TABLE IF NOT EXISTS alone
+    // would no-op against this and leave the column missing — this proves
+    // ensureColumn's guarded ALTER TABLE path actually fires.
+    const db = new Database(tmpDbPath);
+    db.exec(`
+      CREATE TABLE users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user',
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL
+      )
+    `);
+    db.prepare(
+      "INSERT INTO users (username, password_hash, role, created_at) VALUES ('preexisting', 'hash', 'admin', 'x')"
+    ).run();
+    db.close();
+
+    expect(() => initSchema(tmpDbPath)).not.toThrow();
+
+    const db2 = new Database(tmpDbPath);
+    const columns = db2.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
+    expect(columns.map((c) => c.name)).toContain("must_change_password");
+    const row = db2.prepare("SELECT * FROM users WHERE username = 'preexisting'").get() as {
+      must_change_password: number;
+    };
+    expect(row.must_change_password).toBe(0);
+    db2.close();
   });
 
   it("applies correct PRAGMAs", () => {

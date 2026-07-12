@@ -37,7 +37,7 @@ import { createEventAdapter } from "../event-adapter.js";
 import { legacyListToDomain } from "../codec-legacy.js";
 import { prepareModelMessages } from "../history-policy.js";
 import { domainToPi } from "../codec-pi.js";
-import type { DomainEvent } from "../domain.js";
+import type { DomainEvent, ImageBlock } from "../domain.js";
 
 const PROVIDER_ID = "anthropic";
 
@@ -284,8 +284,22 @@ async function runWrapup(
 export type RunTurnDeps = { db?: DbClient; settings: Settings; tools: ToolDef[]; ctx: ToolContext };
 // history carries legacy JSON message dicts (DB row shape) — see
 // codec-legacy.ts's legacyListToDomain, which is the validating boundary
-// that turns this `unknown[]` into typed DomainMessage[].
-export type RunTurnRequest = { sessionId: string; history: unknown[]; userText: string };
+// that turns this `unknown[]` into typed DomainMessage[]. images is this
+// turn's fresh attachments (already validated by sse.ts) — kept
+// domain-shaped (mediaType/base64Data, matching ImageBlock) rather than
+// pi-shaped here, converted to pi's ImageContent only at the prompt()
+// call site below. This is a SEPARATE path from codec-pi.ts's image
+// handling: codec-pi.ts converts *history* replayed into a fresh Agent's
+// initialMessages every turn, while this field is the *current* turn's
+// input, injected via Agent.prompt()'s own (text, images) overload —
+// both need to work for a conversation with an earlier image-bearing
+// turn to keep round-tripping correctly on later turns.
+export type RunTurnRequest = {
+  sessionId: string;
+  history: unknown[];
+  userText: string;
+  images?: ImageBlock[];
+};
 
 // The injectable shape of runTurn itself (Task 5's buildApp takes this as
 // `deps.engine` — SSE route tests inject a stub matching this signature
@@ -353,7 +367,10 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
   });
 
   const run = agent
-    .prompt(req.userText)
+    .prompt(
+      req.userText,
+      req.images?.map((img) => ({ type: "image" as const, data: img.base64Data, mimeType: img.mediaType }))
+    )
     .then(async () => {
       if (agent.state.errorMessage || !budgetExhausted) {
         for (const de of finalizeAgentRun(agent, adapter)) channel.put(de);

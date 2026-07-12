@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import type { DbClient } from "../db/client.js";
 import type { Settings } from "../config.js";
 import type { RunTurnFn } from "../engine/turn.js";
-import { createToken, decodeToken, verifyPassword, AuthError } from "../auth.js";
+import { createToken, decodeToken, verifyPassword, hashPassword, AuthError } from "../auth.js";
 import { listTools } from "../tools/registry.js";
 // Side-effecting registrations (Task 8 closes Phase 4a): each of these
 // files calls registerTool() at import time — calculator (Phase 3's one
@@ -31,8 +31,18 @@ import "../tools/file-reader.js";
 import "../tools/code-search.js";
 import "../tools/symbol-index.js";
 import "../tools/semantic-search.js";
-import { chatEventStream, userOwnsSession, type ChatRequestBody, type CurrentUser } from "./sse.js";
+import "../tools/github-issue.js";
+import {
+  chatEventStream,
+  userOwnsSession,
+  MAX_IMAGES_PER_MESSAGE,
+  MAX_IMAGE_BASE64_CHARS,
+  type ChatRequestBody,
+  type CurrentUser,
+} from "./sse.js";
 import { mountAdminRoutes, type SyncAndPersistFn } from "./admin-routes.js";
+import { mountAdminDashboardRoutes } from "./admin-dashboard-routes.js";
+import { mountIssueRoutes } from "./issue-routes.js";
 
 export type BuildAppDeps = {
   db: DbClient;
@@ -57,15 +67,12 @@ export type Env = { Variables: { user: CurrentUser } };
 const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../web");
 
 // v1 app/main.py:80-83 — static client-side limits, unrelated to any
-// specific request; kept here (not in sse.ts) since GET /api/config is a
-// plain route, not part of the chat/turn orchestration. Images themselves
-// are not wired end to end yet (see sse.ts's ChatRequestBody comment) but
-// the frontend's loadConfig() unconditionally reads these two fields to
-// override its own client-side defaults, so the shape/values still need
-// to match v1's — a missing/zero response here would silently change the
-// frontend's own upload limits.
-const MAX_IMAGES_PER_MESSAGE = 5;
-const MAX_IMAGE_BASE64_CHARS = 6_000_000;
+// specific request; the frontend's loadConfig() unconditionally reads
+// these two fields to override its own client-side defaults, so the
+// shape/values still need to match v1's — a missing/zero response here
+// would silently change the frontend's own upload limits. Canonical
+// values live in sse.ts (where they're actually enforced); re-exported
+// here since GET /api/config is a plain route, not chat/turn orchestration.
 
 // v1 app/main.py:164-178 — in-memory login throttle, ported verbatim:
 // per-process only (won't coordinate across replicas), but meaningfully
@@ -165,10 +172,51 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     }
     loginAttempts.delete(body.username);
     const token = createToken({ id: user.id, username: user.username, role: user.role }, deps.settings);
-    return c.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+    return c.json({
+      token,
+      // BUG-003: surfaces the bootstrap-admin-with-default-password flag
+      // (see auth.ts's ensureAdminUser) so the frontend can block on a
+      // mandatory password change before letting the user past login.
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        must_change_password: Boolean(user.must_change_password),
+      },
+    });
   });
 
   app.get("/api/auth/me", (c) => c.json(c.get("user")));
+
+  // BUG-003: self-service password change, the only way must_change_password
+  // ever gets cleared (storage.ts's updateUserPassword clears it as part of
+  // the same UPDATE). Requires the CURRENT password even when a change is
+  // mandatory — the default password being "known" is exactly why this
+  // route exists, not a reason to skip verifying it; this also defends a
+  // leaked JWT from being enough on its own to take over the account via a
+  // password change.
+  app.post("/api/auth/change-password", async (c) => {
+    const currentUser = c.get("user");
+    let body: { current_password?: unknown; new_password?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ detail: "Invalid JSON body" }, 422);
+    }
+    if (typeof body.current_password !== "string" || typeof body.new_password !== "string") {
+      return c.json({ detail: "current_password and new_password are required" }, 422);
+    }
+    if (body.new_password.length < 8) {
+      return c.json({ detail: "new_password must be at least 8 characters" }, 422);
+    }
+    const user = await deps.db.getUserById(currentUser.id);
+    if (!user || !(await verifyPassword(body.current_password, user.password_hash))) {
+      return c.json({ detail: "Current password is incorrect" }, 401);
+    }
+    const newHash = await hashPassword(body.new_password);
+    await deps.db.updateUserPassword(user.id, newHash);
+    return c.json({ ok: true });
+  });
 
   // ==================== Config / skills ====================
 
@@ -207,12 +255,23 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     const session = await deps.db.getSession(c.req.param("id"));
     if (!session) return c.json({ detail: "Session not found" }, 404);
     if (!userOwnsSession(session, user)) return c.json({ detail: "Access denied" }, 403);
-    // issue_submissions/issue_actions/feedback are Phase 4/5 subsystems
-    // that don't exist yet — web/app.js's openSession() already treats all
-    // three as optional (`data.issue_submissions || []` etc.), so omitting
-    // them here is safe rather than a silent frontend break.
-    const messages = await deps.db.getMessages(session.id);
-    return c.json({ session, messages });
+    // Independent reads (matches v1's `asyncio.gather`) — web/app.js's
+    // openSession() reads all three to reconcile historical draft/action
+    // cards to their real final state and restore this user's 👍/👎 button
+    // state on replay.
+    const [messages, issueSubmissions, issueActions, feedback] = await Promise.all([
+      deps.db.getMessages(session.id),
+      deps.db.getIssueSubmissionsForSession(session.id),
+      deps.db.getIssueActionsForSession(session.id),
+      deps.db.getFeedbackForSession(session.id, user.id),
+    ]);
+    return c.json({
+      session,
+      messages,
+      issue_submissions: issueSubmissions,
+      issue_actions: issueActions,
+      feedback,
+    });
   });
 
   app.delete("/api/sessions/:id", async (c) => {
@@ -259,6 +318,50 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     });
   });
 
+  // ==================== Message feedback ====================
+  // v1's api_set_feedback (app/main.py) — a 👍(+1)/👎(-1) on an assistant
+  // message; re-rating overwrites (storage.ts's setMessageFeedback upsert).
+  // Lives here rather than issue-routes.ts: this is a session/message
+  // concept, not an issue-tracker one (matches v1's own file layout — this
+  // sits under main.py's "Message feedback" section, nowhere near "Issues").
+
+  app.post("/api/feedback", async (c) => {
+    const user = c.get("user");
+    let body: { session_id?: unknown; message_id?: unknown; rating?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ detail: "Invalid JSON body" }, 422);
+    }
+    if (
+      typeof body.session_id !== "string" ||
+      typeof body.message_id !== "number" ||
+      typeof body.rating !== "number"
+    ) {
+      return c.json({ detail: "session_id, message_id, and rating are required" }, 422);
+    }
+    if (body.rating !== 1 && body.rating !== -1) {
+      return c.json({ detail: "rating must be 1 or -1" }, 400);
+    }
+    const session = await deps.db.getSession(body.session_id);
+    if (!session || !userOwnsSession(session, user)) {
+      return c.json({ detail: "Access denied" }, 403);
+    }
+    // The message must actually belong to the claimed session — otherwise
+    // a crafted request could rate arbitrary messages across sessions.
+    if ((await deps.db.getMessageSessionId(body.message_id)) !== body.session_id) {
+      return c.json({ detail: "Message not found in this session" }, 404);
+    }
+    await deps.db.setMessageFeedback(body.message_id, body.session_id, user.id, body.rating);
+    return c.json({ ok: true });
+  });
+
+  // ==================== Issues ====================
+  // Task-Phase-5: submit/action/check-duplicates/mine — port of v1's
+  // app/main.py "Issues" section. See issue-routes.ts's own header for the
+  // full rationale and the getRepoAdmin/listReposFull credential warning.
+  mountIssueRoutes(app, deps);
+
   // ==================== Admin ====================
   // Task 7: user/repo/permission CRUD, port of v1's
   // `app/admin.py`'s users/repos/permissions sections. v1's `require_admin`
@@ -275,6 +378,7 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     await next();
   });
   mountAdminRoutes(app, deps);
+  mountAdminDashboardRoutes(app, deps);
 
   // ==================== Static frontend ====================
   // Mirrors v1's `app.mount("/static", StaticFiles(directory="web"))` +

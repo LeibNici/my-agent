@@ -69,6 +69,21 @@ export function isWithinAllowedPaths(
 }
 
 /**
+ * v1's "active_repo" resolution (app/tools/access.py) — a chat turn's
+ * draft_issue/manage_issue tools need to know WHICH repo an issue targets
+ * when the user hasn't said so explicitly in the message. The narrowing
+ * itself already happened in resolveToolContext (a request-level repo_id
+ * collapses `granted` to that one repo before ToolContext is even built) —
+ * this just reads the result: exactly one visible repo is unambiguous,
+ * zero or multiple are not (the tool must ask the user, not guess).
+ */
+export function getActiveRepo(
+  ctx: ToolContext,
+): { id: number; name: string; localPath: string | null } | null {
+  return ctx.grantedRepos?.length === 1 ? ctx.grantedRepos[0] : null;
+}
+
+/**
  * Distinguish "no permission granted" from "granted but repo never synced".
  * This is returned to the user to explain why they can't access a repo.
  */

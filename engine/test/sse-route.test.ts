@@ -481,6 +481,118 @@ describe("会话标题自动推导（v1 main.py: title still 'New Chat' -> req.m
   });
 });
 
+// ==================== POST /api/chat — image attachments ====================
+// v1's _validate_images (app/main.py:86-102), ported to sse.ts's
+// validateImages. A bad image rejects the WHOLE message (error/done/end,
+// nothing persisted, no engine call) — never "drop the extras".
+
+const PNG_MAGIC_B64 = "iVBORw0KGgo="; // real PNG magic bytes, base64 — just needs to be well-formed base64
+
+describe("POST /api/chat — image attachments", () => {
+  it("超过数量上限 → 整条拒绝", async () => {
+    const { token } = await seedUser("user", "img-count");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const images = Array.from({ length: 6 }, () => ({ media_type: "image/png", data: PNG_MAGIC_B64 }));
+    const { frames } = await postChat(app, token, { message: "看这些图", images });
+    expect(frames.map((f) => f.event)).toEqual(["error", "done", "end"]);
+    expect(JSON.parse(frames[0].data).message).toMatch(/Too many images/);
+  });
+
+  it("不支持的 media_type → 整条拒绝", async () => {
+    const { token } = await seedUser("user", "img-type");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const { frames } = await postChat(app, token, {
+      message: "看这个",
+      images: [{ media_type: "image/svg+xml", data: PNG_MAGIC_B64 }],
+    });
+    expect(frames.map((f) => f.event)).toEqual(["error", "done", "end"]);
+    expect(JSON.parse(frames[0].data).message).toMatch(/Unsupported image type/);
+  });
+
+  it("base64 长度超限 → 整条拒绝", async () => {
+    const { token } = await seedUser("user", "img-size");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const { frames } = await postChat(app, token, {
+      message: "看这个",
+      images: [{ media_type: "image/png", data: "A".repeat(6_000_001) }],
+    });
+    expect(frames.map((f) => f.event)).toEqual(["error", "done", "end"]);
+    expect(JSON.parse(frames[0].data).message).toMatch(/too large/);
+  });
+
+  it("畸形 base64 → 整条拒绝（存储型 XSS 防线，不是单纯格式校验）", async () => {
+    const { token } = await seedUser("user", "img-badb64");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const { frames } = await postChat(app, token, {
+      message: "看这个",
+      images: [{ media_type: "image/png", data: "not-valid-base64!!!" }],
+    });
+    expect(frames.map((f) => f.event)).toEqual(["error", "done", "end"]);
+    expect(JSON.parse(frames[0].data).message).toMatch(/not valid base64/);
+  });
+
+  it("拒绝时不落库、不调用 engine", async () => {
+    const { token } = await seedUser("user", "img-noop");
+    let engineCalled = false;
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: (async function* () {
+        engineCalled = true;
+      }) as RunTurnFn,
+    });
+    const before = await client.listSessions(null);
+    await postChat(app, token, { message: "看这些图", images: [{ media_type: "image/bmp", data: PNG_MAGIC_B64 }] });
+    expect(engineCalled).toBe(false);
+    const after = await client.listSessions(null);
+    expect(after).toHaveLength(before.length); // db-fixture 预置了一个 session，比的是增量为 0
+  });
+
+  it("合法图片：连图带文一起落库（legacy 形状），且原样传给 engine", async () => {
+    const { token } = await seedUser("user", "img-ok");
+    let capturedImages: unknown;
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: (async function* (_deps, req) {
+        capturedImages = req.images;
+        yield { type: "done", data: { text: "ok", success: true, budgetExhausted: false } };
+      }) as RunTurnFn,
+    });
+    const { frames } = await postChat(app, token, {
+      message: "看这个截图",
+      images: [{ media_type: "image/png", data: PNG_MAGIC_B64 }],
+    });
+    const sessionId = JSON.parse(frames[0].data).session_id;
+
+    // engine 收到的是 domain 形状（mediaType/base64Data）
+    expect(capturedImages).toEqual([{ type: "image", mediaType: "image/png", base64Data: PNG_MAGIC_B64 }]);
+
+    // DB 里存的是 legacy 形状（source.media_type/source.data），图在前文在后。
+    // getMessages 已经把以 "[" 开头的 content 解析成数组了，这里不用再 JSON.parse 一次。
+    const messages = await client.getMessages(sessionId);
+    const userMsg = messages.find((m) => m.role === "user")!;
+    expect(userMsg.content).toEqual([
+      { type: "image", source: { type: "base64", media_type: "image/png", data: PNG_MAGIC_B64 } },
+      { type: "text", text: "看这个截图" },
+    ]);
+  });
+
+  it("没有图片时，落库内容仍是纯字符串（不因为这次改动变成单元素数组）", async () => {
+    const { token } = await seedUser("user", "img-none");
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([{ type: "done", data: { text: "ok", success: true, budgetExhausted: false } }]),
+    });
+    const { frames } = await postChat(app, token, { message: "没有图片的消息" });
+    const sessionId = JSON.parse(frames[0].data).session_id;
+    const messages = await client.getMessages(sessionId);
+    const userMsg = messages.find((m) => m.role === "user")!;
+    expect(userMsg.content).toBe("没有图片的消息");
+  });
+});
+
 // ==================== POST /api/auth/login ====================
 
 describe("POST /api/auth/login", () => {
@@ -495,8 +607,27 @@ describe("POST /api/auth/login", () => {
     });
     expect(resp.status).toBe(200);
     const body = await resp.json();
-    expect(body.user).toEqual({ id: expect.any(Number), username: "bob", role: "user" });
+    expect(body.user).toEqual({
+      id: expect.any(Number),
+      username: "bob",
+      role: "user",
+      must_change_password: false,
+    });
     expect(typeof body.token).toBe("string");
+  });
+
+  it("管理员用默认密码 admin123 引导创建 → 登录响应 must_change_password:true（BUG-003）", async () => {
+    const hash = await hashPassword("admin123");
+    await client.createUser("bootstrap-admin", hash, "admin", true);
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await app.request("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "bootstrap-admin", password: "admin123" }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body.user.must_change_password).toBe(true);
   });
 
   it("错误密码 → 401 {detail: 'Invalid credentials'}（FastAPI 风格 envelope）", async () => {
@@ -533,6 +664,103 @@ describe("POST /api/auth/login", () => {
       body: JSON.stringify({ username: "carol", password: "pw" }),
     });
     expect(resp.status).toBe(200);
+  });
+});
+
+describe("POST /api/auth/change-password（BUG-003）", () => {
+  it("正确的当前密码 + 合规新密码 → {ok:true}，旧密码从此失效、新密码可登录", async () => {
+    const { id, token } = await seedUser("user", "erin");
+    await client.updateUserPassword(id, await hashPassword("old-password-1"));
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: "old-password-1", new_password: "new-password-2" }),
+    });
+    expect(resp.status).toBe(200);
+    expect(await resp.json()).toEqual({ ok: true });
+
+    const oldLogin = await app.request("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "erin", password: "old-password-1" }),
+    });
+    expect(oldLogin.status).toBe(401);
+
+    const newLogin = await app.request("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "erin", password: "new-password-2" }),
+    });
+    expect(newLogin.status).toBe(200);
+  });
+
+  it("成功修改密码后 must_change_password 被清除，登录响应恢复 false", async () => {
+    const hash = await hashPassword("admin123");
+    const id = await client.createUser("bootstrap-admin2", hash, "admin", true);
+    const token = createToken({ id, username: "bootstrap-admin2", role: "admin" }, settings);
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+
+    const changeResp = await authedRequest(app, token, "/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: "admin123", new_password: "a-new-strong-pw" }),
+    });
+    expect(changeResp.status).toBe(200);
+
+    const loginResp = await app.request("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "bootstrap-admin2", password: "a-new-strong-pw" }),
+    });
+    expect((await loginResp.json()).user.must_change_password).toBe(false);
+  });
+
+  it("当前密码错误 → 401，密码不变", async () => {
+    const { id, token } = await seedUser("user", "frank");
+    await client.updateUserPassword(id, await hashPassword("real-password-1"));
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: "wrong-guess", new_password: "new-password-2" }),
+    });
+    expect(resp.status).toBe(401);
+
+    const stillWorks = await app.request("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "frank", password: "real-password-1" }),
+    });
+    expect(stillWorks.status).toBe(200);
+  });
+
+  it("新密码短于 8 位 → 422，密码不变", async () => {
+    const { id, token } = await seedUser("user", "grace");
+    await client.updateUserPassword(id, await hashPassword("real-password-1"));
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: "real-password-1", new_password: "short" }),
+    });
+    expect(resp.status).toBe(422);
+  });
+
+  it("缺少字段 → 422", async () => {
+    const { token } = await seedUser("user", "heidi");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ new_password: "new-password-2" }),
+    });
+    expect(resp.status).toBe(422);
+  });
+
+  it("未带 Authorization header → 401（走通用鉴权中间件）", async () => {
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await app.request("/api/auth/change-password", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ current_password: "x", new_password: "new-password-2" }),
+    });
+    expect(resp.status).toBe(401);
   });
 });
 
@@ -687,6 +915,62 @@ describe("GET /api/sessions/:id", () => {
     const resp = await authedRequest(app, token, "/api/sessions/ghost999");
     expect(resp.status).toBe(404);
   });
+
+  // Task Phase 5 — GET /api/sessions/:id 现在额外返回 issue_submissions/
+  // issue_actions/feedback 三个字段（app.ts 的 Promise.all 三路独立读），
+  // 供 web/app.js 在重放会话时把历史草稿/操作卡片对齐到真实终态、恢复本用
+  // 户自己的 👍/👎 按钮状态。
+  it("会话挂有 issue_submission/issue_action/feedback 时，三个字段都带上真实内容（不是空壳）", async () => {
+    const { id: uid, token } = await seedUser("user", "sess-extras");
+    const sid = await client.createSession("chat", uid);
+    const messageId = await client.addMessage(sid, "assistant", "这是回答");
+    const repoId = await client.createRepo({ name: "r1", url: "https://example.com/r1.git" });
+    await client.recordIssueSubmission({
+      sessionId: sid,
+      repoId,
+      userId: uid,
+      title: "some bug",
+      body: "bug body",
+      labels: ["bug"],
+      issueNumber: 10,
+      issueUrl: "https://example.com/r1/issues/10",
+    });
+    await client.recordIssueAction({
+      sessionId: sid,
+      repoId,
+      userId: uid,
+      issueNumber: 10,
+      action: "close",
+      comment: "已修复",
+      issueUrl: "https://example.com/r1/issues/10",
+    });
+    await client.setMessageFeedback(messageId, sid, uid, 1);
+
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, `/api/sessions/${sid}`);
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+
+    expect(body.issue_submissions).toHaveLength(1);
+    expect(body.issue_submissions[0]).toMatchObject({ title: "some bug", issue_number: 10, repo_id: repoId });
+
+    expect(body.issue_actions).toHaveLength(1);
+    expect(body.issue_actions[0]).toMatchObject({ issue_number: 10, action: "close", comment: "已修复" });
+
+    expect(body.feedback).toEqual({ [messageId]: 1 });
+  });
+
+  it("会话没有 issue_submission/issue_action/feedback 时，三个字段仍然存在，分别是 []/[]/{}（不是 undefined）", async () => {
+    const { id: uid, token } = await seedUser("user", "sess-noextras");
+    const sid = await client.createSession("chat", uid);
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, `/api/sessions/${sid}`);
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body.issue_submissions).toEqual([]);
+    expect(body.issue_actions).toEqual([]);
+    expect(body.feedback).toEqual({});
+  });
 });
 
 describe("DELETE /api/sessions/:id", () => {
@@ -710,6 +994,106 @@ describe("DELETE /api/sessions/:id", () => {
     const resp = await authedRequest(app, intruder.token, `/api/sessions/${sid}`, { method: "DELETE" });
     expect(resp.status).toBe(403);
     expect(await client.getSession(sid)).not.toBeNull();
+  });
+});
+
+// ==================== POST /api/feedback ====================
+// v1's api_set_feedback（app/main.py，"Message feedback" 一节）—— app.ts 内联实现
+// （不在 issue-routes.ts 里，见 app.ts 自己的注释：这是 session/message 概念，不是
+// issue-tracker 概念）。校验顺序：422（类型）→ 400（rating 取值）→ 403（会话归属）
+// → 404（message 不属于该 session）→ 落库（upsert）。
+
+describe("POST /api/feedback", () => {
+  it("rating 不是 1/-1（0、5、-2）→ 400，且先于会话归属/消息校验（intruder + 不存在的 message_id 也照样 400）", async () => {
+    const owner = await seedUser("user", "fb-owner");
+    const intruder = await seedUser("user", "fb-intruder");
+    const sid = await client.createSession("chat", owner.id);
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    for (const rating of [0, 5, -2]) {
+      const resp = await authedRequest(app, intruder.token, "/api/feedback", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_id: sid, message_id: 999999, rating }),
+      });
+      expect(resp.status).toBe(400);
+      expect(await resp.json()).toEqual({ detail: "rating must be 1 or -1" });
+    }
+  });
+
+  it("session_id/message_id/rating 缺失或类型不对 → 422", async () => {
+    const { token } = await seedUser("user", "fb-422");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const cases: Record<string, unknown>[] = [
+      {},
+      { session_id: 123, message_id: 1, rating: 1 }, // session_id 类型不对
+      { session_id: "s1", message_id: "not-a-number", rating: 1 }, // message_id 类型不对
+      { session_id: "s1", message_id: 1, rating: "1" }, // rating 类型不对（字符串）
+    ];
+    for (const body of cases) {
+      const resp = await authedRequest(app, token, "/api/feedback", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(resp.status).toBe(422);
+    }
+  });
+
+  it("session 不属于调用者（非 owner、非 admin）→ 403 {detail: 'Access denied'}", async () => {
+    const owner = await seedUser("user", "fb-owner2");
+    const intruder = await seedUser("user", "fb-intruder2");
+    const sid = await client.createSession("chat", owner.id);
+    const messageId = await client.addMessage(sid, "assistant", "答案");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, intruder.token, "/api/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: sid, message_id: messageId, rating: 1 }),
+    });
+    expect(resp.status).toBe(403);
+    expect(await resp.json()).toEqual({ detail: "Access denied" });
+  });
+
+  it("message_id 属于另一个 session → 404 {detail: 'Message not found in this session'}", async () => {
+    const { id: uid, token } = await seedUser("user", "fb-crosssession");
+    const sessionA = await client.createSession("chat-a", uid);
+    const sessionB = await client.createSession("chat-b", uid);
+    const messageInB = await client.addMessage(sessionB, "assistant", "在 B 里的回答");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: sessionA, message_id: messageInB, rating: 1 }),
+    });
+    expect(resp.status).toBe(404);
+    expect(await resp.json()).toEqual({ detail: "Message not found in this session" });
+  });
+
+  it("合法请求 → {ok:true}；同一用户对同一 message 换 rating 是原地更新（仍是一条，不是两条）", async () => {
+    const { id: uid, token } = await seedUser("user", "fb-valid");
+    const sid = await client.createSession("chat", uid);
+    const messageId = await client.addMessage(sid, "assistant", "答案");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+
+    const resp1 = await authedRequest(app, token, "/api/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: sid, message_id: messageId, rating: 1 }),
+    });
+    expect(resp1.status).toBe(200);
+    expect(await resp1.json()).toEqual({ ok: true });
+    expect(await client.getFeedbackForSession(sid, uid)).toEqual({ [messageId]: 1 });
+
+    const resp2 = await authedRequest(app, token, "/api/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: sid, message_id: messageId, rating: -1 }),
+    });
+    expect(resp2.status).toBe(200);
+    expect(await resp2.json()).toEqual({ ok: true });
+    const feedback = await client.getFeedbackForSession(sid, uid);
+    expect(Object.keys(feedback)).toHaveLength(1);
+    expect(feedback).toEqual({ [messageId]: -1 });
   });
 });
 

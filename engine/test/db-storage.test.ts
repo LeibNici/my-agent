@@ -127,6 +127,14 @@ describe("createUser / getUserByUsername（v1 database.py 同语义）", () => {
     expect(id2).toBeGreaterThan(id1);
     expect(() => storage.createUser("dup", "pw3")).toThrow(/UNIQUE/i);
   });
+  it("mustChangePassword 省略时默认 0（BUG-003）", () => {
+    storage.createUser("regular-admin", "hashed-pw", "admin");
+    expect(storage.getUserByUsername("regular-admin")!.must_change_password).toBe(0);
+  });
+  it("mustChangePassword=true → 存为 1（BUG-003：引导用默认密码创建的管理员）", () => {
+    storage.createUser("bootstrap-admin", "hashed-pw", "admin", true);
+    expect(storage.getUserByUsername("bootstrap-admin")!.must_change_password).toBe(1);
+  });
 });
 
 describe("createSession / listSessions / getSession / deleteSession（v1 database.py 同语义，Task 5）", () => {
@@ -287,6 +295,15 @@ describe("getUserById / listUsers / updateUserPassword / setUserActive / deleteU
 
     storage.deleteUser(id);
     expect(storage.getUserById(id)).toBeNull();
+  });
+
+  it("updateUserPassword 同时清除 must_change_password（BUG-003：改密码即视为已处理强制改密）", () => {
+    const id = storage.createUser("bootstrap-admin", "hashed-pw", "admin", true);
+    expect(storage.getUserById(id)!.must_change_password).toBe(1);
+    storage.updateUserPassword(id, "new-hash");
+    const row = storage.getUserById(id)!;
+    expect(row.password_hash).toBe("new-hash");
+    expect(row.must_change_password).toBe(0);
   });
 
   it("getUserById 查无此人 ⇒ null", () => {
@@ -488,5 +505,733 @@ describe("grantPermission / listPermissions / revokePermission（v1 database.py 
 
     const uid = storage.createUser("alice", "hashed-pw", "user");
     expect(() => storage.grantPermission(uid, 999, "read")).toThrow(/FOREIGN KEY/i);
+  });
+});
+
+describe("markSessionResolved（v1 database.py:590 同语义）", () => {
+  it("将 resolved_at 从 null 置为新鲜时间戳，不改动其余字段", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const id = storage.createSession("chat", uid);
+    const before = storage.getSession(id)!;
+    expect(before.resolved_at).toBeNull();
+
+    storage.markSessionResolved(id);
+    const after = storage.getSession(id)!;
+    expect(after.resolved_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+    expect(after.title).toBe(before.title);
+    expect(after.owner_id).toBe(before.owner_id);
+    expect(after.created_at).toBe(before.created_at);
+  });
+});
+
+describe("recordIssueSubmission / getIssueSubmissionsForSession（v1 database.py:661/688 同语义）", () => {
+  it("round trip：labels 解析为真实数组，track_status/reopen_count 落到 schema 默认值", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const subId = storage.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: uid,
+      title: "登录按钮无响应",
+      body: "点击登录无反应",
+      labels: ["bug", "P1"],
+      issueNumber: 42,
+      issueUrl: "https://github.com/x/y/issues/42",
+      draftToolUseId: "tu_1",
+    });
+    expect(typeof subId).toBe("number");
+
+    const rows = storage.getIssueSubmissionsForSession("s1");
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({
+      id: subId,
+      repo_id: repoId,
+      user_id: uid,
+      title: "登录按钮无响应",
+      body: "点击登录无反应",
+      labels: ["bug", "P1"],
+      issue_number: 42,
+      issue_url: "https://github.com/x/y/issues/42",
+      draft_tool_use_id: "tu_1",
+      track_status: "submitted",
+      reopen_count: 0,
+    });
+    expect(rows[0].submitted_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+  });
+
+  it("draftToolUseId 省略时落库为 null；只返回目标 session 的提报", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    storage.createSession("other", uid); // 混淆用的另一个 session，不应污染 s1 的结果
+    storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t", body: "b", labels: [], issueNumber: 1, issueUrl: "https://x/1",
+    });
+    const rows = storage.getIssueSubmissionsForSession("s1");
+    expect(rows.length).toBe(1);
+    expect(rows[0].draft_tool_use_id).toBeNull();
+  });
+
+  it("issueUrl 为 null 时原样落库（TrackerResult 的 comment-only 失败态）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t", body: "b", labels: [], issueNumber: 1, issueUrl: null,
+    });
+    expect(storage.getIssueSubmissionsForSession("s1")[0].issue_url).toBeNull();
+  });
+
+  it("查无提报的 session ⇒ []", () => {
+    expect(storage.getIssueSubmissionsForSession("ghost")).toEqual([]);
+  });
+});
+
+describe("getTrackableSubmissions（v1 database.py:710 同语义：open/未知恒轮询，closed 每天至多查一次）", () => {
+  function seedSubmission(issueNumber: number, issueUrl: string | null = `https://x/${issueNumber}`): number {
+    const uid = storage.createUser(`u${issueNumber}`, "pw");
+    const repoId = storage.createRepo({ name: `r${issueNumber}`, url: `https://example.com/r${issueNumber}.git` });
+    return storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t", body: "b", labels: [], issueNumber, issueUrl,
+    });
+  }
+
+  it("issue_number/issue_url 有一个是 null ⇒ 不可追踪，不出现在结果里", () => {
+    seedSubmission(1, null);
+    expect(storage.getTrackableSubmissions()).toEqual([]);
+  });
+
+  it("从未 track 过（remote_state 为 null）⇒ 恒被包含", () => {
+    const id = seedSubmission(2);
+    expect(storage.getTrackableSubmissions().map((r) => r.id)).toContain(id);
+  });
+
+  it("remote_state 显式为非 'closed' 值（如 'open'）⇒ 恒被包含，不看 last_checked_at", () => {
+    const id = seedSubmission(3);
+    storage.updateIssueTracking(id, { remoteState: "open" }); // last_checked_at 被戳为刚刚
+    expect(storage.getTrackableSubmissions().map((r) => r.id)).toContain(id);
+  });
+
+  it("closed 且 last_checked_at 在 1 天以内 ⇒ 被排除", () => {
+    const id = seedSubmission(4);
+    storage.updateIssueTracking(id, { remoteState: "closed" }); // last_checked_at 刚刚 = 现在
+    expect(storage.getTrackableSubmissions().map((r) => r.id)).not.toContain(id);
+  });
+
+  it("closed 但 last_checked_at 超过 1 天 ⇒ 被重新纳入（防止错过 reopen）", () => {
+    const id = seedSubmission(5);
+    storage.updateIssueTracking(id, { remoteState: "closed" });
+    const db = new Database(dbPath);
+    db.prepare("UPDATE issue_submissions SET last_checked_at = ? WHERE id = ?").run(
+      "2000-01-01T00:00:00.000000",
+      id
+    );
+    db.close();
+    expect(storage.getTrackableSubmissions().map((r) => r.id)).toContain(id);
+  });
+});
+
+describe("updateIssueTracking（status_changed_at 的 CASE 防竞态写法，v1 database.py:732 同语义）", () => {
+  function seedSubmission(): number {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    return storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t", body: "b", labels: [], issueNumber: 1, issueUrl: "https://x/1",
+    });
+  }
+  function readStatusChangedAt(id: number): string | null {
+    const db = new Database(dbPath);
+    const row = db.prepare("SELECT status_changed_at FROM issue_submissions WHERE id = ?").get(id) as {
+      status_changed_at: string | null;
+    };
+    db.close();
+    return row.status_changed_at;
+  }
+
+  it("传入与当前一致的 trackStatus（列默认值 'submitted'）⇒ status_changed_at 保持不变（null 到 null，逐字节相同）", () => {
+    const id = seedSubmission();
+    expect(readStatusChangedAt(id)).toBeNull();
+    storage.updateIssueTracking(id, { trackStatus: "submitted" });
+    expect(readStatusChangedAt(id)).toBeNull();
+  });
+
+  it("传入真正不同的 trackStatus ⇒ status_changed_at 被戳为新鲜时间戳；之后再传相同值就不再变化", () => {
+    const id = seedSubmission();
+    storage.updateIssueTracking(id, { trackStatus: "in_progress" });
+    const stamped = readStatusChangedAt(id);
+    expect(stamped).not.toBeNull();
+    expect(stamped).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+
+    // 再次传入与"当前已存储值"一致的 trackStatus（此时是 'in_progress'）⇒ 不再变化
+    storage.updateIssueTracking(id, { trackStatus: "in_progress" });
+    expect(readStatusChangedAt(id)).toBe(stamped);
+  });
+
+  it("last_checked_at 每次调用都被戳新（哪怕不传 trackStatus，标记的是轮询尝试本身）", () => {
+    const id = seedSubmission();
+    storage.updateIssueTracking(id, {});
+    const db = new Database(dbPath);
+    const row = db.prepare("SELECT last_checked_at FROM issue_submissions WHERE id = ?").get(id) as {
+      last_checked_at: string;
+    };
+    db.close();
+    expect(row.last_checked_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+  });
+
+  it("clearError 优先于 trackError（同时传入时按 v1 的 if/elif 语义，清空而不是写入新错误文本）", () => {
+    const id = seedSubmission();
+    storage.updateIssueTracking(id, { trackError: "boom" });
+    const db1 = new Database(dbPath);
+    expect((db1.prepare("SELECT track_error FROM issue_submissions WHERE id = ?").get(id) as any).track_error).toBe(
+      "boom"
+    );
+    db1.close();
+
+    storage.updateIssueTracking(id, { trackError: "should be ignored", clearError: true });
+    const db2 = new Database(dbPath);
+    expect(
+      (db2.prepare("SELECT track_error FROM issue_submissions WHERE id = ?").get(id) as any).track_error
+    ).toBeNull();
+    db2.close();
+  });
+
+  it("动态 SET：只传 remoteState/reopenCount/closedAt 时，track_status 等未传字段不受影响", () => {
+    const id = seedSubmission();
+    storage.updateIssueTracking(id, {
+      remoteState: "closed",
+      reopenCount: 2,
+      closedAt: "2020-01-01T00:00:00.000000",
+    });
+    const db = new Database(dbPath);
+    const row = db
+      .prepare("SELECT remote_state, reopen_count, closed_at, track_status FROM issue_submissions WHERE id = ?")
+      .get(id) as any;
+    db.close();
+    expect(row).toMatchObject({
+      remote_state: "closed",
+      reopen_count: 2,
+      closed_at: "2020-01-01T00:00:00.000000",
+      track_status: "submitted",
+    });
+  });
+});
+
+describe("upsertFixReport / getUnverifiedFixReports / setFixReportVerified（v1 database.py:765/788 同语义：幂等 upsert + verified 保留）", () => {
+  function seedSubmission(): { subId: number; repoId: number } {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    const subId = storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t", body: "b", labels: [], issueNumber: 1, issueUrl: "https://x/1",
+    });
+    return { subId, repoId };
+  }
+  function rawFixReports(submissionId: number): any[] {
+    const db = new Database(dbPath);
+    const rows = db.prepare("SELECT * FROM issue_fix_reports WHERE submission_id = ? ORDER BY note_id").all(
+      submissionId
+    );
+    db.close();
+    return rows;
+  }
+
+  it("round trip：写入后能在 getUnverifiedFixReports 里查到，含 JOIN 出的 issue_url/repo_id", () => {
+    const { subId, repoId } = seedSubmission();
+    storage.upsertFixReport({
+      submissionId: subId, noteId: 100, workerId: "w1", commitSha: "sha1",
+      files: ["a.ts", "b.ts"], reportedAt: "2020-01-01T00:00:00.000000",
+    });
+    const unverified = storage.getUnverifiedFixReports();
+    expect(unverified.length).toBe(1);
+    expect(unverified[0]).toMatchObject({ submission_id: subId, commit_sha: "sha1", issue_url: "https://x/1", repo_id: repoId });
+  });
+
+  it("commit_sha 为 null 的报告不出现在 getUnverifiedFixReports（v1: verified IS NULL AND commit_sha IS NOT NULL 两个条件都要满足）", () => {
+    const { subId } = seedSubmission();
+    storage.upsertFixReport({ submissionId: subId, noteId: 1, workerId: null, commitSha: null, files: [], reportedAt: null });
+    expect(storage.getUnverifiedFixReports()).toEqual([]);
+  });
+
+  it("幂等：同一 (submissionId, noteId) 二次 upsert 不新增行，且不覆盖已被 setFixReportVerified 设置的 verified", () => {
+    const { subId } = seedSubmission();
+    const reportId = storage.upsertFixReport({
+      submissionId: subId, noteId: 1, workerId: "w1", commitSha: "sha1",
+      files: ["a.ts"], reportedAt: "2020-01-01T00:00:00.000000",
+    });
+    expect(rawFixReports(subId).length).toBe(1);
+
+    storage.setFixReportVerified(reportId, true);
+    expect(storage.getUnverifiedFixReports()).toEqual([]); // 已核实，从"待核实"里消失
+
+    // 二次 upsert：全新的 worker_id/commit_sha/files/reported_at，但 verified 必须原封不动保留
+    storage.upsertFixReport({
+      submissionId: subId, noteId: 1, workerId: "w2", commitSha: "sha2",
+      files: ["c.ts"], reportedAt: "2020-02-02T00:00:00.000000",
+    });
+    const rows = rawFixReports(subId);
+    expect(rows.length).toBe(1); // 仍只有一行，不是新增
+    expect(rows[0]).toMatchObject({
+      id: reportId,
+      worker_id: "w2",
+      commit_sha: "sha2",
+      files_json: '["c.ts"]',
+      reported_at: "2020-02-02T00:00:00.000000",
+      verified: 1, // 被 setFixReportVerified 设置后，未被后续 upsert 覆盖
+    });
+    expect(storage.getUnverifiedFixReports()).toEqual([]); // 依然不在待核实列表里
+  });
+
+  it("不同 noteId（同一 submissionId）⇒ 新增一行，而不是更新既有行", () => {
+    const { subId } = seedSubmission();
+    storage.upsertFixReport({ submissionId: subId, noteId: 1, workerId: "w1", commitSha: "sha1", files: [], reportedAt: null });
+    storage.upsertFixReport({ submissionId: subId, noteId: 2, workerId: "w2", commitSha: "sha2", files: [], reportedAt: null });
+    const rows = rawFixReports(subId);
+    expect(rows.length).toBe(2);
+    expect(rows.map((r) => r.note_id)).toEqual([1, 2]);
+  });
+
+  it("setFixReportVerified(false) 落库为 0（不是 null）；0 是「已查证不在分支上」的结论，不再出现在 getUnverifiedFixReports 里", () => {
+    const { subId } = seedSubmission();
+    const reportId = storage.upsertFixReport({ submissionId: subId, noteId: 1, workerId: "w1", commitSha: "sha1", files: [], reportedAt: null });
+    storage.setFixReportVerified(reportId, false);
+    expect(rawFixReports(subId)[0].verified).toBe(0);
+    expect(storage.getUnverifiedFixReports()).toEqual([]);
+  });
+});
+
+describe("getMyIssueSubmissions / getMyUnreadIssueCount / markMyIssuesSeen（fresh 的 null/非 null 边界，v1 database.py:835/868 同语义）", () => {
+  function seedTrackedSubmission(userId: number, repoId: number, issueNumber: number): number {
+    const subId = storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId,
+      title: `issue-${issueNumber}`, body: "b", labels: [], issueNumber, issueUrl: `https://x/${issueNumber}`,
+    });
+    // 触发一次真实的状态迁移，让 status_changed_at 落到非 null
+    storage.updateIssueTracking(subId, { trackStatus: "in_progress" });
+    return subId;
+  }
+
+  it("status_changed_at 非空 + my_issues_seen_at 从未设置（null）⇒ fresh=true，计入未读数", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    seedTrackedSubmission(uid, repoId, 1);
+
+    expect(storage.getMyUnreadIssueCount(uid)).toBe(1);
+    const rows = storage.getMyIssueSubmissions(uid);
+    expect(rows.length).toBe(1);
+    expect(rows[0].fresh).toBe(true);
+  });
+
+  it("status_changed_at 非空 + my_issues_seen_at 晚于它 ⇒ fresh=false，不计入未读数", () => {
+    const uid = storage.createUser("bob", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    seedTrackedSubmission(uid, repoId, 2);
+
+    // 用一个保证"晚于任何 status_changed_at"的哨兵时间戳，避免和 wall clock 赛跑
+    const db = new Database(dbPath);
+    db.prepare("UPDATE users SET my_issues_seen_at = ? WHERE id = ?").run("9999-01-01T00:00:00.000000", uid);
+    db.close();
+
+    expect(storage.getMyUnreadIssueCount(uid)).toBe(0);
+    const rows = storage.getMyIssueSubmissions(uid);
+    expect(rows.length).toBe(1);
+    expect(rows[0].fresh).toBe(false);
+  });
+
+  it("status_changed_at 仍为 null（从未真正变更过状态）⇒ 无论 my_issues_seen_at 是否设置都不计入", () => {
+    const uid1 = storage.createUser("carol", "hashed-pw");
+    const uid2 = storage.createUser("dave", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+
+    // 注意：不调用 updateIssueTracking，status_changed_at 保持 null
+    storage.recordIssueSubmission({ sessionId: "s1", repoId, userId: uid1, title: "t1", body: "b", labels: [], issueNumber: 3, issueUrl: "https://x/3" });
+    storage.recordIssueSubmission({ sessionId: "s1", repoId, userId: uid2, title: "t2", body: "b", labels: [], issueNumber: 4, issueUrl: "https://x/4" });
+    storage.markMyIssuesSeen(uid2); // uid2 显式标记过已读；uid1 从未标记（null）
+
+    expect(storage.getMyUnreadIssueCount(uid1)).toBe(0);
+    expect(storage.getMyIssueSubmissions(uid1)[0].fresh).toBe(false);
+    expect(storage.getMyUnreadIssueCount(uid2)).toBe(0);
+    expect(storage.getMyIssueSubmissions(uid2)[0].fresh).toBe(false);
+  });
+
+  it("markMyIssuesSeen 之后，原本 fresh 的提报翻转为非 fresh", () => {
+    const uid = storage.createUser("erin", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    seedTrackedSubmission(uid, repoId, 5);
+    expect(storage.getMyUnreadIssueCount(uid)).toBe(1);
+
+    storage.markMyIssuesSeen(uid);
+    expect(storage.getMyUnreadIssueCount(uid)).toBe(0);
+    expect(storage.getMyIssueSubmissions(uid)[0].fresh).toBe(false);
+  });
+
+  it("getMyIssueSubmissions 携带 repo_name（LEFT JOIN）；fix_verified/fix_files_count/fix_commit 汇总自 issue_fix_reports", () => {
+    const uid = storage.createUser("frank", "hashed-pw");
+    const repoId = storage.createRepo({ name: "cool-repo", url: "https://example.com/cool.git" });
+    const subId = storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], issueNumber: 6, issueUrl: "https://x/6",
+    });
+
+    let row = storage.getMyIssueSubmissions(uid)[0];
+    expect(row.repo_name).toBe("cool-repo");
+    expect(row.fix_verified).toBe(false);
+    expect(row.fix_files_count).toBeNull();
+    expect(row.fix_commit).toBeNull();
+
+    const reportId = storage.upsertFixReport({
+      submissionId: subId, noteId: 1, workerId: "w1", commitSha: "abcdef1234567890",
+      files: ["a.ts", "b.ts"], reportedAt: "2020-01-01T00:00:00.000000",
+    });
+    storage.setFixReportVerified(reportId, true);
+
+    row = storage.getMyIssueSubmissions(uid)[0];
+    expect(row.fix_verified).toBe(true);
+    expect(row.fix_files_count).toBe(2);
+    expect(row.fix_commit).toBe("abcdef1234"); // commit_sha 截断到前 10 位
+  });
+
+  it("其他用户的提报不计入 getMyIssueSubmissions/getMyUnreadIssueCount", () => {
+    const uid1 = storage.createUser("gina", "hashed-pw");
+    const uid2 = storage.createUser("henry", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    seedTrackedSubmission(uid1, repoId, 7);
+    expect(storage.getMyIssueSubmissions(uid2)).toEqual([]);
+    expect(storage.getMyUnreadIssueCount(uid2)).toBe(0);
+  });
+});
+
+describe("getIssueTrackingOverview（counts 按 COALESCE(track_status,'submitted') 分组 + labels/remote_labels 真实数组，v1 database.py:892 同语义）", () => {
+  function seedSubmission(userId: number, repoId: number, issueNumber: number, labels: string[] = []): number {
+    return storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId, title: `t${issueNumber}`, body: "b", labels, issueNumber, issueUrl: `https://x/${issueNumber}`,
+    });
+  }
+
+  it("counts 按 track_status 分组统计（未变更的默认 'submitted' 与显式变更的状态分别计数）", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    seedSubmission(uid, repoId, 1); // 保持默认 'submitted'
+    seedSubmission(uid, repoId, 2); // 保持默认 'submitted'
+    const id3 = seedSubmission(uid, repoId, 3);
+    storage.updateIssueTracking(id3, { trackStatus: "closed" });
+
+    const overview = storage.getIssueTrackingOverview();
+    expect(overview.counts).toEqual({ submitted: 2, closed: 1 });
+  });
+
+  it("labels/remote_labels 解析为真实数组；remote_labels 为 NULL 时是 []而不是抛错", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    const id = seedSubmission(uid, repoId, 1, ["bug", "urgent"]);
+
+    let overview = storage.getIssueTrackingOverview();
+    let row = overview.submissions.find((r) => r.id === id)!;
+    expect(row.labels).toEqual(["bug", "urgent"]);
+    expect(row.remote_labels).toEqual([]); // 从未 track 过 ⇒ 该列是 NULL ⇒ 解析为 []
+
+    storage.updateIssueTracking(id, { remoteLabels: JSON.stringify(["needs-info"]) });
+    overview = storage.getIssueTrackingOverview();
+    row = overview.submissions.find((r) => r.id === id)!;
+    expect(row.remote_labels).toEqual(["needs-info"]);
+  });
+
+  it("fix_reports 附加在每个 submission 上（来自 issue_fix_reports 的 JOIN 结果）", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    const id = seedSubmission(uid, repoId, 1);
+    storage.upsertFixReport({ submissionId: id, noteId: 1, workerId: "w1", commitSha: "sha1", files: ["a.ts"], reportedAt: null });
+
+    const overview = storage.getIssueTrackingOverview();
+    const row = overview.submissions.find((r) => r.id === id)!;
+    expect(row.fix_reports.length).toBe(1);
+    expect(row.fix_reports[0]).toMatchObject({ submission_id: id, note_id: 1, worker_id: "w1", commit_sha: "sha1", files: ["a.ts"] });
+  });
+
+  it("limit 参数生效，且按 id DESC 排序", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    const id1 = seedSubmission(uid, repoId, 1);
+    const id2 = seedSubmission(uid, repoId, 2);
+    const id3 = seedSubmission(uid, repoId, 3);
+
+    const overview = storage.getIssueTrackingOverview(2);
+    expect(overview.submissions.map((r) => r.id)).toEqual([id3, id2]);
+    expect(overview.submissions.map((r) => r.id)).not.toContain(id1);
+  });
+});
+
+describe("recordIssueAction / getIssueActionsForSession（v1 database.py:935/955 同语义）", () => {
+  it("round trip：issueUrl/draftToolUseId 可选，省略时落库为 null", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    const actionId = storage.recordIssueAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 10, action: "close", comment: "已解决",
+    });
+    expect(typeof actionId).toBe("number");
+
+    const rows = storage.getIssueActionsForSession("s1");
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({
+      id: actionId, repo_id: repoId, user_id: uid, issue_number: 10,
+      action: "close", comment: "已解决", issue_url: null, draft_tool_use_id: null,
+    });
+    expect(rows[0].applied_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+  });
+
+  it("issueUrl/draftToolUseId 显式传入时原样落库；按 id 升序返回", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    storage.recordIssueAction({ sessionId: "s1", repoId, userId: uid, issueNumber: 1, action: "comment", comment: "c1", issueUrl: "https://x/1", draftToolUseId: "tu_1" });
+    storage.recordIssueAction({ sessionId: "s1", repoId, userId: uid, issueNumber: 1, action: "reopen", comment: "c2" });
+
+    const rows = storage.getIssueActionsForSession("s1");
+    expect(rows.map((r) => r.action)).toEqual(["comment", "reopen"]);
+    expect(rows[0].issue_url).toBe("https://x/1");
+    expect(rows[0].draft_tool_use_id).toBe("tu_1");
+  });
+
+  it("查无 action 的 session ⇒ []", () => {
+    expect(storage.getIssueActionsForSession("ghost")).toEqual([]);
+  });
+});
+
+describe("getUsageSummary / getUsageByUser（v1 database.py:992/1011 同语义：按 user_id 分组，非按 users 主键 JOIN 键分组）", () => {
+  it("空表 ⇒ getUsageSummary 全部字段为 0（每个聚合都被 COALESCE 兜底）", () => {
+    expect(storage.getUsageSummary()).toEqual({
+      call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
+      avg_ttft_ms: 0, max_ttft_ms: 0, avg_total_ms: 0, max_total_ms: 0,
+    });
+  });
+
+  it("getUsageSummary 汇总 sum/avg/max", () => {
+    storage.recordLlmCallMetrics([
+      { session_id: "s1", user_id: 1, model: "m", iteration: 1, input_tokens: 10, output_tokens: 5, ttft_ms: 100, total_ms: 200 },
+      { session_id: "s1", user_id: 1, model: "m", iteration: 2, input_tokens: 30, output_tokens: 15, ttft_ms: 300, total_ms: 400 },
+    ]);
+    expect(storage.getUsageSummary()).toEqual({
+      call_count: 2, total_input_tokens: 40, total_output_tokens: 20,
+      avg_ttft_ms: 200, max_ttft_ms: 300, avg_total_ms: 300, max_total_ms: 400,
+    });
+  });
+
+  it("getUsageByUser 按 user_id 分组（不是按 users 表主键 JOIN 键）；用户被删除后指标仍在，展示占位用户名", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    storage.recordLlmCallMetrics([
+      { session_id: "s1", user_id: uid, model: "m", iteration: 1, input_tokens: 10, output_tokens: 5, ttft_ms: 100, total_ms: 200 },
+      { session_id: "s1", user_id: uid, model: "m", iteration: 2, input_tokens: 20, output_tokens: 5, ttft_ms: 100, total_ms: 200 },
+    ]);
+
+    // 删除前：真实用户名
+    let rows = storage.getUsageByUser();
+    expect(rows).toMatchObject([
+      { user_id: uid, username: "alice", call_count: 2, total_input_tokens: 30, total_output_tokens: 10 },
+    ]);
+
+    // llm_call_metrics.user_id 在 schema.ts 里没有 FK 约束（只有 session_id 有）——
+    // 删除用户不会级联清掉这些行，这正是 LEFT JOIN + GROUP BY m.user_id 要覆盖的场景：
+    // 用真实的 storage.deleteUser 验证行为，而不是假设它会级联。
+    storage.deleteUser(uid);
+    rows = storage.getUsageByUser();
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({ user_id: uid, username: `(已删除用户 #${uid})`, call_count: 2 });
+  });
+
+  it("多用户按 (input+output) 总量降序排列", () => {
+    const uidBig = storage.createUser("big", "hashed-pw");
+    const uidSmall = storage.createUser("small", "hashed-pw");
+    storage.recordLlmCallMetrics([
+      { session_id: "s1", user_id: uidSmall, model: "m", iteration: 1, input_tokens: 1, output_tokens: 1, ttft_ms: 1, total_ms: 1 },
+      { session_id: "s1", user_id: uidBig, model: "m", iteration: 1, input_tokens: 100, output_tokens: 100, ttft_ms: 1, total_ms: 1 },
+    ]);
+    expect(storage.getUsageByUser().map((r) => r.user_id)).toEqual([uidBig, uidSmall]);
+  });
+
+  it("user_id 为 null（未登录调用）也能被分组统计；username 落到 SQL 的 NULL 拼接结果——COALESCE(NULL, '...' || NULL || '...') 本身也是 NULL，不是占位字符串（已用 better-sqlite3 直接验证过，v1 同一段 SQL 有一致行为，非本层引入的差异）", () => {
+    storage.recordLlmCallMetrics([
+      { session_id: "s1", user_id: null, model: "m", iteration: 1, input_tokens: 5, output_tokens: 5, ttft_ms: 1, total_ms: 1 },
+    ]);
+    const rows = storage.getUsageByUser();
+    expect(rows.length).toBe(1);
+    expect(rows[0].user_id).toBeNull();
+    expect(rows[0].username).toBeNull();
+  });
+});
+
+describe("getMessageSessionId / setMessageFeedback / getFeedbackForSession / getFeedbackSummary / getRecentNegativeFeedback（v1 database.py:1040-1103 同语义）", () => {
+  it("getMessageSessionId：命中返回 session_id，未命中返回 null", () => {
+    const msgId = storage.addMessage("s1", "assistant", "回答内容");
+    expect(storage.getMessageSessionId(msgId)).toBe("s1");
+    expect(storage.getMessageSessionId(999999)).toBeNull();
+  });
+
+  it("setMessageFeedback：round trip 写入 +1/-1，getFeedbackForSession 按 (session,user) 还原为 map", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const msg1 = storage.addMessage("s1", "assistant", "答案1");
+    const msg2 = storage.addMessage("s1", "assistant", "答案2");
+    storage.setMessageFeedback(msg1, "s1", uid, 1);
+    storage.setMessageFeedback(msg2, "s1", uid, -1);
+
+    expect(storage.getFeedbackForSession("s1", uid)).toEqual({ [msg1]: 1, [msg2]: -1 });
+  });
+
+  it("setMessageFeedback 对同一 (message,user) 是 UPSERT：二次评分覆盖而不是新增一行", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const msg1 = storage.addMessage("s1", "assistant", "答案1");
+    storage.setMessageFeedback(msg1, "s1", uid, 1);
+    storage.setMessageFeedback(msg1, "s1", uid, -1);
+    expect(storage.getFeedbackForSession("s1", uid)).toEqual({ [msg1]: -1 });
+
+    const db = new Database(dbPath);
+    const count = (db.prepare("SELECT COUNT(*) as n FROM message_feedback WHERE message_id = ?").get(msg1) as any).n;
+    db.close();
+    expect(count).toBe(1);
+  });
+
+  it("不同用户对同一条消息的评分互不影响", () => {
+    const uid1 = storage.createUser("alice", "hashed-pw");
+    const uid2 = storage.createUser("bob", "hashed-pw");
+    const msg1 = storage.addMessage("s1", "assistant", "答案1");
+    storage.setMessageFeedback(msg1, "s1", uid1, 1);
+    storage.setMessageFeedback(msg1, "s1", uid2, -1);
+    expect(storage.getFeedbackForSession("s1", uid1)).toEqual({ [msg1]: 1 });
+    expect(storage.getFeedbackForSession("s1", uid2)).toEqual({ [msg1]: -1 });
+  });
+
+  it("getFeedbackSummary 统计全局 up/down 总数（不按 session 过滤），空表 ⇒ {0,0}", () => {
+    expect(storage.getFeedbackSummary()).toEqual({ up_count: 0, down_count: 0 });
+
+    const uid = storage.createUser("alice", "hashed-pw");
+    const msg1 = storage.addMessage("s1", "assistant", "答案1");
+    const msg2 = storage.addMessage("s1", "assistant", "答案2");
+    const msg3 = storage.addMessage("s1", "assistant", "答案3");
+    storage.setMessageFeedback(msg1, "s1", uid, 1);
+    storage.setMessageFeedback(msg2, "s1", uid, 1);
+    storage.setMessageFeedback(msg3, "s1", uid, -1);
+    expect(storage.getFeedbackSummary()).toEqual({ up_count: 2, down_count: 1 });
+  });
+
+  it("getRecentNegativeFeedback 只返回负分反馈，JOIN 出 session_title/username", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const msg1 = storage.addMessage("s1", "assistant", "好答案");
+    const msg2 = storage.addMessage("s1", "assistant", "差答案");
+    storage.setMessageFeedback(msg1, "s1", uid, 1);
+    storage.setMessageFeedback(msg2, "s1", uid, -1);
+
+    const rows = storage.getRecentNegativeFeedback();
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({ message_id: msg2, session_id: "s1", session_title: "seed", user_id: uid, username: "alice" });
+  });
+
+  it("getRecentNegativeFeedback 遵守 limit，按 id DESC 排序", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const msg1 = storage.addMessage("s1", "assistant", "差1");
+    const msg2 = storage.addMessage("s1", "assistant", "差2");
+    storage.setMessageFeedback(msg1, "s1", uid, -1);
+    storage.setMessageFeedback(msg2, "s1", uid, -1);
+    const rows = storage.getRecentNegativeFeedback(1);
+    expect(rows.length).toBe(1);
+    expect(rows[0].message_id).toBe(msg2);
+  });
+});
+
+describe("getRecentLlmCalls（v1 database.py:1103 同语义）", () => {
+  it("round trip：JOIN 出 session_title/username，按 id DESC 排序，遵守 limit", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    storage.recordLlmCallMetrics([
+      { session_id: "s1", user_id: uid, model: "m1", iteration: 1, input_tokens: 1, output_tokens: 1, ttft_ms: 10, total_ms: 20 },
+    ]);
+    storage.recordLlmCallMetrics([
+      { session_id: "s1", user_id: uid, model: "m2", iteration: 2, input_tokens: 2, output_tokens: 2, ttft_ms: 30, total_ms: 40 },
+    ]);
+    const rows = storage.getRecentLlmCalls();
+    expect(rows.length).toBe(2);
+    expect(rows[0].model).toBe("m2"); // 最近一条在前
+    expect(rows[0]).toMatchObject({ session_id: "s1", session_title: "seed", user_id: uid, username: "alice" });
+
+    const limited = storage.getRecentLlmCalls(1);
+    expect(limited.length).toBe(1);
+    expect(limited[0].model).toBe("m2");
+  });
+
+  it("user_id 为 null 时 username 也是 null——这里不像 getUsageByUser 那样有 COALESCE 占位符兜底，直接是 LEFT JOIN 的自然结果", () => {
+    storage.recordLlmCallMetrics([
+      { session_id: "s1", user_id: null, model: "m", iteration: 1, input_tokens: 1, output_tokens: 1, ttft_ms: 1, total_ms: 1 },
+    ]);
+    const rows = storage.getRecentLlmCalls();
+    expect(rows[0].user_id).toBeNull();
+    expect(rows[0].username).toBeNull();
+  });
+});
+
+describe("recordSemanticSearchLog / getSemanticSearchStats / getSemanticSearchRecent（分桶边界 + low_score_only 过滤，v1 database.py:1125/1156 同语义）", () => {
+  function seedRows(uid: number, repoId: number) {
+    // top1_score: null | 0.1 | 0.3(边界) | 0.5(边界) | 0.7(边界) | 0.95
+    storage.recordSemanticSearchLog({ userId: uid, repoId, query: "q-null", resultCount: 0, top1Score: null, resultsJson: "[]", durationMs: 100 });
+    storage.recordSemanticSearchLog({ userId: uid, repoId, query: "q-01", resultCount: 2, top1Score: 0.1, resultsJson: "[]", durationMs: 100 });
+    storage.recordSemanticSearchLog({ userId: uid, repoId, query: "q-03", resultCount: 4, top1Score: 0.3, resultsJson: "[]", durationMs: 100 });
+    storage.recordSemanticSearchLog({ userId: uid, repoId, query: "q-05", resultCount: 4, top1Score: 0.5, resultsJson: "[]", durationMs: 100 });
+    storage.recordSemanticSearchLog({ userId: uid, repoId, query: "q-07", resultCount: 4, top1Score: 0.7, resultsJson: "[]", durationMs: 100 });
+    storage.recordSemanticSearchLog({ userId: uid, repoId, query: "q-095", resultCount: 4, top1Score: 0.95, resultsJson: "[]", durationMs: 100 });
+  }
+
+  it("5 个分桶按边界 (0.3/0.5/0.7) 正确切分；NULL 落入 bucket_none 且计入 no_result_count，但不计入 low_score_count", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    seedRows(uid, repoId);
+
+    const stats = storage.getSemanticSearchStats();
+    expect(stats.query_count).toBe(6);
+    expect(stats.no_result_count).toBe(1); // 只有 q-null 的 result_count=0
+    expect(stats.low_score_count).toBe(2); // 0.1 和 0.3（< 0.5）；NULL 因 IS NOT NULL 判断被排除在外
+    expect(stats.distribution).toEqual({
+      bucket_none: 1,
+      bucket_0_3: 1, // 0.1
+      bucket_3_5: 1, // 0.3（边界值，>=0.3 记入这里而非 bucket_0_3）
+      bucket_5_7: 1, // 0.5（边界值，>=0.5 记入这里而非 bucket_3_5）
+      bucket_7_10: 2, // 0.7（边界值）与 0.95
+    });
+    expect(stats.avg_top1_score).toBeCloseTo((0.1 + 0.3 + 0.5 + 0.7 + 0.95) / 5, 5); // AVG 自动跳过 NULL
+    expect(stats.avg_duration_ms).toBe(100);
+  });
+
+  it("空表：query_count=0、avg 系列兜底为 0；但 low_score_count/no_result_count/各分桶因 SQL 没有 COALESCE 保护，SUM over 0 行是 null 不是 0（已用 better-sqlite3 直接验证，v1 同一段 SQL 同样没有 COALESCE，是原样保留的行为而非本层 bug）", () => {
+    const stats = storage.getSemanticSearchStats();
+    expect(stats.query_count).toBe(0);
+    expect(stats.avg_top1_score).toBe(0);
+    expect(stats.avg_duration_ms).toBe(0);
+    expect(stats.low_score_count).toBeNull();
+    expect(stats.no_result_count).toBeNull();
+    expect(stats.distribution).toEqual({
+      bucket_none: null, bucket_0_3: null, bucket_3_5: null, bucket_5_7: null, bucket_7_10: null,
+    });
+  });
+
+  it("getSemanticSearchRecent 默认返回全部，按 id DESC；lowScoreOnly=true 只保留 top1_score IS NULL OR < 0.5", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "cool-repo", url: "https://example.com/cool.git" });
+    seedRows(uid, repoId);
+
+    const all = storage.getSemanticSearchRecent();
+    expect(all.length).toBe(6);
+    expect(all[0].query).toBe("q-095"); // 最后插入的排最前
+    expect(all[0]).toMatchObject({ repo_id: repoId, repo_name: "cool-repo", username: "alice" });
+
+    const lowOnly = storage.getSemanticSearchRecent(50, true);
+    expect(lowOnly.map((r) => r.query).sort()).toEqual(["q-01", "q-03", "q-null"].sort());
+  });
+
+  it("getSemanticSearchRecent 遵守 limit", () => {
+    const uid = storage.createUser("alice", "hashed-pw");
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    seedRows(uid, repoId);
+    expect(storage.getSemanticSearchRecent(2).length).toBe(2);
+  });
+
+  it("user_id 为 null 时 username 也是 null（COALESCE 占位符拼接遇到 NULL id 时整体塌缩为 NULL，与 getUsageByUser 是同一个已验证过的 SQL 行为）", () => {
+    const repoId = storage.createRepo({ name: "r", url: "https://example.com/r.git" });
+    storage.recordSemanticSearchLog({ userId: null, repoId, query: "anon", resultCount: 1, top1Score: 0.9, resultsJson: "[]", durationMs: 50 });
+    const rows = storage.getSemanticSearchRecent();
+    expect(rows[0].username).toBeNull();
   });
 });

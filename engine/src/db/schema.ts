@@ -1,5 +1,22 @@
 import Database from "better-sqlite3";
 
+// v1 never had a migration story beyond "recreate the disposable dev db"
+// (every column so far shipped straight in the base CREATE TABLE DDL, per
+// the comment below) — safe when there's no real deployed data to preserve.
+// BUG-003's must_change_password column is the first one added AFTER a
+// real deployment (the 244 machine) already has a populated `users` table,
+// so CREATE TABLE IF NOT EXISTS alone would silently no-op there and leave
+// the column missing. This tiny guarded ALTER TABLE is additive-only (new
+// column, safe default, never touches existing data) — a full migration
+// framework would be over-engineering for what is still, elsewhere in this
+// file, a single hand-maintained DDL script.
+function ensureColumn(db: Database.Database, table: string, column: string, columnDdl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDdl}`);
+  }
+}
+
 export function initSchema(dbPath: string): void {
   const db = new Database(dbPath);
 
@@ -11,7 +28,7 @@ export function initSchema(dbPath: string): void {
   // Create all tables if they don't exist
   // All migration columns are included in the base CREATE TABLE DDL
 
-  // Users table with migration column my_issues_seen_at
+  // Users table with migration columns my_issues_seen_at, must_change_password
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,9 +37,16 @@ export function initSchema(dbPath: string): void {
       role TEXT NOT NULL DEFAULT 'user',
       is_active INTEGER DEFAULT 1,
       created_at TEXT NOT NULL,
-      my_issues_seen_at TEXT
+      my_issues_seen_at TEXT,
+      must_change_password INTEGER NOT NULL DEFAULT 0
     )
   `);
+  // BUG-003: covers the case where `users` already existed (a real prior
+  // deployment) before this column existed — CREATE TABLE IF NOT EXISTS
+  // above is a no-op there, so the column would otherwise be silently
+  // missing. No-ops on a fresh install (the column is already present from
+  // the CREATE TABLE itself).
+  ensureColumn(db, "users", "must_change_password", "must_change_password INTEGER NOT NULL DEFAULT 0");
 
   // Repositories table with migration columns
   db.exec(`

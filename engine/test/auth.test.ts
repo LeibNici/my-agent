@@ -122,11 +122,13 @@ describe("ensureAdminUser — fake UserStore (sync, proves structural interface 
   function makeFakeSyncStore(seed: Record<string, unknown> = {}) {
     const users = new Map<string, unknown>(Object.entries(seed));
     let nextId = Object.keys(seed).length + 1;
-    const createUser = vi.fn((username: string, passwordHash: string, role = "user") => {
-      const row = { id: nextId++, username, password_hash: passwordHash, role };
-      users.set(username, row);
-      return row.id;
-    });
+    const createUser = vi.fn(
+      (username: string, passwordHash: string, role = "user", mustChangePassword = false) => {
+        const row = { id: nextId++, username, password_hash: passwordHash, role, mustChangePassword };
+        users.set(username, row);
+        return row.id;
+      }
+    );
     const store: UserStore = {
       getUserByUsername: (username: string) => users.get(username) ?? null,
       createUser,
@@ -193,6 +195,20 @@ describe("ensureAdminUser — fake UserStore (sync, proves structural interface 
     expect(row.password_hash).not.toBe("custom-strong-pw");
     await expect(verifyPassword("custom-strong-pw", row.password_hash)).resolves.toBe(true);
   });
+
+  it("BUG-003: bootstrapping with the well-known default password passes mustChangePassword=true to createUser", async () => {
+    const { store, createUser } = makeFakeSyncStore();
+    const settings = settingsWith({ APP_ADMIN_PASSWORD: "admin123" });
+    await ensureAdminUser(store, settings);
+    expect(createUser).toHaveBeenCalledWith("admin", expect.any(String), "admin", true);
+  });
+
+  it("BUG-003: bootstrapping with an operator-supplied password passes mustChangePassword=false", async () => {
+    const { store, createUser } = makeFakeSyncStore();
+    const settings = settingsWith({ APP_ADMIN_PASSWORD: "a-real-production-password" });
+    await ensureAdminUser(store, settings);
+    expect(createUser).toHaveBeenCalledWith("admin", expect.any(String), "admin", false);
+  });
 });
 
 describe("ensureAdminUser — real Storage (sync/better-sqlite3)", () => {
@@ -220,6 +236,18 @@ describe("ensureAdminUser — real Storage (sync/better-sqlite3)", () => {
     const settings = settingsWith({ APP_ADMIN_PASSWORD: "custom-strong-pw" });
     await ensureAdminUser(storage, settings);
     await expect(ensureAdminUser(storage, settings)).resolves.toBeUndefined();
+  });
+
+  it("BUG-003: bootstrap with the default password persists must_change_password=1 on the real row", async () => {
+    const settings = settingsWith({ APP_ADMIN_PASSWORD: "admin123" });
+    await ensureAdminUser(storage, settings);
+    expect(storage.getUserByUsername("admin")!.must_change_password).toBe(1);
+  });
+
+  it("BUG-003: bootstrap with a custom password persists must_change_password=0", async () => {
+    const settings = settingsWith({ APP_ADMIN_PASSWORD: "custom-strong-pw" });
+    await ensureAdminUser(storage, settings);
+    expect(storage.getUserByUsername("admin")!.must_change_password).toBe(0);
   });
 });
 

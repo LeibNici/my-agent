@@ -126,7 +126,17 @@ describe("e2e smoke — real server + real runTurn engine against an offline moc
     });
     expect(loginResp.status).toBe(200);
     const loginBody = (await loginResp.json()) as { token: string; user: { username: string; role: string } };
-    expect(loginBody.user).toEqual({ id: expect.any(Number), username: "admin", role: "admin" });
+    // BUG-003: bootstrapping with the well-known default password now also
+    // flags must_change_password:true (see auth.ts's ensureAdminUser) —
+    // this e2e test isn't exercising that gate itself (test/sse-route.test.ts
+    // and test/auth.test.ts cover it directly), just proving the login
+    // response's OTHER fields still round-trip through the real server.
+    expect(loginBody.user).toEqual({
+      id: expect.any(Number),
+      username: "admin",
+      role: "admin",
+      must_change_password: true,
+    });
     const token = loginBody.token;
     expect(typeof token).toBe("string");
 

@@ -43,8 +43,17 @@ parentPort.on("message", (req: Request) => {
         break;
       }
       case "createUser": {
-        const [username, passwordHash, role] = args as [string, string, string | undefined];
-        reply({ id, ok: true, result: storage.createUser(username, passwordHash, role) });
+        const [username, passwordHash, role, mustChangePassword] = args as [
+          string,
+          string,
+          string | undefined,
+          boolean | undefined,
+        ];
+        reply({
+          id,
+          ok: true,
+          result: storage.createUser(username, passwordHash, role, mustChangePassword),
+        });
         break;
       }
       case "getUserById": {
@@ -170,6 +179,128 @@ parentPort.on("message", (req: Request) => {
         const [row] = args as [Parameters<typeof storage.recordSemanticSearchLog>[0]];
         storage.recordSemanticSearchLog(row);
         reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "markSessionResolved": {
+        const [sessionId] = args as [string];
+        storage.markSessionResolved(sessionId);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "recordIssueSubmission": {
+        const [fields] = args as [Parameters<typeof storage.recordIssueSubmission>[0]];
+        reply({ id, ok: true, result: storage.recordIssueSubmission(fields) });
+        break;
+      }
+      case "getIssueSubmissionsForSession": {
+        const [sessionId] = args as [string];
+        reply({ id, ok: true, result: storage.getIssueSubmissionsForSession(sessionId) });
+        break;
+      }
+      case "getTrackableSubmissions": {
+        reply({ id, ok: true, result: storage.getTrackableSubmissions() });
+        break;
+      }
+      case "updateIssueTracking": {
+        const [submissionId, fields] = args as [
+          number,
+          Parameters<typeof storage.updateIssueTracking>[1],
+        ];
+        storage.updateIssueTracking(submissionId, fields);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "upsertFixReport": {
+        const [fields] = args as [Parameters<typeof storage.upsertFixReport>[0]];
+        reply({ id, ok: true, result: storage.upsertFixReport(fields) });
+        break;
+      }
+      case "getUnverifiedFixReports": {
+        reply({ id, ok: true, result: storage.getUnverifiedFixReports() });
+        break;
+      }
+      case "setFixReportVerified": {
+        const [reportId, verified] = args as [number, boolean];
+        storage.setFixReportVerified(reportId, verified);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "getMyIssueSubmissions": {
+        const [userId, limit] = args as [number, number | undefined];
+        reply({ id, ok: true, result: storage.getMyIssueSubmissions(userId, limit) });
+        break;
+      }
+      case "getMyUnreadIssueCount": {
+        const [userId] = args as [number];
+        reply({ id, ok: true, result: storage.getMyUnreadIssueCount(userId) });
+        break;
+      }
+      case "markMyIssuesSeen": {
+        const [userId] = args as [number];
+        storage.markMyIssuesSeen(userId);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "getIssueTrackingOverview": {
+        const [limit] = args as [number | undefined];
+        reply({ id, ok: true, result: storage.getIssueTrackingOverview(limit) });
+        break;
+      }
+      case "recordIssueAction": {
+        const [fields] = args as [Parameters<typeof storage.recordIssueAction>[0]];
+        reply({ id, ok: true, result: storage.recordIssueAction(fields) });
+        break;
+      }
+      case "getIssueActionsForSession": {
+        const [sessionId] = args as [string];
+        reply({ id, ok: true, result: storage.getIssueActionsForSession(sessionId) });
+        break;
+      }
+      case "getUsageSummary": {
+        reply({ id, ok: true, result: storage.getUsageSummary() });
+        break;
+      }
+      case "getUsageByUser": {
+        reply({ id, ok: true, result: storage.getUsageByUser() });
+        break;
+      }
+      case "getMessageSessionId": {
+        const [messageId] = args as [number];
+        reply({ id, ok: true, result: storage.getMessageSessionId(messageId) });
+        break;
+      }
+      case "setMessageFeedback": {
+        const [messageId, sessionId, userId, rating] = args as [number, string, number, number];
+        storage.setMessageFeedback(messageId, sessionId, userId, rating);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "getFeedbackForSession": {
+        const [sessionId, userId] = args as [string, number];
+        reply({ id, ok: true, result: storage.getFeedbackForSession(sessionId, userId) });
+        break;
+      }
+      case "getFeedbackSummary": {
+        reply({ id, ok: true, result: storage.getFeedbackSummary() });
+        break;
+      }
+      case "getRecentNegativeFeedback": {
+        const [limit] = args as [number | undefined];
+        reply({ id, ok: true, result: storage.getRecentNegativeFeedback(limit) });
+        break;
+      }
+      case "getRecentLlmCalls": {
+        const [limit] = args as [number | undefined];
+        reply({ id, ok: true, result: storage.getRecentLlmCalls(limit) });
+        break;
+      }
+      case "getSemanticSearchStats": {
+        reply({ id, ok: true, result: storage.getSemanticSearchStats() });
+        break;
+      }
+      case "getSemanticSearchRecent": {
+        const [limit, lowScoreOnly] = args as [number | undefined, boolean | undefined];
+        reply({ id, ok: true, result: storage.getSemanticSearchRecent(limit, lowScoreOnly) });
         break;
       }
       case "close": {
