@@ -3,6 +3,8 @@
 // for v2's explicit ToolContext parameter (v1 used AsyncLocalStorage ContextVar)
 import { describe, it, expect, beforeEach } from "vitest";
 import * as path from "node:path";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import {
   getAllowedPaths,
   getToolUserId,
@@ -120,6 +122,38 @@ describe("getAllowedPaths", () => {
     const result = getAllowedPaths(ctx);
     expect(result).toHaveLength(1);
     expect(result[0]).toMatch(/^\/repos\/foo/);
+  });
+
+  it("resolves symlinks to their real target (fs.realpathSync semantics, matching Python's os.path.realpath) — a lexical path.resolve() would wrongly return the symlink path itself", () => {
+    const tmpBase = fs.realpathSync(os.tmpdir());
+    const realDir = fs.mkdtempSync(path.join(tmpBase, "access-real-"));
+    const linkPath = path.join(tmpBase, `access-link-${process.pid}-${Date.now()}`);
+    fs.symlinkSync(realDir, linkPath, "dir");
+    try {
+      const ctx: ToolContext = {
+        allowedRepoPaths: [linkPath],
+        unsyncedRepoNames: [],
+        userId: null,
+      };
+      const result = getAllowedPaths(ctx);
+      expect(result).toEqual([realDir]);
+      expect(result[0]).not.toBe(linkPath);
+    } finally {
+      fs.unlinkSync(linkPath);
+      fs.rmdirSync(realDir);
+    }
+  });
+
+  it("falls back to lexical path.resolve() (not a throw) for a path that doesn't exist yet — mirrors Python's os.path.realpath, which never throws on a missing target", () => {
+    const nonexistent = path.join(os.tmpdir(), `access-nonexistent-${process.pid}-${Date.now()}`);
+    const ctx: ToolContext = {
+      allowedRepoPaths: [nonexistent],
+      unsyncedRepoNames: [],
+      userId: null,
+    };
+    expect(() => getAllowedPaths(ctx)).not.toThrow();
+    const result = getAllowedPaths(ctx);
+    expect(result).toEqual([path.resolve(nonexistent)]);
   });
 });
 

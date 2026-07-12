@@ -11,16 +11,34 @@
 // they aren't — this used to be copy-pasted and had already drifted. Now
 // the central functions here are the single source of truth.
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolContext } from "./registry.js";
 
 /**
- * Get the current turn's allowed repo paths, normalized via realpath.
- * The caller (turn.ts) may pass un-normalized paths; this function
- * normalizes them and filters empty strings to ensure consistency.
+ * Get the current turn's allowed repo paths, normalized via realpath
+ * (symlink-resolved, matching Python's os.path.realpath — NOT a lexical
+ * path.resolve(), which would leave symlink components unresolved and let
+ * isWithinAllowedPaths wrongly deny access to a tool-supplied path that
+ * fs.realpathSync (used elsewhere on the tool-supplied side) has already
+ * resolved through the same symlink).
+ *
+ * Python's os.path.realpath never throws on a nonexistent target — it just
+ * lexically normalizes what it can. Node's fs.realpathSync THROWS ENOENT
+ * for a missing path. Repo paths here should always exist (already-synced
+ * repos), but to match Python's non-throwing behavior for the edge case,
+ * fall back to path.resolve(p) on ENOENT.
  */
 export function getAllowedPaths(ctx: ToolContext): string[] {
-  return ctx.allowedRepoPaths.filter((p) => p).map((p) => path.resolve(p));
+  return ctx.allowedRepoPaths
+    .filter((p) => p)
+    .map((p) => {
+      try {
+        return fs.realpathSync(p);
+      } catch {
+        return path.resolve(p);
+      }
+    });
 }
 
 /**
