@@ -1,6 +1,6 @@
 import { Worker } from "node:worker_threads";
 import { once } from "node:events";
-import type { StoredMessageRow, LlmMetricsRow, UserRow } from "./storage.js";
+import type { StoredMessageRow, LlmMetricsRow, UserRow, SessionRow, RepoRow } from "./storage.js";
 
 export type DbClient = {
   addMessage(sessionId: string, role: string, content: string | unknown[]): Promise<number>;
@@ -8,6 +8,12 @@ export type DbClient = {
   recordLlmCallMetrics(rows: LlmMetricsRow[]): Promise<void>;
   getUserByUsername(username: string): Promise<UserRow | null>;
   createUser(username: string, passwordHash: string, role?: string): Promise<number>;
+  createSession(title: string, ownerId: number | null): Promise<string>;
+  listSessions(ownerId: number | null): Promise<SessionRow[]>;
+  getSession(sessionId: string): Promise<SessionRow | null>;
+  deleteSession(sessionId: string): Promise<void>;
+  listRepos(): Promise<RepoRow[]>;
+  listReposForUser(userId: number): Promise<RepoRow[]>;
   close(): Promise<void>;
 };
 
@@ -109,6 +115,12 @@ export function createDbClient(dbPath: string): DbClient {
     getUserByUsername: (username) => call<UserRow | null>("getUserByUsername", [username]),
     createUser: (username, passwordHash, role) =>
       call<number>("createUser", [username, passwordHash, role]),
+    createSession: (title, ownerId) => call<string>("createSession", [title, ownerId]),
+    listSessions: (ownerId) => call<SessionRow[]>("listSessions", [ownerId]),
+    getSession: (sessionId) => call<SessionRow | null>("getSession", [sessionId]),
+    deleteSession: (sessionId) => call<void>("deleteSession", [sessionId]),
+    listRepos: () => call<RepoRow[]>("listRepos", []),
+    listReposForUser: (userId) => call<RepoRow[]>("listReposForUser", [userId]),
     close: () => {
       // 幂等：第二次及以后的 close() 返回同一个 promise（resolve-as-noop），不再发 RPC。
       if (!closePromise) {

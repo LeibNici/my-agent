@@ -32,12 +32,14 @@ describe("openStorage", () => {
     const db = new Database(p3);
     db.exec(`
       CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
-        owner_id INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        owner_id INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, resolved_at TEXT);
       CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
         role TEXT NOT NULL, content TEXT NOT NULL, timestamp TEXT NOT NULL);
       CREATE TABLE llm_call_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
         user_id INTEGER, model TEXT, iteration INTEGER, input_tokens INTEGER, output_tokens INTEGER,
         ttft_ms INTEGER, total_ms INTEGER, created_at TEXT NOT NULL);
+      CREATE TABLE repositories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL);
+      CREATE TABLE permissions (user_id INTEGER NOT NULL, repo_id INTEGER NOT NULL, access_level TEXT DEFAULT 'read');
     `);
     db.close();
     expect(() => openStorage(p3)).toThrow(SchemaError);
@@ -124,5 +126,119 @@ describe("createUser / getUserByUsername（v1 database.py 同语义）", () => {
     const id2 = storage.createUser("someone-else", "pw2");
     expect(id2).toBeGreaterThan(id1);
     expect(() => storage.createUser("dup", "pw3")).toThrow(/UNIQUE/i);
+  });
+});
+
+describe("createSession / listSessions / getSession / deleteSession（v1 database.py 同语义，Task 5）", () => {
+  // sessions.owner_id carries a real FOREIGN KEY -> users(id) (schema.ts,
+  // ported from v1's DDL) and the fixture's PRAGMA foreign_keys=ON enforces
+  // it — an arbitrary int like owner_id=1 with no matching users row would
+  // 500 on that constraint, not on session-id collision. Every test that
+  // cares about owner_id uses a REAL user row's id for exactly this reason.
+  function seedUser(username: string): number {
+    return storage.createUser(username, "hashed-pw", "user");
+  }
+
+  it("createSession 返回 8 位十六进制 id，getSession 读回完整行（owner_id/resolved_at 含在内）", () => {
+    const uid = seedUser("alice");
+    const id = storage.createSession("New Chat", uid);
+    expect(id).toMatch(/^[0-9a-f]{8}$/);
+    const row = storage.getSession(id);
+    expect(row).toMatchObject({ id, title: "New Chat", owner_id: uid, resolved_at: null });
+    expect(row!.created_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$/);
+    expect(row!.updated_at).toBe(row!.created_at);
+  });
+
+  it("owner_id 可为 null（未登录/系统会话，对照 v1 create_session 的默认参数）", () => {
+    const id = storage.createSession("New Chat", null);
+    expect(storage.getSession(id)!.owner_id).toBeNull();
+  });
+
+  it("不存在的 session_id ⇒ null", () => {
+    expect(storage.getSession("ghost1234")).toBeNull();
+  });
+
+  it("listSessions(ownerId) 只返回该 owner 的会话，按 updated_at DESC", () => {
+    const uid1 = seedUser("alice");
+    const uid2 = seedUser("bob");
+    const a = storage.createSession("chat-a", uid1);
+    const b = storage.createSession("chat-b", uid1);
+    storage.createSession("chat-c", uid2); // different owner — must not show up
+    // a/b can land in the same millisecond in a tight loop — stamp
+    // updated_at explicitly so the DESC ordering assertion is deterministic
+    // rather than racing the wall clock.
+    const db = new Database(dbPath);
+    db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run("2020-01-01T00:00:00.000000", a);
+    db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run("2020-01-02T00:00:00.000000", b);
+    db.close();
+    const rows = storage.listSessions(uid1);
+    expect(rows.map((r) => r.id)).toEqual([b, a]);
+    expect(rows.every((r) => r.owner_id === uid1)).toBe(true);
+  });
+
+  it("listSessions(null) 返回全部会话（admin 视角），不按 owner 过滤", () => {
+    const uid1 = seedUser("alice");
+    const uid2 = seedUser("bob");
+    const a = storage.createSession("chat-a", uid1);
+    const b = storage.createSession("chat-b", uid2);
+    const ids = storage.listSessions(null).map((r) => r.id);
+    expect(ids).toContain(a);
+    expect(ids).toContain(b);
+    expect(ids).toContain("s1"); // fixture seed row
+  });
+
+  it("deleteSession 级联删除 messages（显式两条 DELETE），会话本身也消失", () => {
+    const uid = seedUser("alice");
+    const id = storage.createSession("to-delete", uid);
+    storage.addMessage(id, "user", "hi");
+    storage.addMessage(id, "assistant", "there");
+    expect(storage.getMessages(id).length).toBe(2);
+    storage.deleteSession(id);
+    expect(storage.getSession(id)).toBeNull();
+    expect(storage.getMessages(id).length).toBe(0);
+  });
+
+  it("连续创建多个会话 id 各不相同（8 位十六进制 id 空间下的正常路径）", () => {
+    const ids = Array.from({ length: 20 }, () => storage.createSession("x", null));
+    expect(new Set(ids).size).toBe(20);
+  });
+});
+
+describe("listRepos / listReposForUser（v1 database.py list_repos/get_user_repos 同语义，Task 5）", () => {
+  function seedRepoWithPermission(db: Database.Database, userId: number, accessLevel: string): number {
+    const repoId = Number(
+      db
+        .prepare("INSERT INTO repositories (name, url, description, branch, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run("demo-repo", "https://example.com/demo.git", "desc", "main", "x").lastInsertRowid
+    );
+    db.prepare(
+      "INSERT INTO permissions (user_id, repo_id, access_level, created_at) VALUES (?, ?, ?, ?)"
+    ).run(userId, repoId, accessLevel, "x");
+    return repoId;
+  }
+
+  it("空 repositories 表 ⇒ listRepos/listReposForUser 都返回 []", () => {
+    expect(storage.listRepos()).toEqual([]);
+    expect(storage.listReposForUser(1)).toEqual([]);
+  });
+
+  it("listRepos 返回全部仓库，access_level 恒为 null（无授权行可关联）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const db = new Database(dbPath);
+    seedRepoWithPermission(db, uid, "write");
+    db.close();
+    const rows = storage.listRepos();
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({ name: "demo-repo", url: "https://example.com/demo.git", access_level: null });
+  });
+
+  it("listReposForUser 只返回该用户被授权的仓库，携带真实 access_level；未授权用户拿到 []", () => {
+    const uid1 = storage.createUser("alice", "hashed-pw", "user");
+    const uid2 = storage.createUser("bob", "hashed-pw", "user");
+    const db = new Database(dbPath);
+    seedRepoWithPermission(db, uid1, "write");
+    db.close();
+    expect(storage.listReposForUser(uid1)).toMatchObject([{ name: "demo-repo", access_level: "write" }]);
+    expect(storage.listReposForUser(uid2)).toEqual([]);
   });
 });

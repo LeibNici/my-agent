@@ -266,6 +266,12 @@ export type RunTurnDeps = { db?: DbClient; settings: Settings; tools: ToolDef[] 
 // that turns this `unknown[]` into typed DomainMessage[].
 export type RunTurnRequest = { sessionId: string; history: unknown[]; userText: string };
 
+// The injectable shape of runTurn itself (Task 5's buildApp takes this as
+// `deps.engine` — SSE route tests inject a stub matching this signature
+// instead of the real per-turn pi Agent assembly, so the SSE contract can
+// be verified with no network/no pi involved).
+export type RunTurnFn = (deps: RunTurnDeps, req: RunTurnRequest) => AsyncGenerator<DomainEvent>;
+
 export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGenerator<DomainEvent> {
   const { settings, tools } = deps;
   const setup = buildModelSetup(settings);

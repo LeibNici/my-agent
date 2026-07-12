@@ -47,6 +47,36 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.createUser(username, passwordHash, role) });
         break;
       }
+      case "createSession": {
+        const [title, ownerId] = args as [string, number | null];
+        reply({ id, ok: true, result: storage.createSession(title, ownerId) });
+        break;
+      }
+      case "listSessions": {
+        const [ownerId] = args as [number | null];
+        reply({ id, ok: true, result: storage.listSessions(ownerId) });
+        break;
+      }
+      case "getSession": {
+        const [sessionId] = args as [string];
+        reply({ id, ok: true, result: storage.getSession(sessionId) });
+        break;
+      }
+      case "deleteSession": {
+        const [sessionId] = args as [string];
+        storage.deleteSession(sessionId);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "listRepos": {
+        reply({ id, ok: true, result: storage.listRepos() });
+        break;
+      }
+      case "listReposForUser": {
+        const [userId] = args as [number];
+        reply({ id, ok: true, result: storage.listReposForUser(userId) });
+        break;
+      }
       case "close": {
         storage.close();
         reply({ id, ok: true, result: undefined });
