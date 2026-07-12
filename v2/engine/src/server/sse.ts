@@ -29,7 +29,7 @@ import type { DbClient } from "../db/client.js";
 import type { LlmMetricsRow } from "../db/storage.js";
 import type { Settings } from "../config.js";
 import type { RunTurnFn, RunTurnDeps } from "../engine/turn.js";
-import type { ToolDef } from "../tools/registry.js";
+import type { ToolDef, ToolContext } from "../tools/registry.js";
 import type { DomainBlock } from "../domain.js";
 import { domainToLegacy } from "../codec-legacy.js";
 
@@ -40,14 +40,16 @@ export type ChatRequestBody = {
   session_id?: string | null;
   message: string;
   // Accepted for wire-shape compatibility with the frontend's POST body
-  // (web/app.js always sends these) but not yet acted on this phase:
-  // skills/tools are calculator-only with no skill gating (GET /api/skills
-  // returns [] — see app.ts), repo-scoped tool access is Phase 4, and
-  // current-turn image blocks are a known pre-existing gap (codec-pi.ts's
-  // domainToPi throws on image DomainBlocks; RunTurnRequest.userText is
-  // plain string only — Task 4 never extended it). Silently ignored, not
-  // rejected: v1's MAX_MESSAGE_LENGTH check is the only "reject" path this
-  // phase ports.
+  // (web/app.js always sends these). skills/tools are calculator-only with
+  // no skill gating (GET /api/skills returns [] — see app.ts); current-turn
+  // image blocks are a known pre-existing gap (codec-pi.ts's domainToPi
+  // throws on image DomainBlocks; RunTurnRequest.userText is plain string
+  // only — Task 4 never extended it) and stay silently ignored, not
+  // rejected — v1's MAX_MESSAGE_LENGTH check is the only "reject" path this
+  // phase ports. repo_id DOES act on something as of Task 8: it narrows
+  // resolveToolContext's granted-repo set to a single repo (v1's
+  // `if req.repo_id: granted_repos = [r for r in all_repos if r["id"] ==
+  // req.repo_id]`).
   active_skills?: string[];
   repo_id?: number | null;
   images?: unknown[];
@@ -69,6 +71,37 @@ export type CurrentUser = { id: number; username: string; role: string };
 // rule instead of re-branching it per call site.
 export function userOwnsSession(session: { owner_id: number | null }, user: CurrentUser): boolean {
   return user.role === "admin" || session.owner_id === user.id;
+}
+
+/**
+ * Resolves this turn's ToolContext from the user's repo permissions —
+ * ported from v1's chat route inline block (`git show v1-python-final:
+ * app/main.py`, right after the user's add_message, before agent.run():
+ * `_get_visible_repos` + `allowed_repo_paths`/`unsynced_repo_names`).
+ * Admin bypasses the permission table entirely (every repo, v1's
+ * `_get_visible_repos`); a non-admin only sees repos explicitly granted
+ * via `permissions`. An optional `repoId` (the request's `repo_id`)
+ * narrows the granted set to that one repo, matching v1's
+ * `if req.repo_id: granted_repos = [r for r in all_repos if r["id"] ==
+ * req.repo_id]` — note this filters the ALREADY-VISIBLE set, so a
+ * non-admin passing a repo_id they have no grant for narrows to [],
+ * not a permission bypass.
+ *
+ * Uses db.listReposFull()/listReposForUserFull() (Task 8), NOT
+ * db.listRepos()/listReposForUser() — those two power the client-facing
+ * GET /api/repos response and deliberately omit local_path (RepoRow is
+ * v1's `_public_repo` client-safe subset); this function runs entirely
+ * server-side and structurally needs local_path to build
+ * allowedRepoPaths, so it reads the full row instead.
+ */
+export async function resolveToolContext(db: DbClient, user: CurrentUser, repoId?: number | null): Promise<ToolContext> {
+  const allRepos = user.role === "admin" ? await db.listReposFull() : await db.listReposForUserFull(user.id);
+  const granted = repoId ? allRepos.filter((r) => r.id === repoId) : allRepos;
+  return {
+    allowedRepoPaths: granted.filter((r) => r.local_path).map((r) => r.local_path as string),
+    unsyncedRepoNames: granted.filter((r) => !r.local_path).map((r) => r.name),
+    userId: user.id,
+  };
 }
 
 /** v1's `_sse_reject`: the standard "reject this request" sequence shared by
@@ -190,7 +223,11 @@ export async function* chatEventStream(
   // even though the DomainEvent itself doesn't (see file header).
   const toolNameById = new Map<string, string>();
 
-  const runTurnDeps: RunTurnDeps = { db, settings, tools };
+  // Per-turn tool access, resolved fresh from the CURRENT permission table
+  // right before the engine call (never cached/reused across turns) — see
+  // resolveToolContext's own comment for the v1 correspondence.
+  const ctx = await resolveToolContext(db, user, req.repo_id);
+  const runTurnDeps: RunTurnDeps = { db, settings, tools, ctx };
   const engineIter = engine(runTurnDeps, { sessionId, history, userText: req.message })[Symbol.asyncIterator]();
 
   try {

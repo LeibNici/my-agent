@@ -14,6 +14,13 @@ import { calculatorTool } from "../src/tools/calculator.js";
 import { runTurn } from "../src/engine/turn.js";
 import { startMock, textTurn, toolTurn, textThenToolTurn, type MockServer, type SseEvent } from "./mock-anthropic.js";
 import type { DomainEvent } from "../src/domain.js";
+import type { ToolContext } from "../src/tools/registry.js";
+
+// This suite's tests are about budget/text/tool-call plumbing, not repo
+// permissions (Task 8 owns that — see chat-tools-integration.test.ts) —
+// every call site here just needs SOME valid ctx to satisfy RunTurnDeps'
+// now-required `ctx` field.
+const EMPTY_CTX: ToolContext = { allowedRepoPaths: [], unsyncedRepoNames: [], userId: null };
 
 // loadSettings({}) yields every field at its documented default (no env,
 // no dotenv read — see config.test.ts) — cheapest way to get a fully-typed
@@ -42,7 +49,7 @@ describe("runTurn — turn engine (Task 4)", () => {
     const mock = startMock([textTurn("你好")]);
     const settings = testSettings({ baseUrl: mock.url });
     const events = await collect(
-      runTurn({ settings, tools: [] }, { sessionId: "s1", history: [], userText: "hi" }),
+      runTurn({ settings, tools: [], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "hi" }),
     );
     expect(events.map((e) => e.type)).toEqual(["text_delta", "llm_metrics", "done"]);
     expect(events.at(-1)!.data).toMatchObject({ text: "你好", success: true, budgetExhausted: false });
@@ -58,7 +65,7 @@ describe("runTurn — turn engine (Task 4)", () => {
     const events: DomainEvent[] = [];
     let requestsSeenAtExchange = -1;
     for await (const e of runTurn(
-      { settings, tools: [calculatorTool] },
+      { settings, tools: [calculatorTool], ctx: EMPTY_CTX },
       { sessionId: "s1", history: [], userText: "1+1=?" },
     )) {
       events.push(e);
@@ -86,7 +93,7 @@ describe("runTurn — turn engine (Task 4)", () => {
     const mock = startMock(exhaustingTurns());
     const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
     const events = await collect(
-      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+      runTurn({ settings, tools: [calculatorTool], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "查" }),
     );
     const call3 = JSON.stringify(mock.requests[3]?.body);
     const call4 = JSON.stringify(mock.requests[4]?.body);
@@ -108,7 +115,7 @@ describe("runTurn — turn engine (Task 4)", () => {
     const mock = startMock(exhaustingTurns());
     const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
     const events = await collect(
-      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+      runTurn({ settings, tools: [calculatorTool], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "查" }),
     );
     // mock.requests.length is the oracle for "how many LLM calls happened":
     // 8 tool-loop calls (the budget) + 1 separate wrap-up call.
@@ -130,7 +137,7 @@ describe("runTurn — turn engine (Task 4)", () => {
     const mock = startMock([]); // 空脚本 ⇒ mock 返 500
     const settings = testSettings({ baseUrl: mock.url });
     const events = await collect(
-      runTurn({ settings, tools: [] }, { sessionId: "s1", history: [], userText: "hi" }),
+      runTurn({ settings, tools: [], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "hi" }),
     );
     expect(events.map((e) => e.type)).toEqual(["error", "done"]);
     expect((events[0].data as { message: string }).message).toMatch(/^LLM API error: /);
@@ -141,14 +148,14 @@ describe("runTurn — turn engine (Task 4)", () => {
   it("7. promptCache:'off' -> 请求体不含任何 cache_control；默认（'auto'）-> 请求体含 cache_control（GATE 的 0A S4：DashScope 缓存真实生效，cacheRead=4005，默认保持开启）", async () => {
     const mockOff = startMock([textTurn("ok")]);
     const settingsOff = testSettings({ baseUrl: mockOff.url, promptCache: "off" });
-    await collect(runTurn({ settings: settingsOff, tools: [] }, { sessionId: "s1", history: [], userText: "hi" }));
+    await collect(runTurn({ settings: settingsOff, tools: [], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "hi" }));
     expect(JSON.stringify(mockOff.requests[0]?.body)).not.toContain("cache_control");
     await mockOff.close();
 
     const mockDefault = startMock([textTurn("ok")]);
     const settingsDefault = testSettings({ baseUrl: mockDefault.url }); // promptCache defaults to "auto"
     await collect(
-      runTurn({ settings: settingsDefault, tools: [] }, { sessionId: "s1", history: [], userText: "hi" }),
+      runTurn({ settings: settingsDefault, tools: [], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "hi" }),
     );
     expect(JSON.stringify(mockDefault.requests[0]?.body)).toContain("cache_control");
     await mockDefault.close();
@@ -159,7 +166,7 @@ describe("runTurn — turn engine (Task 4)", () => {
     const mock = startMock(turns);
     const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8, promptCache: "off" });
     await collect(
-      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+      runTurn({ settings, tools: [calculatorTool], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "查" }),
     );
     // request[8] is the wrap-up call (see test 4/6's numbering).
     expect(JSON.stringify(mock.requests[8]?.body)).not.toContain("cache_control");
@@ -169,11 +176,11 @@ describe("runTurn — turn engine (Task 4)", () => {
   it("6. 每 turn 新 Agent：连续两次 runTurn，第二次的请求体只来自入参 history（无第一 turn 残留）", async () => {
     const mock: MockServer = startMock([textTurn("第一轮回复"), textTurn("第二轮回复")]);
     const settings = testSettings({ baseUrl: mock.url });
-    await collect(runTurn({ settings, tools: [] }, { sessionId: "s1", history: [], userText: "第一轮问题" }));
+    await collect(runTurn({ settings, tools: [], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "第一轮问题" }));
     // Turn 2 also gets an EMPTY history argument — if runTurn cached/reused
     // an Agent (or any module-level state) across calls, turn 1's Q&A would
     // still leak onto the wire here even though nothing was passed for it.
-    await collect(runTurn({ settings, tools: [] }, { sessionId: "s1", history: [], userText: "第二轮问题" }));
+    await collect(runTurn({ settings, tools: [], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "第二轮问题" }));
     expect(mock.requests.length).toBe(2);
     const secondBody = JSON.stringify(mock.requests[1]?.body);
     expect(secondBody).not.toContain("第一轮问题");
@@ -221,7 +228,7 @@ describe("runTurn — wrap-up v1 parity（review fix：fallback 文本、metrics
     const mock = startMock(turns);
     const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
     const events = await collect(
-      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+      runTurn({ settings, tools: [calculatorTool], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "查" }),
     );
     expect(mock.requests.length).toBe(9); // no retry — the attempt didn't fail
     const textDeltas = events
@@ -238,7 +245,7 @@ describe("runTurn — wrap-up v1 parity（review fix：fallback 文本、metrics
     const mock = startMock(exhaustingTurns());
     const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
     const events = await collect(
-      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+      runTurn({ settings, tools: [calculatorTool], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "查" }),
     );
     const metrics = events.filter(
       (e): e is Extract<DomainEvent, { type: "llm_metrics" }> => e.type === "llm_metrics",
@@ -264,7 +271,7 @@ describe("runTurn — wrap-up v1 parity（review fix：fallback 文本、metrics
     const mock = startMock(exhaustingTurns());
     const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
     await collect(
-      runTurn({ settings, tools: [calculatorTool] }, { sessionId: "s1", history: [], userText: "查" }),
+      runTurn({ settings, tools: [calculatorTool], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "查" }),
     );
     const loopBody = mock.requests[0]?.body as { max_tokens?: number };
     const wrapBody = mock.requests[8]?.body as { max_tokens?: number };

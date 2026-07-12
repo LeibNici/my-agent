@@ -33,6 +33,11 @@ export type DbClient = {
   getUserRepos(userId: number): Promise<RepoRow[]>;
   getRepo(repoId: number): Promise<RepoRow | null>;
   getRepoAdmin(repoId: number): Promise<FullRepoRow | null>;
+  // Task 8: full-row (local_path-carrying) bulk accessors for the chat
+  // route's ToolContext resolution — server-internal only, never wired to
+  // a client-facing route (see storage.ts's listReposFull comment).
+  listReposFull(): Promise<FullRepoRow[]>;
+  listReposForUserFull(userId: number): Promise<FullRepoRow[]>;
   createRepo(fields: CreateRepoFields): Promise<number>;
   updateRepo(repoId: number, fields: UpdateRepoFields): Promise<void>;
   deleteRepo(repoId: number): Promise<void>;
@@ -156,6 +161,8 @@ export function createDbClient(dbPath: string): DbClient {
     getUserRepos: (userId) => call<RepoRow[]>("getUserRepos", [userId]),
     getRepo: (repoId) => call<RepoRow | null>("getRepo", [repoId]),
     getRepoAdmin: (repoId) => call<FullRepoRow | null>("getRepoAdmin", [repoId]),
+    listReposFull: () => call<FullRepoRow[]>("listReposFull", []),
+    listReposForUserFull: (userId) => call<FullRepoRow[]>("listReposForUserFull", [userId]),
     createRepo: (fields) => call<number>("createRepo", [fields]),
     updateRepo: (repoId, fields) => call<void>("updateRepo", [repoId, fields]),
     deleteRepo: (repoId) => call<void>("deleteRepo", [repoId]),

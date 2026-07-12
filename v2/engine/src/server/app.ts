@@ -22,7 +22,15 @@ import type { Settings } from "../config.js";
 import type { RunTurnFn } from "../engine/turn.js";
 import { createToken, decodeToken, verifyPassword, AuthError } from "../auth.js";
 import { listTools } from "../tools/registry.js";
-import "../tools/calculator.js"; // side-effecting registration — this phase's one real tool
+// Side-effecting registrations (Task 8 closes Phase 4a): each of these
+// files calls registerTool() at import time — calculator (Phase 3's one
+// tool) plus the repo-scoped file/code/symbol tools Phase 4a adds
+// (file_reader, code_search + list_directory, find_symbol +
+// list_file_symbols). Six tools total; chat requests now reach real repos.
+import "../tools/calculator.js";
+import "../tools/file-reader.js";
+import "../tools/code-search.js";
+import "../tools/symbol-index.js";
 import { chatEventStream, userOwnsSession, type ChatRequestBody, type CurrentUser } from "./sse.js";
 import { mountAdminRoutes, type SyncAndPersistFn } from "./admin-routes.js";
 
@@ -61,9 +69,9 @@ const MAX_IMAGE_BASE64_CHARS = 6_000_000;
 
 export function buildApp(deps: BuildAppDeps): Hono<Env> {
   const app = new Hono<Env>();
-  // Registered once at app-build time, not per-request — Phase 3's tool
-  // face is calculator-only (Task 3); Phase 4 grows this via the same
-  // side-effecting-import + listTools() pattern.
+  // Registered once at app-build time, not per-request — Phase 3 shipped
+  // calculator-only (Task 3); Phase 4a grows this to six tools via the
+  // same side-effecting-import + listTools() pattern (imports above).
   const tools = listTools();
 
   app.use(

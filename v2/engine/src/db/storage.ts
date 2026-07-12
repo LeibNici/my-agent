@@ -137,6 +137,8 @@ export type Storage = {
   getUserRepos(userId: number): RepoRow[];
   getRepo(repoId: number): RepoRow | null;
   getRepoAdmin(repoId: number): FullRepoRow | null;
+  listReposFull(): FullRepoRow[];
+  listReposForUserFull(userId: number): FullRepoRow[];
   createRepo(fields: CreateRepoFields): number;
   updateRepo(repoId: number, fields: UpdateRepoFields): void;
   deleteRepo(repoId: number): void;
@@ -506,6 +508,40 @@ export function openStorage(dbPath: string): Storage {
         .prepare("SELECT * FROM repositories WHERE id = ?")
         .get(repoId) as Omit<FullRepoRow, "access_level"> | undefined;
       return row ? { ...row, access_level: null } : null;
+    },
+
+    // Task 8: the chat route's ToolContext resolution needs local_path
+    // (which RepoRow's `_public_repo`-equivalent column set never
+    // includes — see RepoRow's own comment) to build allowedRepoPaths.
+    // v1 didn't need this distinction: its list_repos()/get_user_repos()
+    // DB functions always returned the full sqlite row (local_path
+    // included), and masking only happened at the `/api/repos` ROUTE via
+    // `_public_repo()`. v2 baked the masking into listRepos/listReposForUser
+    // itself instead, which is safer by construction for that endpoint but
+    // left no full-row bulk accessor for a server-internal caller like
+    // resolveToolContext (src/server/sse.ts) that legitimately needs
+    // local_path and must never let it leak to the browser. These two
+    // mirror listRepos/listReposForUser's admin-bypass shape exactly, just
+    // with the full column set (like getRepoAdmin) — for internal callers
+    // only, never wired to a client-facing route.
+    listReposFull(): FullRepoRow[] {
+      const rows = db
+        .prepare("SELECT * FROM repositories ORDER BY name")
+        .all() as Array<Omit<FullRepoRow, "access_level">>;
+      return rows.map((r) => ({ ...r, access_level: null }));
+    },
+
+    listReposForUserFull(userId: number): FullRepoRow[] {
+      const rows = db
+        .prepare(
+          `SELECT r.*, p.access_level
+           FROM repositories r
+           JOIN permissions p ON r.id = p.repo_id
+           WHERE p.user_id = ?
+           ORDER BY r.name`
+        )
+        .all(userId);
+      return rows as FullRepoRow[];
     },
 
     // v1's create_repo — local_path intentionally omitted from the writable

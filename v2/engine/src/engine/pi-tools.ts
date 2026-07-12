@@ -25,8 +25,9 @@ const label = (name: string): string => name.charAt(0).toUpperCase() + name.slic
 
 /**
  * Maps registered ToolDef[] to pi AgentTool[], binding every tool's
- * execute() to the same per-turn `ctx` (a placeholder object for now —
- * repo-scoped access arrives in Phase 4).
+ * execute() to the same per-turn `ctx` — the real per-turn value resolved
+ * by sse.ts's resolveToolContext (Task 8) and threaded in via
+ * RunTurnDeps.ctx, not a placeholder.
  *
  * Errors thrown by a tool's own execute() are caught HERE and turned into
  * a normal (non-throwing) text result — this is the registry-level

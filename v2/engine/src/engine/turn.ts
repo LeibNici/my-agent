@@ -32,7 +32,7 @@ import {
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import type { Settings } from "../config.js";
 import type { DbClient } from "../db/client.js";
-import type { ToolDef } from "../tools/registry.js";
+import type { ToolDef, ToolContext } from "../tools/registry.js";
 import { toPiTools } from "./pi-tools.js";
 import { createEventAdapter } from "../event-adapter.js";
 import { legacyListToDomain } from "../codec-legacy.js";
@@ -277,7 +277,12 @@ async function runWrapup(
 
 // ==================== runTurn ====================
 
-export type RunTurnDeps = { db?: DbClient; settings: Settings; tools: ToolDef[] };
+// ctx is per-turn (Task 8): sse.ts's resolveToolContext resolves it fresh
+// from the current user's repo permissions before every runTurn call —
+// required, not optional, so a call site can't silently fall back to
+// Task 2/3's placeholder empty-access default and grant a tool nothing to
+// read without anyone noticing at the type level.
+export type RunTurnDeps = { db?: DbClient; settings: Settings; tools: ToolDef[]; ctx: ToolContext };
 // history carries legacy JSON message dicts (DB row shape) — see
 // codec-legacy.ts's legacyListToDomain, which is the validating boundary
 // that turns this `unknown[]` into typed DomainMessage[].
@@ -290,7 +295,7 @@ export type RunTurnRequest = { sessionId: string; history: unknown[]; userText: 
 export type RunTurnFn = (deps: RunTurnDeps, req: RunTurnRequest) => AsyncGenerator<DomainEvent>;
 
 export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGenerator<DomainEvent> {
-  const { settings, tools } = deps;
+  const { settings, tools, ctx } = deps;
   const setup = buildModelSetup(settings);
   const adapter = createEventAdapter({ model: settings.model });
 
@@ -311,11 +316,7 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
     initialState: {
       systemPrompt: settings.systemPrompt,
       model: setup.model,
-      tools: toPiTools(tools, {
-        allowedRepoPaths: [],
-        unsyncedRepoNames: [],
-        userId: null,
-      }),
+      tools: toPiTools(tools, ctx),
       messages: initialMessages,
     },
     streamFn: setup.streamFn,
