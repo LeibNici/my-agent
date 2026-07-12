@@ -5,7 +5,50 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { embPath, writeEmbeddingIndex, readEmbeddingIndex } from "../src/tools/embed-store.js";
+import {
+  embPath,
+  writeEmbeddingIndex,
+  readEmbeddingIndex,
+  MAGIC,
+  VERSION,
+  HEADER_LEN,
+  VECTORS_START,
+} from "../src/tools/embed-store.js";
+
+/**
+ * Build a raw .emb.v1.bin buffer directly from the documented layout
+ * (see embed-store.ts's header comment), bypassing writeEmbeddingIndex's
+ * own validation so tests can construct headers that are structurally
+ * valid but carry a semantically-corrupt meta section.
+ */
+function buildRawIndexBuffer(opts: {
+  dims: number;
+  count: number;
+  vectors: number[][];
+  metaJson: string;
+}): Buffer {
+  const { dims, count, vectors, metaJson } = opts;
+  if (MAGIC.byteLength + HEADER_LEN !== VECTORS_START) {
+    throw new Error("layout constants inconsistent — embed-store.ts changed?");
+  }
+  const headerBuf = Buffer.alloc(HEADER_LEN);
+  headerBuf.writeUInt32LE(VERSION, 0);
+  headerBuf.writeUInt32LE(dims, 4);
+  headerBuf.writeUInt32LE(count, 8);
+
+  const vectorBuf = Buffer.alloc(count * dims * 4);
+  for (let i = 0; i < count; i++) {
+    for (let j = 0; j < dims; j++) {
+      vectorBuf.writeFloatLE(vectors[i][j], (i * dims + j) * 4);
+    }
+  }
+
+  const metaBuf = Buffer.from(metaJson, "utf8");
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32LE(metaBuf.byteLength, 0);
+
+  return Buffer.concat([MAGIC, headerBuf, vectorBuf, lenBuf, metaBuf]);
+}
 
 describe("embed-store", () => {
   it("embPath = realpath(repoPath) + .emb.v1.bin，sidecar 在仓库目录外", () => {
@@ -55,6 +98,90 @@ describe("embed-store", () => {
   it("magic/version 不匹配 -> null", () => {
     const dir = mkdtempSync(join(tmpdir(), "emb-"));
     writeFileSync(embPath(dir), Buffer.from("garbage not a valid index"));
+    expect(readEmbeddingIndex(dir)).toBeNull();
+    rmSync(dir + ".emb.v1.bin");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // --- self-review findings: write-time invariants, read-time meta validation ---
+
+  it("vectors.length !== meta.length -> writeEmbeddingIndex 抛错（vectors 比 meta 多）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "emb-"));
+    const vectors = [new Float32Array([1, 2]), new Float32Array([3, 4])];
+    const meta = [{ path: "a.ts", start: 1, end: 2, name: "foo", hash: "h1" }];
+    expect(() => writeEmbeddingIndex(dir, { dims: 2, vectors, meta })).toThrow(
+      /vectors\.length \(2\) must equal meta\.length \(1\)/,
+    );
+    expect(existsSync(dir + ".emb.v1.bin")).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("vectors.length !== meta.length -> writeEmbeddingIndex 抛错（meta 比 vectors 多）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "emb-"));
+    const vectors = [new Float32Array([1, 2])];
+    const meta = [
+      { path: "a.ts", start: 1, end: 2, name: "foo", hash: "h1" },
+      { path: "b.ts", start: 3, end: 4, name: "bar", hash: "h2" },
+    ];
+    expect(() => writeEmbeddingIndex(dir, { dims: 2, vectors, meta })).toThrow(
+      /vectors\.length \(1\) must equal meta\.length \(2\)/,
+    );
+    expect(existsSync(dir + ".emb.v1.bin")).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("某个向量长度 !== dims（过短）-> writeEmbeddingIndex 抛错，错误信息指出具体是哪个下标", () => {
+    const dir = mkdtempSync(join(tmpdir(), "emb-"));
+    const vectors = [new Float32Array([1, 2, 3]), new Float32Array([1, 2])]; // index 1 too short for dims=3
+    const meta = [
+      { path: "a.ts", start: 1, end: 2, name: "foo", hash: "h1" },
+      { path: "b.ts", start: 3, end: 4, name: "bar", hash: "h2" },
+    ];
+    expect(() => writeEmbeddingIndex(dir, { dims: 3, vectors, meta })).toThrow(
+      /vectors\[1\]\.length \(2\) must equal dims \(3\)/,
+    );
+    expect(existsSync(dir + ".emb.v1.bin")).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("某个向量长度 !== dims（过长）-> writeEmbeddingIndex 抛错，错误信息指出具体是哪个下标", () => {
+    const dir = mkdtempSync(join(tmpdir(), "emb-"));
+    const vectors = [new Float32Array([1, 2]), new Float32Array([1, 2, 3, 4])]; // index 1 too long for dims=2
+    const meta = [
+      { path: "a.ts", start: 1, end: 2, name: "foo", hash: "h1" },
+      { path: "b.ts", start: 3, end: 4, name: "bar", hash: "h2" },
+    ];
+    expect(() => writeEmbeddingIndex(dir, { dims: 2, vectors, meta })).toThrow(
+      /vectors\[1\]\.length \(4\) must equal dims \(2\)/,
+    );
+    expect(existsSync(dir + ".emb.v1.bin")).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("header 正确但 meta JSON 元素缺少必需字段 -> readEmbeddingIndex 返回 null（不抛）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "emb-"));
+    const buf = buildRawIndexBuffer({
+      dims: 2,
+      count: 1,
+      vectors: [[1, 2]],
+      // missing "hash" field entirely
+      metaJson: JSON.stringify([{ path: "a.ts", start: 1, end: 2, name: "foo" }]),
+    });
+    writeFileSync(embPath(dir), buf);
+    expect(readEmbeddingIndex(dir)).toBeNull();
+    rmSync(dir + ".emb.v1.bin");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("header 正确、count 匹配，但 meta 不是数组（如 {}）-> readEmbeddingIndex 返回 null（不抛）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "emb-"));
+    const buf = buildRawIndexBuffer({
+      dims: 2,
+      count: 1,
+      vectors: [[1, 2]],
+      metaJson: JSON.stringify({}),
+    });
+    writeFileSync(embPath(dir), buf);
     expect(readEmbeddingIndex(dir)).toBeNull();
     rmSync(dir + ".emb.v1.bin");
     rmSync(dir, { recursive: true, force: true });

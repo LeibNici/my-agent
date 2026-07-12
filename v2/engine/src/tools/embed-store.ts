@@ -34,10 +34,12 @@ export type EmbeddingIndex = {
   meta: EmbeddingChunkMeta[];
 };
 
-const MAGIC = Buffer.from("CAXEMB1\0", "ascii"); // 8 bytes, includes trailing NUL
-const VERSION = 1;
-const HEADER_LEN = 12; // version + dims + count, all uint32 LE
-const VECTORS_START = MAGIC.byteLength + HEADER_LEN; // 20
+// Exported (not just internal consts) so tests can construct/inspect raw
+// buffers using the same layout math instead of duplicating magic numbers.
+export const MAGIC = Buffer.from("CAXEMB1\0", "ascii"); // 8 bytes, includes trailing NUL
+export const VERSION = 1;
+export const HEADER_LEN = 12; // version + dims + count, all uint32 LE
+export const VECTORS_START = MAGIC.byteLength + HEADER_LEN; // 20
 
 /**
  * Sidecar path for a repo checkout: realpath(repoPath) + ".emb.v1.bin" —
@@ -59,6 +61,19 @@ export function embPath(repoPath: string): string {
 export function writeEmbeddingIndex(repoPath: string, index: EmbeddingIndex): void {
   const { dims, vectors, meta } = index;
   const count = vectors.length;
+
+  if (vectors.length !== meta.length) {
+    throw new Error(
+      `vectors.length (${vectors.length}) must equal meta.length (${meta.length})`,
+    );
+  }
+  for (let i = 0; i < vectors.length; i++) {
+    if (vectors[i].length !== dims) {
+      throw new Error(
+        `vectors[${i}].length (${vectors[i].length}) must equal dims (${dims})`,
+      );
+    }
+  }
 
   const headerBuf = Buffer.alloc(HEADER_LEN);
   headerBuf.writeUInt32LE(VERSION, 0);
@@ -126,9 +141,26 @@ export function readEmbeddingIndex(repoPath: string): EmbeddingIndex | null {
       vectors.push(vec);
     }
 
-    const meta = JSON.parse(
+    const parsed: unknown = JSON.parse(
       buf.subarray(metaStart, metaStart + metaLen).toString("utf8"),
-    ) as EmbeddingChunkMeta[];
+    );
+    if (!Array.isArray(parsed) || parsed.length !== count) {
+      throw new Error("meta JSON is not an array of length count");
+    }
+    for (const entry of parsed) {
+      if (
+        typeof entry !== "object" ||
+        entry === null ||
+        typeof (entry as Record<string, unknown>).path !== "string" ||
+        typeof (entry as Record<string, unknown>).start !== "number" ||
+        typeof (entry as Record<string, unknown>).end !== "number" ||
+        typeof (entry as Record<string, unknown>).name !== "string" ||
+        typeof (entry as Record<string, unknown>).hash !== "string"
+      ) {
+        throw new Error("meta entry missing required EmbeddingChunkMeta fields");
+      }
+    }
+    const meta = parsed as EmbeddingChunkMeta[];
 
     return { dims, vectors, meta };
   } catch {
