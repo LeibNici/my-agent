@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { makeSeededDb } from "./db-fixture.js";
 import { createDbClient, type DbClient } from "../src/db/client.js";
 import * as symbolIndex from "../src/tools/symbol-index.js";
+import { loadSettings, type Settings } from "../src/config.js";
+import { readEmbeddingIndex } from "../src/tools/embed-store.js";
 import {
   maskUrlCredentials,
   getRepoLocalPath,
@@ -15,13 +17,21 @@ import {
   syncAndPersist,
   syncAllRepos,
   periodicSyncLoop,
+  configureIndexing,
   __internal,
 } from "../src/repo-sync.js";
 
 // buildIndex 的默认调度这批测试要精确控制它的开始/结束时机（人为延迟 + 记录
 // 时间窗），来证明它有没有真的重新排进 per-repo 锁——不 mock 就没法可靠地
-// 制造"buildIndex 还没跑完，第二次 sync 已经想动手"这个窗口。
-vi.mock("../src/tools/symbol-index.js", () => ({ buildIndex: vi.fn() }));
+// 制造"buildIndex 还没跑完，第二次 sync 已经想动手"这个窗口。只替换
+// buildIndex（importOriginal 保留真实 loadTags）——Phase 4b Task 5 的
+// defaultOnSyncSuccess 在 buildIndex 成功后会调 collectChunks，后者从这同一
+// 个模块 import 真实的 loadTags；整体替换成 `{ buildIndex: vi.fn() }` 会让
+// loadTags 在这个模块里变成 undefined，collectChunks 一调用就抛错。
+vi.mock("../src/tools/symbol-index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/tools/symbol-index.js")>();
+  return { ...actual, buildIndex: vi.fn() };
+});
 const mockedBuildIndex = vi.mocked(symbolIndex.buildIndex);
 
 // __internal.*Unvalidated 绕开 validateUrl，只用于让"clone/sync/persist 机制
@@ -57,6 +67,70 @@ function commitFile(dir: string, name: string, content: string): void {
   const run = (args: string[]) => execFileSync("git", args, { cwd: dir });
   run(["add", "-A"]);
   run(["commit", "-m", `add ${name}`]);
+}
+
+// Phase 4b Task 5 fixtures below —— chunking.ts's collectChunks gates ALL
+// chunk collection (including the ctags-independent XML window chunker) on
+// loadTags(repoPath) returning non-null (see chunking.ts's collectChunks:
+// `if (tags === null) return [];`), so these tests need a real-looking
+// ctags sidecar on disk even though buildIndex itself is mocked away above.
+// A mapper XML file (rather than a ctags-parseable source file) sidesteps
+// needing the real ctags binary to recognize a language in this sandbox —
+// chunkXmlWindows only cares about the "resources"+"mapper" path
+// convention, not ctags output.
+function addMapperXmlFile(originDir: string): void {
+  const dir = join(originDir, "resources", "mapper");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "Foo.xml"), "<mapper>\n".repeat(5));
+  const run = (args: string[]) => execFileSync("git", args, { cwd: originDir });
+  run(["add", "-A"]);
+  run(["commit", "-m", "add mapper xml"]);
+}
+
+/** buildIndex mock impl that plants an empty-but-valid ctags sidecar (real
+ * loadTags sees "ran, found zero symbols" — not "never ran") and reports
+ * success, without needing the real ctags binary. */
+function mockBuildIndexSuccess(): void {
+  mockedBuildIndex.mockImplementation(async (repoPath: string) => {
+    writeFileSync(symbolIndex.indexPath(repoPath), "");
+    return true;
+  });
+}
+
+function makeEmbeddingSettings(overrides: Record<string, string | undefined> = {}): Settings {
+  return loadSettings({
+    ANTHROPIC_API_KEY: "llm-key",
+    ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    APP_EMBEDDING_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    APP_EMBEDDING_API_KEY: "test-embed-key",
+    APP_EMBEDDING_MODEL: "text-embedding-v4",
+    APP_EMBEDDING_DIMENSIONS: "4",
+    ...overrides,
+  });
+}
+
+/** Fetch mock for the embedding endpoint: 200 + one fixed-dims vector per
+ * requested input, after an optional artificial delay (to prove the embed
+ * phase doesn't block a concurrent sync — see the "不持有仓库锁" test). */
+function makeEmbeddingFetchMock(dims: number, delayMs = 0) {
+  return vi.fn(async (_url: string, init: { body: string }) => {
+    if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    const body = JSON.parse(init.body) as { input: string[] };
+    const data = body.input.map((_text, index) => ({
+      index,
+      embedding: Array.from({ length: dims }, (_v, i) => (index + i + 1) / 10),
+    }));
+    return { status: 200, json: async () => ({ data }) } as unknown as Response;
+  });
+}
+
+async function waitFor(check: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    if (check()) return;
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }
 
 describe("maskUrlCredentials", () => {
@@ -493,6 +567,118 @@ describe("默认 onSyncSuccess —— buildIndex 重新排队到 per-repo 锁", 
     expect(buildIndexWindow.end).toBeGreaterThan(0);
     expect(secondSyncDoneAt - secondSyncCalledAt).toBeGreaterThanOrEqual(BUILD_INDEX_DELAY_MS);
     expect(buildIndexWindow.end).toBeLessThanOrEqual(secondSyncDoneAt);
+  });
+});
+
+describe("两阶段索引构建 —— chunk 收集 + embedding（Phase 4b Task 5）", () => {
+  let reposDir: string, originDir: string, dbDir: string, dbPath: string, client: DbClient;
+  let repoId: number;
+
+  beforeEach(async () => {
+    reposDir = mkdtempSync(join(tmpdir(), "repo-sync-repos-"));
+    originDir = mkdtempSync(join(tmpdir(), "repo-sync-origin-"));
+    initOriginRepo(originDir);
+    addMapperXmlFile(originDir); // 给 collectChunks 一份保证非空的 chunk 来源
+    const seeded = makeSeededDb();
+    dbDir = seeded.dir;
+    dbPath = seeded.dbPath;
+    client = createDbClient(dbPath);
+    repoId = await client.createRepo({ name: "r1", url: originDir });
+    mockedBuildIndex.mockReset();
+    mockBuildIndexSuccess();
+  });
+
+  afterEach(async () => {
+    await client.close();
+    rmSync(reposDir, { recursive: true, force: true });
+    rmSync(originDir, { recursive: true, force: true });
+    rmSync(dbDir, { recursive: true, force: true });
+    mockedBuildIndex.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  // 必须是这个新 describe 块里第一条调用 configureIndexing 之前跑的测试——
+  // configureIndexing 写的是模块级单例状态，在同一个测试文件里没有测试专用
+  // 的重置入口（本任务的 brief 也没有要求一个），所以"从未配置"这个前提只有
+  // 在文件里任何一次 configureIndexing 调用发生之前才成立。下面两条测试都会
+  // 调 configureIndexing，因此这条必须排在它们前面。
+  it("未调用 configureIndexing 时，defaultOnSyncSuccess 只建 ctags 索引、不尝试 embed，也不报错", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+    });
+    expect(result.ok).toBe(true);
+
+    const localPath = getRepoLocalPath(reposDir, repoId);
+    // ctags 阶段确实跑了（mockBuildIndexSuccess 落的 sidecar 文件出现），
+    // 证明"跳过 embed"不是因为整个两阶段构建都没触发。
+    await waitFor(() => existsSync(symbolIndex.indexPath(localPath)));
+
+    // 给 fire-and-forget 的构建流程一点时间——如果它错误地尝试了 embed，
+    // fetch 会在这个窗口内被调用；没配置时它永远不应该被调用。
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readEmbeddingIndex(localPath)).toBeNull();
+  });
+
+  it("调用 configureIndexing 后，一次真实 sync 成功后能读到 .emb.v1.bin（mock fetch 提供 embedding 响应）", async () => {
+    const dims = 4;
+    configureIndexing(makeEmbeddingSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) }));
+    const fetchMock = makeEmbeddingFetchMock(dims);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+    });
+    expect(result.ok).toBe(true);
+
+    const localPath = getRepoLocalPath(reposDir, repoId);
+    await waitFor(() => readEmbeddingIndex(localPath) !== null);
+
+    expect(fetchMock).toHaveBeenCalled();
+    const index = readEmbeddingIndex(localPath)!;
+    expect(index.dims).toBe(dims);
+    expect(index.meta.length).toBeGreaterThan(0);
+    expect(index.meta.some((m) => m.path.endsWith("Foo.xml"))).toBe(true);
+  });
+
+  it("embed 阶段不持有仓库锁——紧随其后的第二次 sync 不必等它跑完", async () => {
+    const dims = 4;
+    const EMBED_DELAY_MS = 200;
+    configureIndexing(makeEmbeddingSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) }));
+    const fetchMock = makeEmbeddingFetchMock(dims, EMBED_DELAY_MS);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const r1 = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+    });
+    expect(r1.ok).toBe(true);
+
+    // 紧接着发起第二次 sync（普通 pull，仓库已经 clone 过）。ctags+chunk
+    // 收集阶段仍然在锁内、很快；embedding 阶段（EMBED_DELAY_MS 之后才会
+    // resolve 的 mock fetch）在锁外——第二次 sync 的 git 操作不应该被它拖慢。
+    const secondStart = Date.now();
+    const r2 = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+    });
+    const secondDuration = Date.now() - secondStart;
+
+    expect(r2.ok).toBe(true);
+    expect(secondDuration).toBeLessThan(EMBED_DELAY_MS);
+
+    // 确认 embed 阶段确实在后台跑完了（不是被完全跳过）——只是没有拖住 r2。
+    const localPath = getRepoLocalPath(reposDir, repoId);
+    await waitFor(() => readEmbeddingIndex(localPath) !== null);
   });
 });
 

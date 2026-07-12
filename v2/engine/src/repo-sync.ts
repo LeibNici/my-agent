@@ -11,6 +11,9 @@ import type { DbClient } from "./db/client.js";
 import type { UpdateRepoFields } from "./db/storage.js";
 import { pyLocalIsoNow } from "./db/py-compat.js";
 import { buildIndex } from "./tools/symbol-index.js";
+import { collectChunks } from "./tools/chunking.js";
+import { embedAndSaveIndex } from "./tools/embedding-client.js";
+import type { Settings } from "./config.js";
 
 const GIT_TIMEOUT_MS = 120_000;
 
@@ -427,12 +430,26 @@ async function syncAndPersistImpl(
   });
 }
 
+// Phase 4b Task 5: settings injection point for the embedding phase of
+// defaultOnSyncSuccess below. repo-sync.ts's other functions never need
+// Settings (clone/pull don't touch LLM/embedding config) — importing the
+// config singleton directly here would blur that boundary, so main.ts calls
+// this once at startup instead, the same injection shape as syncAllRepos/
+// periodicSyncLoop's fetchRepos param. Never called (existing tests, or a
+// deployment with no embedding config) -> the embed phase is skipped, same
+// as "no embedding key configured", not an error.
+let indexingSettings: Settings | undefined;
+
+export function configureIndexing(settings: Settings): void {
+  indexingSettings = settings;
+}
+
 // Task 6 挂的默认 onSyncSuccess —— 模块级 import buildIndex（symbol-index.ts
 // 不反向依赖 repo-sync.ts，两者本就在同一 Node 进程里，不像 v1 要担心动态
 // import 的时机）。对 syncAndPersistImpl 而言仍是 fire-and-forget（这里自己
-// `void withRepoLock(...)`，不 await，syncAndPersistImpl 也不等它返回）——
+// `void runIndexBuild(...)`，不 await，syncAndPersistImpl 也不等它返回）——
 // 触发它的 create/update/手动 sync API 调用一旦 git 跑完就能返回，不用连带
-// 等 ctags 建完。
+// 等 ctags 建完，更不用等 Phase 4b 新增的 embedding 构建完。
 //
 // 但 fire-and-forget 不等于对锁一无所知：ctags 扫描要读整个 checkout，如果
 // admin 紧接着一次 force-reclone 把 checkout rmtree 掉，这次 buildIndex 就
@@ -444,7 +461,28 @@ async function syncAndPersistImpl(
 // sync 起就没释放过——中间有一个短暂的“未上锁”缝隙，和 v1 两个独立的
 // `async with` 块语义一致，不是一次连续加锁。
 function defaultOnSyncSuccess(repoId: number, localPath: string): void {
-  void withRepoLock(repoId, () => buildIndex(localPath));
+  void runIndexBuild(repoId, localPath);
+}
+
+// Phase 4b Task 5: chunk 收集（collectChunks）复用 buildIndex 刚建好的 ctags
+// sidecar，同样是纯文件 I/O、快——和 buildIndex 挤在同一次 withRepoLock 调用
+// 里（而不是各自单独 withRepoLock 再首尾相接）：两次分开排队之间有一条真实
+// 的缝隙——一次并发的第二次 sync 完全可能在 buildIndex 释放锁、collectChunks
+// 还没来得及重新排队之间抢到那个位置，插到两者中间，破坏"ctags 和分块看到
+// 同一个 checkout 快照"这条不变量。挤在一次调用里就没有这条缝隙。
+// embedAndSaveIndex 才是真正慢的一段（分钟级 HTTP 调用）——特意不放进
+// withRepoLock：一次冷启动的大仓库 embedding 构建如果攥着锁，会把这个仓库
+// 后续所有 sync（包括手动触发的、周期性的）全部堵在锁的队列后面，堵的时间
+// 是"整个 embedding 构建"而不是"一次 git pull"的量级。对照 v1
+// `_background_build_index` 把 `collect_index_chunks`（锁内）和
+// `embed_and_save_index`（锁外）分成两段的理由完全一致。
+async function runIndexBuild(repoId: number, localPath: string): Promise<void> {
+  const chunks = await withRepoLock(repoId, async () => {
+    const ok = await buildIndex(localPath);
+    return ok ? collectChunks(localPath) : [];
+  });
+  if (chunks.length === 0 || !indexingSettings) return;
+  await embedAndSaveIndex(localPath, chunks, indexingSettings);
 }
 
 export async function syncAndPersist(

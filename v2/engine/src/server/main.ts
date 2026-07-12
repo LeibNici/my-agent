@@ -28,7 +28,12 @@ import { createDbClient, type DbClient } from "../db/client.js";
 import type { FullRepoRow } from "../db/storage.js";
 import { ensureAdminUser } from "../auth.js";
 import { runTurn } from "../engine/turn.js";
-import { syncAllRepos, periodicSyncLoop, type RepoSyncDescriptor } from "../repo-sync.js";
+import {
+  syncAllRepos,
+  periodicSyncLoop,
+  configureIndexing,
+  type RepoSyncDescriptor,
+} from "../repo-sync.js";
 import { buildApp } from "./app.js";
 
 // listReposFull() returns the admin/internal full row shape (snake_case,
@@ -148,6 +153,12 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   initSchema(dbPath);
   const db = createDbClient(dbPath);
   await ensureAdminUser(db, settings);
+
+  // Phase 4b Task 5: repo-sync.ts's default onSyncSuccess needs Settings for
+  // its embedding-build phase but doesn't import the config singleton itself
+  // (see configureIndexing's doc comment) — must run before the startup sync
+  // below, which is the first thing that can trigger onSyncSuccess.
+  configureIndexing(settings);
 
   // Repo sync — v1's lifespan (app/main.py, ~line 124-138) awaits
   // sync_all_repos(repos) on startup BEFORE the app starts serving requests,

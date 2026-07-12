@@ -245,6 +245,47 @@ engine → 监听。SIGINT/SIGTERM 触发优雅关停（server close + db client
 （以及 admin/issue/feedback/code-viewer/repo-sync 页面的后端路由）都是
 Phase 4/5 的交付物；前端对应入口在此期间报 404 属预期。
 
+## Phase 4b：语义代码检索（embeddings）
+
+用业务中文描述检索只有英文标识符的代码（`semantic_search` 工具）。四层单向
+依赖：`embed-store.ts`（纯二进制读写）← `chunking.ts`（复用 ctags sidecar）
+← `embedding-client.ts`（HTTP 批量 + 增量哈希构建）← `semantic-search.ts`
+工具（查询 + 跨仓库余弦 top-k + 检索日志）。
+
+**二进制格式**（`.emb.v1.bin`，取代 v1 的 numpy 专有 `.emb.npz`——Node 没有
+装 numpy 格式解析器的理由，换成自定义的、版本号在 header 里的格式）：
+`magic(8B) + version(u32) + dims(u32) + count(u32) + count*dims*f32 向量
+（行主序，已归一化）+ metaJsonByteLength(u32) + UTF-8 JSON meta[]`。sidecar
+和 ctags 的 `.tags.json` 一样落在仓库目录**之外**（`embed-store.ts`
+`embPath` = `realpath(repoPath) + ".emb.v1.bin"`）。
+
+**凭证复用安全闸门**（`embedding-client.ts` `embeddingKeyOrFallback`）：只有
+显式配置了 `APP_EMBEDDING_API_KEY`，或 `APP_EMBEDDING_BASE_URL` 和
+`ANTHROPIC_BASE_URL` 的 host 相同时，才会复用 `ANTHROPIC_API_KEY`；host 不
+匹配则返回空字符串——语义检索停用，不会把 LLM 凭证连同代码块一起发给未知
+的第三方 embedding endpoint。
+
+**降级行为**（`semantic-search.ts`，三条独立的中文提示，都指向
+`code_search`/`find_symbol`，从不抛异常拖垮整个 turn）：未配置 key、一个
+仓库的索引都不存在、有索引但零命中——各自文案见该文件的
+`NO_KEY_MESSAGE`/`NO_INDEX_ANYWHERE_MESSAGE`/`zeroHitsMessage`。检索日志
+（`recordSemanticSearchLog`）是 best-effort：`ctx.db` 未提供时静默跳过，
+写库失败也不影响工具的返回值。
+
+**两阶段构建接入 repo-sync**：`repo-sync.ts` 的 `defaultOnSyncSuccess` 在
+ctags 建完后，同一次 `withRepoLock` 里紧接着跑 `collectChunks`（快、纯文件
+I/O，必须和 ctags 共享同一个锁定的 checkout 快照，中间不能有缝隙让并发的
+force-reclone 插进来）；`embedAndSaveIndex`（慢，分钟级 HTTP 调用）特意放在
+锁**外**——放进锁里会让一次冷启动的大仓库 embedding 构建堵住这个仓库后续
+所有 sync。`repo-sync.ts` 本身不 import `Settings`（clone/pull 不需要），
+所以由 `main.ts` 在 `startServer()` 里调一次 `configureIndexing(settings)`
+注入；未调用过的路径（例如未接线的测试）等同于没配置 key，两阶段构建的
+ctags/分块照常跑，只是永远不会触发 embedding 请求。
+
+**Phase 5 待办**：目前只有写入路径（`recordSemanticSearchLog`）；管理后台
+的语义检索仪表盘读接口（`get_semantic_search_stats`/
+`get_semantic_search_recent` 的等价物）留给 Phase 5。
+
 ## 测试
 
 ```bash

@@ -229,8 +229,8 @@ async function defaultOnSyncSuccess(repoId: number, localPath: string): Promise<
 
 `settings` 怎么进 `repo-sync.ts`：目前 `repo-sync.ts` 的函数都不接收 `Settings`（clone/pull 不需要）。本任务给 `defaultOnSyncSuccess` 的构造加一个可选的模块级 `configureIndexing(settings: Settings)` 初始化函数，`main.ts` 启动时调用一次（类似现有 `syncAllRepos`/`periodicSyncLoop` 的注入模式，避免 `repo-sync.ts` 直接 `import` config 单例）。未调用 `configureIndexing` 时（例如既有测试）`embedAndSaveIndex` 直接跳过（等同没配 key），不报错。
 
-- [ ] **Step 1: 写失败测试**（`configureIndexing` 未调用时，`defaultOnSyncSuccess` 只建 ctags 索引、不尝试 embed、不报错；调用后，一次真实 `syncAndPersist` 成功后能读到 `.emb.v1.bin`（mock fetch 提供 embedding 响应）；验证 embed 阶段确实在锁释放之后跑——用一个耗时的 mock fetch + 并发的第二次 sync 请求，断言第二次 sync 的 git 操作不必等 embed 完成，对照 Task 4a 已有的"clone/pull 与 index 构建不互相饿死"测试模式）
-- [ ] **Step 2: 跑测失败** → **Step 3: 实现** → **Step 4: 跑测通过 + typecheck**（405 现有 + 本 Phase 全部新增）→ **Step 5: README 补章节** → **Step 6: Commit**
+- [x] **Step 1: 写失败测试**（`configureIndexing` 未调用时，`defaultOnSyncSuccess` 只建 ctags 索引、不尝试 embed、不报错；调用后，一次真实 `syncAndPersist` 成功后能读到 `.emb.v1.bin`（mock fetch 提供 embedding 响应）；验证 embed 阶段确实在锁释放之后跑——用一个耗时的 mock fetch + 并发的第二次 sync 请求，断言第二次 sync 的 git 操作不必等 embed 完成，对照 Task 4a 已有的"clone/pull 与 index 构建不互相饿死"测试模式）
+- [x] **Step 2: 跑测失败** → **Step 3: 实现** → **Step 4: 跑测通过 + typecheck**（405 现有 + 本 Phase 全部新增）→ **Step 5: README 补章节** → **Step 6: Commit**
 
 ```bash
 git add v2/engine docs
