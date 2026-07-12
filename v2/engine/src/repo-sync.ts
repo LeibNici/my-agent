@@ -104,7 +104,12 @@ async function validateUrl(url: string): Promise<string | null> {
   }
   let host: string | null = null;
   try {
-    host = new URL(url).hostname || null;
+    // WHATWG URL 给 IPv6 字面量 host 保留方括号（"[::1]"），但 isIP()/dns.lookup()
+    // 都不认识带方括号的写法——isIP("[::1]") 返回 0（当成"不是字面 IP"），
+    // lookup("[::1]") 直接 ENOTFOUND。两者都不 throw 出"这是私网地址"，而是
+    // 分别走进"当成域名去 DNS 解析"和"解析失败→放行"这两条分支，SSRF 网关被
+    // 整个绕过。剥掉外层方括号，让 isIP/lookup 看到的是裸地址。
+    host = (new URL(url).hostname || null)?.replace(/^\[|\]$/g, "") ?? null;
   } catch {
     host = null;
   }

@@ -124,6 +124,15 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
     expect(mockedExecFile).not.toHaveBeenCalled();
   });
 
+  it("拒绝带方括号的 IPv6 字面量 host（[::1]/[fd00::1]/[fe80::1]），且从不调用 git", async () => {
+    for (const bracketed of ["[::1]", "[fd00::1]", "[fe80::1]"]) {
+      const result = await cloneRepo({ url: `http://${bracketed}/x`, repoId: 10, reposDir });
+      expect(result.ok).toBe(false);
+      expect(result.message).toMatch(/internal\/private host/);
+    }
+    expect(mockedExecFile).not.toHaveBeenCalled();
+  });
+
   it("拒绝 ftp:// 协议，且从不调用 git", async () => {
     const result = await cloneRepo({ url: "ftp://example.com/x", repoId: 4, reposDir });
     expect(result.ok).toBe(false);
@@ -346,28 +355,51 @@ describe("syncAndPersist", () => {
   });
 
   it("同一 repoId 的两个并发调用被序列化，而不是并发 rmtree 出竞态", async () => {
-    // 用一个人为延迟的 origin（clone 时间可观测）验证第二个调用等第一个完成。
-    // 用两次连续调用 + 顺序断言：第二次调用开始时，第一次一定已经完全落盘。
-    const order: string[] = [];
+    // 光凭 resolve 顺序（谁先 .then 到）证明不了真的序列化——两个调用即使
+    // 内部并发跑 git，也可能凑巧按发起顺序 resolve。这里用真实的人为延迟给
+    // 每一次 execFile 调用套一层：在真的跑 git 之前先等 DELAY_MS，同时记录
+    // 每次调用的起止时间戳。如果 withRepoLock 没有真的序列化（比如两个
+    // clone 并发抢同一个 tmpPath），两次 git 调用的时间窗口会重叠；如果真的
+    // 序列化了，后一次的开始时间必然不早于前一次的结束时间——DELAY_MS 远大于
+    // Date.now() 的毫秒级抖动，所以这个断言不会因为时钟精度而 flaky。
+    const DELAY_MS = 60;
+    const passthroughExecFile = mockedExecFile.getMockImplementation()!;
+    const invocations: { start: number; end: number }[] = [];
 
-    const first = syncAndPersistUnvalidated(client, { repoId, url: originDir, reposDir }).then(
-      (r) => {
-        order.push("first-done");
-        return r;
-      }
-    );
-    const second = syncAndPersistUnvalidated(client, { repoId, url: originDir, reposDir }).then(
-      (r) => {
-        order.push("second-done");
-        return r;
-      }
-    );
+    mockedExecFile.mockImplementation(((...args: unknown[]) => {
+      const start = Date.now();
+      const rec = { start, end: start };
+      invocations.push(rec);
+      const cb = args[args.length - 1] as (...cbArgs: unknown[]) => void;
+      const rest = args.slice(0, -1);
+      setTimeout(() => {
+        (passthroughExecFile as (...a: unknown[]) => void)(...rest, (...cbArgs: unknown[]) => {
+          rec.end = Date.now();
+          cb(...cbArgs);
+        });
+      }, DELAY_MS);
+    }) as typeof execFileCb);
 
-    const [r1, r2] = await Promise.all([first, second]);
+    let r1: { ok: boolean; message: string }, r2: { ok: boolean; message: string };
+    try {
+      [r1, r2] = await Promise.all([
+        syncAndPersistUnvalidated(client, { repoId, url: originDir, reposDir }),
+        syncAndPersistUnvalidated(client, { repoId, url: originDir, reposDir }),
+      ]);
+    } finally {
+      mockedExecFile.mockImplementation(passthroughExecFile as typeof execFileCb);
+    }
+
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(true);
-    // 序列化必然产生这个顺序（first 排在 second 前面进队列，且不会被打断）
-    expect(order).toEqual(["first-done", "second-done"]);
+
+    // 两次 syncAndPersist 各自至少跑一次 clone（还可能有一次 rev-parse）——
+    // 至少两次真实 git 调用发生过，且没有任何一次和另一次的时间窗口重叠。
+    expect(invocations.length).toBeGreaterThanOrEqual(2);
+    invocations.sort((a, b) => a.start - b.start);
+    for (let i = 1; i < invocations.length; i++) {
+      expect(invocations[i].start).toBeGreaterThanOrEqual(invocations[i - 1].end);
+    }
 
     const localPath = getRepoLocalPath(reposDir, repoId);
     expect(existsSync(join(localPath, ".git"))).toBe(true);
