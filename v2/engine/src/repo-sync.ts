@@ -10,6 +10,7 @@ import { lookup } from "node:dns/promises";
 import type { DbClient } from "./db/client.js";
 import type { UpdateRepoFields } from "./db/storage.js";
 import { pyLocalIsoNow } from "./db/py-compat.js";
+import { buildIndex } from "./tools/symbol-index.js";
 
 const GIT_TIMEOUT_MS = 120_000;
 
@@ -423,7 +424,15 @@ async function syncAndPersistImpl(
 export async function syncAndPersist(
   db: DbClient,
   opts: SyncAndPersistOptions,
-  onSyncSuccess?: (repoId: number, localPath: string) => void
+  // Task 6: 默认挂上 buildIndex —— 模块级 import（symbol-index.ts 不反向依赖
+  // repo-sync.ts，两者本就在同一 Node 进程里，不像 v1 要担心动态 import 的
+  // 时机），仍是 fire-and-forget（onSyncSuccess 自己 `void buildIndex(...)`，
+  // 不 await，syncAndPersistImpl 也不等它）。显式传入 onSyncSuccess（包括
+  // 显式传 undefined，见 syncAllRepos/periodicSyncLoop 的透传）会覆盖这个
+  // 默认值——调用方（比如测试）想绕开索引重建、换一个 mock 时依然可以。
+  onSyncSuccess: (repoId: number, localPath: string) => void = (_repoId, localPath) => {
+    void buildIndex(localPath);
+  }
 ): Promise<{ ok: boolean; message: string }> {
   return syncAndPersistImpl(db, opts, onSyncSuccess, syncRepo);
 }
