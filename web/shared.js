@@ -56,3 +56,130 @@ function initThemeToggle(container) {
     container.appendChild(btn);
     _updateThemeToggleButton(btn);
 }
+
+// ===== Modal dialogs =====
+// In-page replacement for native alert()/confirm()/prompt() — those render
+// as browser-chrome popups that break the app's own visual language (see
+// .modal-* in style.css). One shared overlay+card builder; confirmDialog/
+// promptDialog/alertDialog just vary its content and buttons. Each returns
+// a Promise so call sites `await` them the same way they'd have used the
+// synchronous native versions, just one keyword added.
+function _buildModal({ title, message, danger, input }) {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const card = document.createElement("div");
+    card.className = danger ? "modal-card modal-danger" : "modal-card";
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-modal", "true");
+    if (title) {
+        const t = document.createElement("div");
+        t.className = "modal-title";
+        t.textContent = title;
+        card.appendChild(t);
+    }
+    if (message) {
+        const m = document.createElement("div");
+        m.className = "modal-message";
+        m.textContent = message;
+        card.appendChild(m);
+    }
+    let inputEl = null;
+    if (input) {
+        inputEl = document.createElement("input");
+        inputEl.type = input.type || "text";
+        inputEl.className = "modal-input";
+        inputEl.placeholder = input.placeholder || "";
+        if (input.value) inputEl.value = input.value;
+        card.appendChild(inputEl);
+    }
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    card.appendChild(actions);
+    overlay.appendChild(card);
+    return { overlay, actions, inputEl };
+}
+
+// Wires the shared teardown (remove from DOM, drop the keydown listener,
+// unlock body scroll) behind a single `finish` call each dialog variant
+// builds its own resolve-value around.
+function _mountModal(overlay, resolve, resultForKey) {
+    document.body.classList.add("modal-open");
+    document.body.appendChild(overlay);
+    const onKeydown = (e) => {
+        if (e.key !== "Escape" && e.key !== "Enter") return;
+        finish(resultForKey(e));
+    };
+    function finish(result) {
+        document.removeEventListener("keydown", onKeydown);
+        overlay.remove();
+        document.body.classList.remove("modal-open");
+        resolve(result);
+    }
+    overlay.addEventListener("click", (e) => {
+        if (e.target === overlay) finish(resultForKey({ key: "Escape" }));
+    });
+    document.addEventListener("keydown", onKeydown);
+    return finish;
+}
+
+function confirmDialog({ title = "", message = "", confirmLabel = "确认", cancelLabel = "取消", danger = false } = {}) {
+    return new Promise((resolve) => {
+        const { overlay, actions } = _buildModal({ title, message, danger });
+        const cancelBtn = document.createElement("button");
+        cancelBtn.type = "button";
+        cancelBtn.className = "btn-cancel";
+        cancelBtn.textContent = cancelLabel;
+        const confirmBtn = document.createElement("button");
+        confirmBtn.type = "button";
+        confirmBtn.className = danger ? "btn-confirm btn-danger" : "btn-confirm";
+        confirmBtn.textContent = confirmLabel;
+        actions.appendChild(cancelBtn);
+        actions.appendChild(confirmBtn);
+
+        const finish = _mountModal(overlay, resolve, (e) => e.key === "Enter");
+        cancelBtn.onclick = () => finish(false);
+        confirmBtn.onclick = () => finish(true);
+        confirmBtn.focus();
+    });
+}
+
+function promptDialog({
+    title = "", message = "", placeholder = "", defaultValue = "", inputType = "text",
+    confirmLabel = "确认", cancelLabel = "取消",
+} = {}) {
+    return new Promise((resolve) => {
+        const { overlay, actions, inputEl } = _buildModal({
+            title, message, input: { type: inputType, placeholder, value: defaultValue },
+        });
+        const cancelBtn = document.createElement("button");
+        cancelBtn.type = "button";
+        cancelBtn.className = "btn-cancel";
+        cancelBtn.textContent = cancelLabel;
+        const confirmBtn = document.createElement("button");
+        confirmBtn.type = "button";
+        confirmBtn.className = "btn-confirm";
+        confirmBtn.textContent = confirmLabel;
+        actions.appendChild(cancelBtn);
+        actions.appendChild(confirmBtn);
+
+        const finish = _mountModal(overlay, resolve, (e) => (e.key === "Enter" ? inputEl.value : null));
+        cancelBtn.onclick = () => finish(null);
+        confirmBtn.onclick = () => finish(inputEl.value);
+        inputEl.focus();
+    });
+}
+
+function alertDialog({ title = "", message = "", confirmLabel = "知道了" } = {}) {
+    return new Promise((resolve) => {
+        const { overlay, actions } = _buildModal({ title, message });
+        const okBtn = document.createElement("button");
+        okBtn.type = "button";
+        okBtn.className = "btn-confirm";
+        okBtn.textContent = confirmLabel;
+        actions.appendChild(okBtn);
+
+        const finish = _mountModal(overlay, resolve, () => undefined);
+        okBtn.onclick = () => finish();
+        okBtn.focus();
+    });
+}

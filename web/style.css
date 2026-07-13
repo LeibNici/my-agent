@@ -1419,6 +1419,72 @@ body {
 
 .issue-status a:hover { text-decoration: underline; }
 
+/* ===== Modal dialogs — in-page replacement for native alert()/confirm()/
+   prompt(), which render as browser-chrome popups jarringly inconsistent
+   with the app's own visual language. Amber accent = pending decision
+   (same vocabulary as .issue-card); danger variant swaps to rust for
+   destructive confirmations (delete repo, revoke permission). ===== */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 300;
+    padding: 20px;
+}
+
+.modal-card {
+    width: min(420px, 100%);
+    background: var(--ink-900);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--amber);
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+
+.modal-card.modal-danger { border-left-color: var(--rust); }
+
+.modal-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--paper);
+    margin-bottom: 8px;
+}
+
+.modal-message {
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--mute);
+    white-space: pre-wrap;
+}
+
+.modal-input {
+    width: 100%;
+    margin-top: 12px;
+    padding: 9px 12px;
+    background: var(--ink-950);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--paper);
+    font-family: var(--font-body);
+    font-size: 14px;
+}
+.modal-input:focus { border-color: var(--moss); outline: none; }
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 18px;
+}
+
+.btn-danger { background: var(--rust); }
+
+body.modal-open { overflow: hidden; }
+
 /* ===== Responsive ===== */
 @media (max-width: 768px) {
     #sidebar {

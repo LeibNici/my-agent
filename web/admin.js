@@ -84,7 +84,7 @@ async function createUser() {
 }
 
 async function resetPwd(userId) {
-    const pwd = prompt("输入新密码:");
+    const pwd = await promptDialog({ title: "重置密码", message: "输入新密码:", inputType: "password" });
     if (!pwd) return;
     await fetch(`/api/admin/users/${userId}`, {
         method: "PATCH", headers: authHeaders(),
@@ -266,7 +266,11 @@ async function syncRepo(id, btn) {
 }
 
 async function deleteRepo(id) {
-    if (!confirm("确定删除此仓库？相关权限也会被移除。")) return;
+    const ok = await confirmDialog({
+        title: "删除仓库", message: "确定删除此仓库？相关权限也会被移除。",
+        confirmLabel: "删除", danger: true,
+    });
+    if (!ok) return;
     await fetch(`/api/admin/repos/${id}`, { method: "DELETE", headers: authHeaders() });
     showMsg("仓库已删除");
     loadRepos();
@@ -352,7 +356,10 @@ async function grantPerm() {
 }
 
 async function revokePerm(userId, repoId) {
-    if (!confirm("确定撤销此权限？")) return;
+    const ok = await confirmDialog({
+        title: "撤销权限", message: "确定撤销此权限？", confirmLabel: "撤销", danger: true,
+    });
+    if (!ok) return;
     await fetch(`/api/admin/permissions/${userId}/${repoId}`, { method: "DELETE", headers: authHeaders() });
     showMsg("权限已撤销");
     loadPerms();

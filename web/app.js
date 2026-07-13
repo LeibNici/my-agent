@@ -492,7 +492,7 @@ async function sendMessage() {
 
     // Validate message size
     if (text.length > 10000) {
-        alert("Message too long (max 10,000 characters)");
+        await alertDialog({ title: "消息过长", message: "消息不能超过 10,000 字符，请精简后重试。" });
         return;
     }
 
