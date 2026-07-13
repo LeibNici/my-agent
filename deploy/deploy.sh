@@ -32,15 +32,23 @@ if [ "$ok" != true ]; then
 fi
 echo "service is up"
 
-# Reclaim disk from THIS build only: dangling images are always safe to
-# drop (nothing references them, whether ours or another project's) and
-# builder prune only evicts unused cache layers — neither touches another
-# project's running containers or tagged images on this shared host. Not
-# a blanket `docker system prune -a`, which would also nuke other
-# projects' still-useful cache.
-echo "==> reclaiming build cache + dangling images"
+# Reclaim disk from old builds: dangling images are always safe to drop
+# (nothing references them, whether ours or another project's). Build
+# cache is time-filtered (keep the last 24h) rather than wiped entirely —
+# a full wipe was tried first and bit us: it also evicts the `npm ci`
+# layer that JUST got built, so the very next deploy is forced into a
+# fully cold rebuild of better-sqlite3's native module, which depends on
+# downloading a prebuilt binary over a flaky network path (this host is
+# behind a CN proxy for anything GitHub-adjacent) — that cold rebuild
+# failed outright once already (no Python for node-gyp's source-compile
+# fallback). Keeping a 24h window still bounds growth (nothing lives
+# forever) without punishing the immediately-next build. Neither this nor
+# image prune is a blanket `docker system prune -a`, which would also nuke
+# other projects' (natfrp/kkfileview/xinchuan-dev) still-useful cache on
+# this shared host.
+echo "==> reclaiming dangling images + build cache older than 24h"
 docker image prune -f
-docker builder prune -f
+docker builder prune -f --filter "until=24h"
 
 echo "==> disk after cleanup"
 docker system df
