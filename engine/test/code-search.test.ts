@@ -371,6 +371,15 @@ describe("validateRepoPath", () => {
       fs.rmSync(outside, { recursive: true, force: true });
     }
   });
+
+  it("allows a bare relative subdirectory name by joining it against the allowed root (QA-reported: used to only resolve against process cwd)", () => {
+    fs.mkdirSync(path.join(root, "deploy"));
+    fs.writeFileSync(path.join(root, "deploy", "auto-deploy.sh"), "#!/bin/sh\n");
+    const [ok, realPath, err] = validateRepoPath("deploy", [root]);
+    expect(ok).toBe(true);
+    expect(realPath).toBe(fs.realpathSync(path.join(root, "deploy")));
+    expect(err).toBe("");
+  });
 });
 
 describe("list_directory tool", () => {
@@ -401,6 +410,14 @@ describe("list_directory tool", () => {
     fs.writeFileSync(path.join(sub, "x.txt"), "hi");
     const result = await listDirectoryTool.execute({ path: sub }, makeCtx([root]));
     expect(result).toContain("📄 x.txt");
+  });
+
+  it("lists a bare relative subdirectory name, not just an absolute path (QA-reported: list_directory(\"deploy\") was always denied)", async () => {
+    const sub = path.join(root, "deploy");
+    fs.mkdirSync(sub);
+    fs.writeFileSync(path.join(sub, "auto-deploy.sh"), "#!/bin/sh\n");
+    const result = await listDirectoryTool.execute({ path: "deploy" }, makeCtx([root]));
+    expect(result).toContain("📄 auto-deploy.sh");
   });
 
   it("denies an explicit path outside allowed roots", async () => {

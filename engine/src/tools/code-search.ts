@@ -20,7 +20,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef } from "./registry.js";
 import type { ToolContext } from "./registry.js";
 import { getAllowedPaths, isWithinAllowedPaths, noAccessReason } from "./access.js";
-import { expandUser, realpathOrResolve, isDirSafe } from "./file-reader.js";
+import { expandUser, isDirSafe, resolvePath as resolveAgainstRoots } from "./file-reader.js";
 
 // ---------------------------------------------------------------------------
 // rg detection
@@ -49,9 +49,22 @@ const SEARCH_TIMEOUT_MS = 15_000;
 
 /** Returns [ok, realPath, err] — matching v1's `_validate_repo_path` tuple
  * return shape exactly (including returning realPath even when !ok, which
- * v1's callers never use, but is kept for fidelity/testability). */
+ * v1's callers never use, but is kept for fidelity/testability).
+ *
+ * QA-reported (2026-07-13): v1's original `os.path.realpath(os.path.
+ * expanduser(path))` — ported here verbatim as `realpathOrResolve(
+ * expandUser(inputPath))` — never joined a RELATIVE inputPath against any
+ * allowed repo root, so it resolved against the process's cwd instead
+ * (`/app/engine` in the container), which is essentially never inside an
+ * allowed repo path. `list_directory("deploy")` (or any other bare
+ * relative subdirectory name — not specific to "deploy") always got
+ * rejected as "outside your assigned repositories" even when that
+ * directory genuinely existed in an allowed repo. file-reader.ts's own
+ * `resolvePath` already solves this correctly (try each allowed root,
+ * first existing candidate wins, absolute paths pass through as-is) —
+ * reused here rather than re-implementing the same logic a second time. */
 function validateRepoPath(inputPath: string, allowedPaths: string[]): [boolean, string, string] {
-  const realPath = realpathOrResolve(expandUser(inputPath));
+  const realPath = resolveAgainstRoots(expandUser(inputPath), allowedPaths);
   if (isWithinAllowedPaths(realPath, allowedPaths)) {
     return [true, realPath, ""];
   }
