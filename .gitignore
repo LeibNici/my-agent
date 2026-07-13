@@ -6,3 +6,4 @@ venv/
 .env
 .jwt_secret
 .ccg/
+deploy/auto-deploy.log
