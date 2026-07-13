@@ -1361,12 +1361,23 @@ async function checkIssueDuplicates(card, repoId, title) {
         });
         if (!resp.ok) return;
         const { issues } = await resp.json();
-        if (!issues || !issues.length) return;
 
         const box = document.createElement("div");
         box.className = "issue-dupes";
         const head = document.createElement("div");
         head.className = "issue-dupes-head";
+
+        // FLOW-004 (QA follow-up): a zero-result check used to render
+        // nothing at all, leaving no way to tell "checked, found none"
+        // apart from "never ran" — make the checked-and-clear case explicit.
+        if (!issues || !issues.length) {
+            head.classList.add("none");
+            head.textContent = "未发现相似 issue";
+            box.appendChild(head);
+            card.insertBefore(box, card.querySelector(".issue-actions"));
+            return;
+        }
+
         head.textContent = `发现 ${issues.length} 个相似 issue，提交前请确认不是重复：`;
         box.appendChild(head);
         issues.slice(0, 5).forEach(i => {

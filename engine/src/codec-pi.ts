@@ -179,6 +179,38 @@ export function domainToPi(
   return out;
 }
 
+// Defensive cleanup (2026-07-13 QA follow-up, FLOW-002): DashScope's
+// Anthropic-compatible bridge for Qwen3.7-plus occasionally fails to
+// cleanly separate hidden reasoning from the visible answer — confirmed
+// against a real production sample where a bare `</thinking>` closing tag
+// (no matching opening tag) turned up 1057 characters into what pi-ai
+// reported as a "text" block, with everything before it being narration
+// ("Now I have enough information to write a comprehensive analysis...")
+// that should have stayed hidden thinking. This is an upstream DashScope/
+// pi-ai limitation, not something a request-side option can prevent — see
+// github.com/earendil-works/pi issues #2022 and #2770 (the latter's fix
+// isn't in our pinned pi-ai@0.80.6 yet, and it only covers the
+// openai-completions API path we don't use anyway). Stripping it here
+// rather than showing it to the user; this does not attempt to recover
+// anything from inside the leaked span, only to hide it.
+const PAIRED_THINKING_TAG_RE = /<thinking>[\s\S]*?<\/thinking>|<think>[\s\S]*?<\/think>/gi;
+const ORPHAN_THINKING_CLOSE_RE = /^[\s\S]*?<\/(?:thinking|think)>/i;
+const HAS_OPEN_THINKING_TAG_RE = /<(?:thinking|think)>/i;
+const HAS_CLOSE_THINKING_TAG_RE = /<\/(?:thinking|think)>/i;
+
+function stripLeakedThinkingTags(text: string): string {
+  // Properly paired tags anywhere in the text (either tag name): drop the
+  // whole opening-to-closing span, wherever it falls.
+  let cleaned = text.replace(PAIRED_THINKING_TAG_RE, "");
+  // What's actually been observed in production: a bare closing tag with
+  // no opening tag at all (the leading narration was never wrapped in
+  // anything) — drop everything from the start through that tag.
+  if (HAS_CLOSE_THINKING_TAG_RE.test(cleaned) && !HAS_OPEN_THINKING_TAG_RE.test(cleaned)) {
+    cleaned = cleaned.replace(ORPHAN_THINKING_CLOSE_RE, "");
+  }
+  return cleaned;
+}
+
 export function piAssistantToDomain(m: PiAssistantMessage): {
   message: DomainMessage;
   usage: { inputTokens: number; outputTokens: number };
@@ -187,7 +219,7 @@ export function piAssistantToDomain(m: PiAssistantMessage): {
   const content: DomainBlock[] = m.content.map((block): DomainBlock => {
     switch (block.type) {
       case "text":
-        return { type: "text", text: block.text };
+        return { type: "text", text: stripLeakedThinkingTags(block.text) };
       case "toolCall": {
         const toolUse: ToolUseBlock = {
           type: "tool_use",

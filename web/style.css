@@ -1703,6 +1703,11 @@ body {
     margin-bottom: 6px;
 }
 .issue-dupes-head::before { content: "⚠ "; }
+.issue-dupes-head.none {
+    color: var(--faint);
+    margin-bottom: 0;
+}
+.issue-dupes-head.none::before { content: "✓ "; }
 
 .issue-dupe {
     display: flex;

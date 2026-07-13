@@ -28,7 +28,12 @@ const DraftIssueParams = Type.Object({
 
 const DRAFT_ISSUE_DESCRIPTION =
   "Generate an issue draft with title, expected_behavior, body (markdown), and labels. This creates " +
-  "a preview for the user to confirm before submission. expected_behavior is a separate REQUIRED field, " +
+  "a preview for the user to confirm before submission. Call this tool directly using the investigation " +
+  "and conclusions you ALREADY established earlier in this conversation — do NOT call semantic_search/" +
+  "code_search/file_reader/list_directory again first just to re-confirm what you already found; only " +
+  "investigate further if the user's latest message raises something genuinely not yet covered. Redoing " +
+  "an investigation that already reached a clear conclusion just delays the draft for no benefit. " +
+  "expected_behavior is a separate REQUIRED field, " +
   "not a section inside body — the confirmation card renders it as its own highlighted block above the " +
   "rest so the user can catch a wrong assumption before submitting, instead of it being buried inside a " +
   "long technical body. State plainly what the correct/expected behavior should be; if you're inferring " +

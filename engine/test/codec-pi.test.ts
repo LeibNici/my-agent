@@ -125,4 +125,57 @@ describe("piAssistantToDomain", () => {
     expect(out.message).toEqual({ role: "assistant", content: [
       { type: "thinking", thinking: "", thinkingSignature: "opaque_redacted_blob", redacted: true } ] });
   });
+
+  // FLOW-002 (2026-07-13 QA follow-up): DashScope's Anthropic-compatible
+  // bridge for Qwen3.7-plus occasionally leaks residual thinking-tag text
+  // into what pi-ai reports as a "text" block instead of "thinking".
+  it("孤立的 </thinking> 闭合标签（无开标签，实测生产案例的真实形状）→ 标签及之前内容整体丢弃", () => {
+    const out = piAssistantToDomain({
+      role: "assistant", api: "anthropic-messages", provider: "dashscope", model: "qwen3.7-plus",
+      content: [{
+        type: "text",
+        text: "Now I have enough information to write a comprehensive analysis. I should cite specific files.</thinking>Based on my investigation, the URL normalization...",
+      }],
+      usage: { input: 3, output: 0 } as any, stopReason: "stop", timestamp: 1,
+    } as any);
+    expect(out.message).toEqual({ role: "assistant", content: [
+      { type: "text", text: "Based on my investigation, the URL normalization..." } ] });
+  });
+  it("配对的 <thinking>...</thinking> → 整段丢弃，标签外的文本保留", () => {
+    const out = piAssistantToDomain({
+      role: "assistant", api: "anthropic-messages", provider: "dashscope", model: "qwen3.7-plus",
+      content: [{
+        type: "text",
+        text: "前言。<thinking>这段是模型的内部推理，不应该出现</thinking>这才是真正的回答。",
+      }],
+      usage: { input: 3, output: 0 } as any, stopReason: "stop", timestamp: 1,
+    } as any);
+    expect(out.message).toEqual({ role: "assistant", content: [
+      { type: "text", text: "前言。这才是真正的回答。" } ] });
+  });
+  it("更短的 <think>/</think> 变体（Qwen 原生模板更常见的写法）→ 同样处理", () => {
+    const out = piAssistantToDomain({
+      role: "assistant", api: "anthropic-messages", provider: "dashscope", model: "qwen3.7-plus",
+      content: [{ type: "text", text: "internal draft notes</think>the real answer" }],
+      usage: { input: 3, output: 0 } as any, stopReason: "stop", timestamp: 1,
+    } as any);
+    expect(out.message).toEqual({ role: "assistant", content: [{ type: "text", text: "the real answer" }] });
+  });
+  it("大小写不敏感（</THINKING> / </Think>）", () => {
+    const out = piAssistantToDomain({
+      role: "assistant", api: "anthropic-messages", provider: "dashscope", model: "qwen3.7-plus",
+      content: [{ type: "text", text: "leaked reasoning</THINKING>the answer" }],
+      usage: { input: 3, output: 0 } as any, stopReason: "stop", timestamp: 1,
+    } as any);
+    expect(out.message).toEqual({ role: "assistant", content: [{ type: "text", text: "the answer" }] });
+  });
+  it("没有任何 thinking 标签的普通文本 → 原样不动（回归保护）", () => {
+    const out = piAssistantToDomain({
+      role: "assistant", api: "anthropic-messages", provider: "dashscope", model: "qwen3.7-plus",
+      content: [{ type: "text", text: "普通回答，完全没有任何标签，也提到了 thinking 这个词。" }],
+      usage: { input: 3, output: 0 } as any, stopReason: "stop", timestamp: 1,
+    } as any);
+    expect(out.message).toEqual({ role: "assistant", content: [
+      { type: "text", text: "普通回答，完全没有任何标签，也提到了 thinking 这个词。" } ] });
+  });
 });
