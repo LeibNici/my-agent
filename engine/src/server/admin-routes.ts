@@ -363,4 +363,18 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     await deps.db.revokePermission(userId, repoId);
     return c.json({ ok: true });
   });
+
+  // ==================== Webhook config ====================
+
+  // Paths only — the admin UI prepends location.origin so this never has to
+  // guess the public hostname behind whatever reverse proxy fronts this
+  // deployment (see webhook-routes.ts for the receivers themselves).
+  app.get("/api/admin/webhook-config", async (c) =>
+    c.json({
+      github_path: "/api/webhooks/github",
+      github_secret: deps.settings.githubWebhookSecret,
+      gitlab_path: "/api/webhooks/gitlab",
+      gitlab_secret: deps.settings.gitlabWebhookSecret,
+    })
+  );
 }

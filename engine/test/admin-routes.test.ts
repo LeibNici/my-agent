@@ -96,6 +96,7 @@ describe("admin-only guard", () => {
     ["POST", "/api/admin/repos"],
     ["GET", "/api/admin/permissions"],
     ["POST", "/api/admin/permissions"],
+    ["GET", "/api/admin/webhook-config"],
   ])("%s %s → 403 {detail} for an authenticated non-admin", async (method, path) => {
     const { token } = await seedUser("user");
     const app = buildTestApp();
@@ -562,5 +563,24 @@ describe("permissions", () => {
     expect(await resp.json()).toEqual({ ok: true });
     const list = await client.listPermissions();
     expect(list.find((p) => p.user_id === userId && p.repo_id === repoId)).toBeUndefined();
+  });
+});
+
+// ==================== Webhook config ====================
+
+describe("webhook config", () => {
+  it("GET returns the receiver paths and the configured secrets, not a guessed hostname", async () => {
+    settings.githubWebhookSecret = "gh-secret-abc";
+    settings.gitlabWebhookSecret = "gl-secret-xyz";
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/admin/webhook-config");
+    expect(resp.status).toBe(200);
+    expect(await resp.json()).toEqual({
+      github_path: "/api/webhooks/github",
+      github_secret: "gh-secret-abc",
+      gitlab_path: "/api/webhooks/gitlab",
+      gitlab_secret: "gl-secret-xyz",
+    });
   });
 });

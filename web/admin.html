@@ -144,6 +144,7 @@
             <button class="tab-btn" onclick="switchTab('repos', this)">仓库</button>
             <button class="tab-btn" onclick="switchTab('perms', this)">权限</button>
             <button class="tab-btn" onclick="switchTab('issues', this)">工单</button>
+            <button class="tab-btn" onclick="switchTab('webhook', this)">Webhook</button>
             <button class="tab-btn" onclick="switchTab('usage', this)">用量</button>
             <button class="tab-btn" onclick="switchTab('semantic', this)">语义检索</button>
         </div>
@@ -238,6 +239,48 @@
                         <thead><tr><th>提报时间</th><th>提报人</th><th>仓库</th><th>Issue</th><th>状态</th><th>Reopen</th><th>上次检查</th></tr></thead>
                         <tbody id="issues-tracking-table"></tbody>
                     </table>
+                </div>
+            </div>
+
+            <!-- Webhook Panel -->
+            <div id="panel-webhook" class="panel">
+                <div class="card">
+                    <h3>GitHub</h3>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:70px;color:var(--faint);font-size:12.5px;">URL</span>
+                        <input id="webhook-github-url" readonly style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
+                        <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="copyWebhookField('webhook-github-url')">复制</button>
+                    </div>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:70px;color:var(--faint);font-size:12.5px;">Secret</span>
+                        <input id="webhook-github-secret" readonly style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
+                        <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="copyWebhookField('webhook-github-secret')">复制</button>
+                    </div>
+                    <div style="font-size:12px;color:var(--faint);margin-top:4px;">
+                        填入 GitHub 仓库 Settings → Webhooks → Add webhook：Payload URL 用上面的 URL，
+                        Content type 选 <code>application/json</code>，Secret 用上面的值，
+                        勾选 Issues + Issue comments 事件。
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>GitLab</h3>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:70px;color:var(--faint);font-size:12.5px;">URL</span>
+                        <input id="webhook-gitlab-url" readonly style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
+                        <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="copyWebhookField('webhook-gitlab-url')">复制</button>
+                    </div>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:70px;color:var(--faint);font-size:12.5px;">Secret Token</span>
+                        <input id="webhook-gitlab-secret" readonly style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
+                        <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="copyWebhookField('webhook-gitlab-secret')">复制</button>
+                    </div>
+                    <div style="font-size:12px;color:var(--faint);margin-top:4px;">
+                        填入 GitLab 仓库 Settings → Webhooks：URL 用上面的 URL，Secret Token 用上面的值，
+                        勾选 Issues events + Comments 事件。
+                    </div>
+                </div>
+                <div style="font-size:12px;color:var(--faint);">
+                    两个 secret 由服务首次启动时自动生成并持久化，所有仓库共用同一对，不是每个仓库单独一个。
                 </div>
             </div>
 

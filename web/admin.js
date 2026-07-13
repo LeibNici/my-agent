@@ -647,12 +647,34 @@ async function loadSemanticSearch() {
     `).join("") || `<tr><td colspan="7" style="color:var(--faint);">暂无数据</td></tr>`;
 }
 
+// ===== Webhook config =====
+async function loadWebhookConfig() {
+    const resp = await fetch("/api/admin/webhook-config", { headers: authHeaders() });
+    const data = await resp.json();
+    document.getElementById("webhook-github-url").value = location.origin + data.github_path;
+    document.getElementById("webhook-github-secret").value = data.github_secret;
+    document.getElementById("webhook-gitlab-url").value = location.origin + data.gitlab_path;
+    document.getElementById("webhook-gitlab-secret").value = data.gitlab_secret;
+}
+
+async function copyWebhookField(id) {
+    const input = document.getElementById(id);
+    try {
+        await navigator.clipboard.writeText(input.value);
+        showMsg("已复制到剪贴板");
+    } catch {
+        input.select();
+        showMsg("剪贴板不可用，已为你选中文本，手动复制（Ctrl/Cmd+C）", false);
+    }
+}
+
 // ===== Init =====
 if (isAuthorizedAdmin) {
     loadUsers();
     loadRepos();
     loadPerms();
     loadIssueTracking();
+    loadWebhookConfig();
     loadUsage();
     loadSemanticSearch();
 }

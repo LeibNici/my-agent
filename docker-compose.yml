@@ -22,5 +22,7 @@ services:
       # deploy step that touches these before the first `docker compose up`.
       - ./data/agent_data.db:/app/agent_data.db
       - ./data/jwt_secret:/app/.jwt_secret
+      - ./data/github_webhook_secret:/app/.github_webhook_secret
+      - ./data/gitlab_webhook_secret:/app/.gitlab_webhook_secret
       - ./data/repos:/data/repos
       - ./engine/.env:/app/engine/.env:ro
