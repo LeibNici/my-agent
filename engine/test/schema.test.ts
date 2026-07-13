@@ -49,12 +49,10 @@ describe("loadSettings", () => {
       APP_ADMIN_USERNAME: "superadmin",
       APP_ADMIN_PASSWORD: "supersecret",
       APP_REPOS_DIR: "/custom/repos",
-      APP_GITHUB_TOKEN: "github-token-123",
     });
     expect(settings.adminUsername).toBe("superadmin");
     expect(settings.adminPassword).toBe("supersecret");
     expect(settings.reposDir).toBe("/custom/repos");
-    expect(settings.githubToken).toBe("github-token-123");
   });
 
   it("contains systemPrompt with default Chinese text", () => {

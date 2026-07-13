@@ -21,7 +21,6 @@ export interface Settings {
   adminUsername: string;
   adminPassword: string;
   reposDir: string;
-  githubToken: string;
   repoSyncIntervalMinutes: number;
   issueTrackIntervalMinutes: number;
   issueFixTargetBranch: string;
@@ -117,7 +116,6 @@ export function loadSettings(env?: Record<string, string | undefined>): Settings
     adminUsername: getEnvStr("APP_ADMIN_USERNAME", "admin"),
     adminPassword: getEnvStr("APP_ADMIN_PASSWORD", "admin123"),
     reposDir: getEnvStr("APP_REPOS_DIR", "/tmp/agent-repos"),
-    githubToken: getEnvStr("APP_GITHUB_TOKEN", ""),
     repoSyncIntervalMinutes: getEnvNum("APP_REPO_SYNC_INTERVAL_MINUTES", 10),
     issueTrackIntervalMinutes: getEnvNum(
       "APP_ISSUE_TRACK_INTERVAL_MINUTES",

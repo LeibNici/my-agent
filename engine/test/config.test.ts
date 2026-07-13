@@ -20,7 +20,6 @@ describe("config", () => {
       expect(settings.adminUsername).toBe("admin");
       expect(settings.adminPassword).toBe("admin123");
       expect(settings.reposDir).toBe("/tmp/agent-repos");
-      expect(settings.githubToken).toBe("");
       expect(settings.repoSyncIntervalMinutes).toBe(10);
       expect(settings.issueTrackIntervalMinutes).toBe(10);
       expect(settings.issueFixTargetBranch).toBe("test");
@@ -87,7 +86,6 @@ describe("config", () => {
         APP_ADMIN_USERNAME: "superadmin",
         APP_ADMIN_PASSWORD: "complexpass",
         APP_REPOS_DIR: "/var/repos",
-        APP_GITHUB_TOKEN: "ghp_test_token",
         APP_ISSUE_FIX_TARGET_BRANCH: "main",
         APP_CORS_ORIGINS: "https://example.com",
         APP_EMBEDDING_BASE_URL: "https://embedding.example.com",
@@ -99,7 +97,6 @@ describe("config", () => {
       expect(settings.adminUsername).toBe("superadmin");
       expect(settings.adminPassword).toBe("complexpass");
       expect(settings.reposDir).toBe("/var/repos");
-      expect(settings.githubToken).toBe("ghp_test_token");
       expect(settings.issueFixTargetBranch).toBe("main");
       expect(settings.corsOrigins).toBe("https://example.com");
       expect(settings.embeddingBaseUrl).toBe("https://embedding.example.com");
@@ -114,7 +111,6 @@ describe("config", () => {
         ANTHROPIC_SYSTEM_PROMPT: "test",
         ANTHROPIC_PROMPT_CACHE: "off",
         APP_REPOS_DIR: "/test",
-        APP_GITHUB_TOKEN: "token",
         APP_REPO_SYNC_INTERVAL_MINUTES: "5",
         APP_ISSUE_TRACK_INTERVAL_MINUTES: "10",
         APP_ISSUE_FIX_TARGET_BRANCH: "develop",
@@ -132,7 +128,6 @@ describe("config", () => {
       expect(settings).toHaveProperty("maxToolIterations");
       expect(settings).toHaveProperty("maxHistoryMessages");
       expect(settings).toHaveProperty("reposDir");
-      expect(settings).toHaveProperty("githubToken");
       expect(settings).toHaveProperty("repoSyncIntervalMinutes");
       expect(settings).toHaveProperty("issueTrackIntervalMinutes");
       expect(settings).toHaveProperty("issueFixTargetBranch");

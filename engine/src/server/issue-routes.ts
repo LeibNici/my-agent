@@ -15,7 +15,6 @@
 // `undefined` forever.
 import type { Hono, Context } from "hono";
 import type { DbClient } from "../db/client.js";
-import type { Settings } from "../config.js";
 import type { Env } from "./app.js";
 import { userOwnsSession, type CurrentUser } from "./sse.js";
 import {
@@ -30,7 +29,7 @@ import {
 import { truncateChars } from "../tools/chunking.js";
 import type { FullRepoRow } from "../db/storage.js";
 
-export type IssueRoutesDeps = { db: DbClient; settings: Settings };
+export type IssueRoutesDeps = { db: DbClient };
 
 async function parseBody<T = Record<string, unknown>>(c: Context<Env>): Promise<T | null> {
   try {
@@ -211,7 +210,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
       `**提报人**: ${user.username}（经内部代码助手确认后提交）`;
 
     // Submits against the stored repo URL/credentials (not client-supplied).
-    const result = await submitRepoIssue(repo, body.title, fullBody, labels, deps.settings);
+    const result = await submitRepoIssue(repo, body.title, fullBody, labels);
     if ("error" in result) return c.json({ detail: result.error }, 502);
 
     if (sessionId) {
@@ -277,13 +276,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     const draftResp = await verifyDraftRepoId(c, deps.db, sessionId, draftToolUseId, body.repo_id);
     if (draftResp) return draftResp;
 
-    const result = await applyRepoIssueAction(
-      repo,
-      body.issue_number,
-      body.action,
-      body.comment,
-      deps.settings,
-    );
+    const result = await applyRepoIssueAction(repo, body.issue_number, body.action, body.comment);
     if ("error" in result) return c.json({ detail: result.error }, 502);
 
     if (sessionId) {
@@ -317,7 +310,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
 
     const query = truncateChars(body.title.trim(), 100);
     if (!query) return c.json({ issues: [] });
-    return c.json({ issues: await searchRepoIssues(repo, query, 5, deps.settings) });
+    return c.json({ issues: await searchRepoIssues(repo, query, 5) });
   });
 
   app.get("/api/issues/mine", async (c) => {

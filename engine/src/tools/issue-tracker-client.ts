@@ -5,10 +5,15 @@
 // and issue-tracker.ts (the poller) all share this module instead of each
 // re-implementing host dispatch/auth.
 //
-// Every GitLab call authenticates with the REPO'S OWN cred_token (the same
-// credential configured for cloning it in 仓库管理 — a GitLab PAT commonly
-// carries both repo and API scopes). GitHub calls use the single global
-// settings.githubToken instead, unrelated to any repo's clone credential.
+// Every call — GitHub or GitLab — authenticates with the REPO'S OWN
+// cred_token (the same credential configured for cloning it in 仓库管理; a
+// PAT commonly carries both repo and API scopes). This used to be
+// GitLab-only, with GitHub requiring a separate global APP_GITHUB_TOKEN —
+// changed so both trackers work identically and a repo's own credential is
+// the only thing that needs configuring (2026-07-13). The issue body still
+// stamps the actual CodeAxis submitter's username (issue-routes.ts) since
+// the tracker itself always attributes the issue to whichever account the
+// token belongs to, not the platform user who triggered it.
 // Every call site MUST pass a FullRepoRow (db.getRepoAdmin/listReposFull),
 // never a RepoRow (db.getRepo/listRepos) — the client-safe view never
 // carries cred_token, so a RepoRow would silently authenticate with
@@ -26,7 +31,6 @@
 import { createHash } from "node:crypto";
 import type { FullRepoRow } from "../db/storage.js";
 import type { DbClient } from "../db/client.js";
-import type { Settings } from "../config.js";
 import { validateUrl } from "../repo-sync.js";
 import { withTimeout } from "./embedding-client.js";
 
@@ -208,13 +212,18 @@ export type TrackerResult =
 
 async function submitGithubIssue(
   repoUrl: string,
+  credToken: string | null,
   title: string,
   body: string,
   labels: string[],
-  settings: Settings,
 ): Promise<TrackerResult> {
-  const token = settings.githubToken;
-  if (!token) return { error: "GitHub token not configured (set APP_GITHUB_TOKEN)" };
+  const token = credToken;
+  if (!token) {
+    return {
+      error:
+        "This repo has no credentials configured — set them in 仓库管理 → 编辑 (needed to call the GitHub API, not just to clone)",
+    };
+  }
   const parsed = parseOwnerRepo(repoUrl);
   if (!parsed) return { error: `Cannot parse GitHub URL: ${repoUrl}` };
   const { owner, repo } = parsed;
@@ -273,9 +282,8 @@ export async function submitRepoIssue(
   title: string,
   body: string,
   labels: string[],
-  settings: Settings,
 ): Promise<TrackerResult> {
-  if (isGithubHosted(repo)) return submitGithubIssue(repo.url, title, body, labels, settings);
+  if (isGithubHosted(repo)) return submitGithubIssue(repo.url, repo.cred_token, title, body, labels);
   return submitGitlabIssue(repo.url, repo.cred_token, title, body, labels);
 }
 
@@ -287,13 +295,18 @@ export async function submitRepoIssue(
 
 async function applyGithubIssueAction(
   repoUrl: string,
+  credToken: string | null,
   issueNumber: number,
   action: string,
   comment: string,
-  settings: Settings,
 ): Promise<TrackerResult> {
-  const token = settings.githubToken;
-  if (!token) return { error: "GitHub token not configured (set APP_GITHUB_TOKEN)" };
+  const token = credToken;
+  if (!token) {
+    return {
+      error:
+        "This repo has no credentials configured — set them in 仓库管理 → 编辑 (needed to call the GitHub API, not just to clone)",
+    };
+  }
   const parsed = parseOwnerRepo(repoUrl);
   if (!parsed) return { error: `Cannot parse GitHub URL: ${repoUrl}` };
   const { owner, repo } = parsed;
@@ -399,9 +412,8 @@ export async function applyRepoIssueAction(
   issueNumber: number,
   action: string,
   comment: string,
-  settings: Settings,
 ): Promise<TrackerResult> {
-  if (isGithubHosted(repo)) return applyGithubIssueAction(repo.url, issueNumber, action, comment, settings);
+  if (isGithubHosted(repo)) return applyGithubIssueAction(repo.url, repo.cred_token, issueNumber, action, comment);
   return applyGitlabIssueAction(repo.url, repo.cred_token, issueNumber, action, comment);
 }
 
@@ -411,11 +423,11 @@ export type IssueHit = { number: number; title: string; url: string; state: stri
 
 async function searchGithubIssues(
   repoUrl: string,
+  credToken: string | null,
   query: string,
   limit: number,
-  settings: Settings,
 ): Promise<IssueHit[]> {
-  const token = settings.githubToken;
+  const token = credToken;
   if (!token) return [];
   const parsed = parseOwnerRepo(repoUrl);
   if (!parsed) return [];
@@ -467,10 +479,9 @@ export async function searchRepoIssues(
   repo: FullRepoRow,
   query: string,
   limit: number,
-  settings: Settings,
 ): Promise<IssueHit[]> {
   try {
-    if (isGithubHosted(repo)) return await searchGithubIssues(repo.url, query, limit, settings);
+    if (isGithubHosted(repo)) return await searchGithubIssues(repo.url, repo.cred_token, query, limit);
     return await searchGitlabIssues(repo.url, repo.cred_token, query, limit);
   } catch {
     return [];

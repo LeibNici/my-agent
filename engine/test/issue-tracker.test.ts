@@ -36,7 +36,6 @@ import {
 
 function makeSettings(overrides: Record<string, string | undefined> = {}): Settings {
   return loadSettings({
-    APP_GITHUB_TOKEN: "gh-default-token",
     APP_ISSUE_FIX_TARGET_BRANCH: "test",
     ...overrides,
   });
@@ -325,14 +324,12 @@ describe("pollTrackedIssues", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("issue_url 是 github.com -> 走 GitHub 轮询路径，用 settings.githubToken 认证，而非仓库自己的 cred_token", async () => {
-    const settings = makeSettings({ APP_GITHUB_TOKEN: "gh-global-token-xyz" });
-    // 仓库自己的 url 故意用别的主机 + 别的 token：证明 GitHub 分支完全不看仓库主机
-    // 是否匹配、也不会把仓库自己的凭证用在这条路径上。
+  it("issue_url 是 github.com 且主机与仓库一致 -> 走 GitHub 轮询路径，用仓库自己的 cred_token 认证（不再有单独的全局 token）", async () => {
+    const settings = makeSettings();
     const repoId = await client.createRepo({
       name: "proj",
-      url: "https://gitlab.example.com/group/proj.git",
-      credToken: "repo-own-gitlab-token",
+      url: "https://github.com/acme/widgets.git",
+      credToken: "repo-own-github-token",
     });
     const subId = await client.recordIssueSubmission({
       sessionId: "s1",
@@ -356,13 +353,44 @@ describe("pollTrackedIssues", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = (fetchMock as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit & { headers: Record<string, string> }];
     expect(url).toBe("https://api.github.com/repos/acme/widgets/issues/42");
-    expect(init.headers.Authorization).toBe("token gh-global-token-xyz");
-    expect(init.headers.Authorization).not.toContain("repo-own-gitlab-token");
+    expect(init.headers.Authorization).toBe("token repo-own-github-token");
 
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_status).toBe("submitted");
     expect(raw.remote_state).toBe("opened");
     expect(JSON.parse(raw.remote_labels)).toEqual(["bug"]);
+  });
+
+  it("issue_url 是 github.com 但主机与仓库当前 url 不一致 -> 护栏拦截，不发请求（GitHub 现在和 GitLab 走同一条主机匹配规则）", async () => {
+    const settings = makeSettings();
+    // 仓库自己的 url 故意指向别的主机：证明 GitHub 分支现在也遵守主机匹配护栏，
+    // 不会把仓库凭证发到一个 issue_url 主机不匹配的地方。
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://gitlab.example.com/group/proj.git",
+      credToken: "repo-own-gitlab-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 42,
+      issueUrl: "https://github.com/acme/widgets/issues/42",
+    });
+
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollTrackedIssues(client, settings);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.track_error).toBe(
+      "issue 所在主机(github.com)与仓库当前主机(gitlab.example.com)不一致，凭证不外发，暂停追踪"
+    );
   });
 
   it("GitLab 成功路径：issue GET + resource_state_events + notes（含 codex-report/v1 标记）-> 落库 derived status/remote_state/labels/reopen_count/closed_at，清空 track_error；fix report 经 getUnverifiedFixReports 可读到", async () => {

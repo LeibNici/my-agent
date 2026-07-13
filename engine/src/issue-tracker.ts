@@ -214,10 +214,10 @@ export function deriveStatus(remoteState: string, labels: string[], reopenCount:
   return "submitted";
 }
 
-async function pollGithub(sub: TrackableSubmissionRow, db: DbClient, settings: Settings): Promise<void> {
-  const token = settings.githubToken;
+async function pollGithub(sub: TrackableSubmissionRow, credToken: string | null, db: DbClient): Promise<void> {
+  const token = credToken;
   if (!token) {
-    await db.updateIssueTracking(sub.id, { trackError: "未配置 APP_GITHUB_TOKEN，无法追踪 GitHub issue" });
+    await db.updateIssueTracking(sub.id, { trackError: "仓库未配置凭证，无法调用 GitHub API" });
     return;
   }
   const issueUrl = sub.issue_url ?? "";
@@ -267,7 +267,6 @@ async function pollOne(
   sub: TrackableSubmissionRow,
   reposById: Map<number, FullRepoRow>,
   db: DbClient,
-  settings: Settings,
 ): Promise<void> {
   const repo = sub.repo_id !== null ? reposById.get(sub.repo_id) : undefined;
   if (!repo) {
@@ -279,21 +278,24 @@ async function pollOne(
   const issueHost = safeHostname(issueUrl).toLowerCase();
   const repoHost = safeHostname(repo.url).toLowerCase();
 
-  if (issueHost === "github.com" || issueHost === "www.github.com") {
-    await pollGithub(sub, db, settings);
-    return;
-  }
-
   // The poll target's host comes from the submission's OWN stored
   // issue_url, never the repo's current url (see module header) — but the
   // credential still comes from the repo record, and only gets used if
   // that repo's CURRENT host still matches where the issue actually lives.
+  // Applies to GitHub too, now that it authenticates with the repo's own
+  // cred_token instead of a separate global token.
   if (issueHost !== repoHost) {
     await db.updateIssueTracking(sub.id, {
       trackError: `issue 所在主机(${issueHost})与仓库当前主机(${repoHost})不一致，凭证不外发，暂停追踪`,
     });
     return;
   }
+
+  if (issueHost === "github.com" || issueHost === "www.github.com") {
+    await pollGithub(sub, repo.cred_token, db);
+    return;
+  }
+
   const token = repo.cred_token;
   if (!token) {
     await db.updateIssueTracking(sub.id, { trackError: "仓库未配置凭证，无法调用 GitLab API" });
@@ -356,7 +358,7 @@ export async function pollTrackedIssues(db: DbClient, settings: Settings): Promi
 
   for (const sub of subs) {
     try {
-      await pollOne(sub, reposById, db, settings);
+      await pollOne(sub, reposById, db);
     } catch (e) {
       const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
       try {

@@ -14,7 +14,6 @@
 // used for the SSRF-rejected smoke test).
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { rmSync } from "node:fs";
-import { loadSettings, type Settings } from "../src/config.js";
 import { createDbClient, type DbClient } from "../src/db/client.js";
 import { makeSeededDb } from "./db-fixture.js";
 import type { FullRepoRow } from "../src/db/storage.js";
@@ -46,7 +45,7 @@ function makeRepo(overrides: Partial<FullRepoRow> = {}): FullRepoRow {
     branch: null,
     access_level: null,
     cred_username: null,
-    cred_token: null,
+    cred_token: "ghp_test_token",
     local_path: null,
     created_at: "2026-01-01 00:00:00.000000",
     last_sync_at: null,
@@ -56,10 +55,6 @@ function makeRepo(overrides: Partial<FullRepoRow> = {}): FullRepoRow {
     last_sync_sha: null,
     ...overrides,
   };
-}
-
-function makeSettings(overrides: Record<string, string | undefined> = {}): Settings {
-  return loadSettings({ APP_GITHUB_TOKEN: "ghp_test_token", ...overrides });
 }
 
 afterEach(() => {
@@ -317,7 +312,6 @@ describe("getRepoLabels", () => {
 describe("submitRepoIssue", () => {
   it("GitHub: labels 以 JSON 数组形式发送；成功(201) -> success 结果", async () => {
     const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-    const settings = makeSettings();
     const fetchMock = vi.fn(async () => ({
       status: 201,
       json: async () => ({ number: 42, html_url: "https://github.com/acme/widget/issues/42", title: "Bug title" }),
@@ -325,7 +319,7 @@ describe("submitRepoIssue", () => {
     } as unknown as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await submitRepoIssue(repo, "Bug title", "body text", ["bug", "urgent"], settings);
+    const result = await submitRepoIssue(repo, "Bug title", "body text", ["bug", "urgent"]);
     expect(result).toEqual({
       success: true,
       number: 42,
@@ -348,7 +342,6 @@ describe("submitRepoIssue", () => {
 
   it("GitHub: 非 201 -> error，带状态码和响应体", async () => {
     const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-    const settings = makeSettings();
     const fetchMock = vi.fn(async () => ({
       status: 422,
       json: async () => ({}),
@@ -356,18 +349,19 @@ describe("submitRepoIssue", () => {
     } as unknown as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await submitRepoIssue(repo, "T", "B", [], settings);
+    const result = await submitRepoIssue(repo, "T", "B", []);
     expect(result).toEqual({ error: "GitHub API error (422): Validation Failed" });
   });
 
-  it("GitHub: 未配置 token -> error，且不发请求", async () => {
-    const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-    const settings = makeSettings({ APP_GITHUB_TOKEN: "" });
+  it("GitHub: repo 没有 cred_token -> error，且不发请求", async () => {
+    const repo = makeRepo({ url: "https://github.com/acme/widget.git", cred_token: null });
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await submitRepoIssue(repo, "T", "B", [], settings);
-    expect(result).toEqual({ error: "GitHub token not configured (set APP_GITHUB_TOKEN)" });
+    const result = await submitRepoIssue(repo, "T", "B", []);
+    expect(result).toEqual({
+      error: "This repo has no credentials configured — set them in 仓库管理 → 编辑 (needed to call the GitHub API, not just to clone)",
+    });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -376,7 +370,6 @@ describe("submitRepoIssue", () => {
       url: "https://gitlab.example.invalid/acme/widget.git",
       cred_token: "glpat_abc",
     });
-    const settings = makeSettings();
     const fetchMock = vi.fn(async () => ({
       status: 201,
       json: async () => ({ iid: 7, web_url: "https://gitlab.example.invalid/acme/widget/-/issues/7", title: "Bug title" }),
@@ -384,7 +377,7 @@ describe("submitRepoIssue", () => {
     } as unknown as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await submitRepoIssue(repo, "T", "B", ["bug", "urgent"], settings);
+    const result = await submitRepoIssue(repo, "T", "B", ["bug", "urgent"]);
     expect(result).toEqual({
       success: true,
       number: 7,
@@ -404,7 +397,6 @@ describe("submitRepoIssue", () => {
 
   it("GitLab: 非 201 -> error", async () => {
     const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-    const settings = makeSettings();
     const fetchMock = vi.fn(async () => ({
       status: 400,
       json: async () => ({}),
@@ -412,17 +404,16 @@ describe("submitRepoIssue", () => {
     } as unknown as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await submitRepoIssue(repo, "T", "B", [], settings);
+    const result = await submitRepoIssue(repo, "T", "B", []);
     expect(result).toEqual({ error: "GitLab API error (400): Bad Request" });
   });
 
   it("GitLab: 没有 cred_token -> error，不发请求", async () => {
     const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: null });
-    const settings = makeSettings();
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await submitRepoIssue(repo, "T", "B", [], settings);
+    const result = await submitRepoIssue(repo, "T", "B", []);
     expect(result).toEqual({
       error: "This repo has no credentials configured — set them in 仓库管理 → 编辑 (needed to call the GitLab API, not just to clone)",
     });
@@ -431,11 +422,10 @@ describe("submitRepoIssue", () => {
 
   it("GitLab: SSRF 拒绝的内网 host -> error，不发请求（冒烟测试）", async () => {
     const repo = makeRepo({ url: "http://127.0.0.1/group/proj.git", cred_token: "tok" });
-    const settings = makeSettings();
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await submitRepoIssue(repo, "T", "B", [], settings);
+    const result = await submitRepoIssue(repo, "T", "B", []);
     expect((result as { error: string }).error).toMatch(/internal\/private host/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -449,7 +439,6 @@ describe("applyRepoIssueAction", () => {
   describe("GitHub", () => {
     it("action=comment：只发一次 comments POST，没有额外的 GET；返回合成的 URL", async () => {
       const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-      const settings = makeSettings();
       const fetchMock = vi.fn(async () => ({
         status: 201,
         json: async () => ({}),
@@ -457,7 +446,7 @@ describe("applyRepoIssueAction", () => {
       } as unknown as Response));
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 99, "comment", "clarifying note", settings);
+      const result = await applyRepoIssueAction(repo, 99, "comment", "clarifying note");
 
       expect(fetchMock).toHaveBeenCalledTimes(1); // 只有 POST，没有 GET
       const [url, init] = fetchMock.mock.calls[0];
@@ -475,11 +464,10 @@ describe("applyRepoIssueAction", () => {
 
     it("action=comment 但 comment 是空白 -> 跳过 POST，直接返回合成 URL，零请求", async () => {
       const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 99, "comment", "   ", settings);
+      const result = await applyRepoIssueAction(repo, 99, "comment", "   ");
       expect(fetchMock).not.toHaveBeenCalled();
       expect(result).toEqual({
         success: true,
@@ -491,7 +479,6 @@ describe("applyRepoIssueAction", () => {
 
     it("comment POST 失败(非 201) -> error，不再往下走", async () => {
       const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-      const settings = makeSettings();
       const fetchMock = vi.fn(async () => ({
         status: 422,
         json: async () => ({}),
@@ -499,14 +486,13 @@ describe("applyRepoIssueAction", () => {
       } as unknown as Response));
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 99, "comment", "x", settings);
+      const result = await applyRepoIssueAction(repo, 99, "comment", "x");
       expect(result).toEqual({ error: "GitHub comment API error (422): nope" });
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it("action=close：先 POST 评论，再 PATCH state=closed，返回 PATCH 响应里的数据", async () => {
       const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       fetchMock
         .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
@@ -517,7 +503,7 @@ describe("applyRepoIssueAction", () => {
         } as unknown as Response);
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 99, "close", "resolved, closing", settings);
+      const result = await applyRepoIssueAction(repo, 99, "close", "resolved, closing");
       expect(fetchMock).toHaveBeenCalledTimes(2);
       const [patchUrl, patchInit] = fetchMock.mock.calls[1];
       expect(patchUrl).toBe("https://api.github.com/repos/acme/widget/issues/99");
@@ -533,7 +519,6 @@ describe("applyRepoIssueAction", () => {
 
     it("action=reopen：PATCH body 是 state=open", async () => {
       const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       fetchMock
         .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
@@ -544,14 +529,13 @@ describe("applyRepoIssueAction", () => {
         } as unknown as Response);
       vi.stubGlobal("fetch", fetchMock);
 
-      await applyRepoIssueAction(repo, 99, "reopen", "actually still happening", settings);
+      await applyRepoIssueAction(repo, 99, "reopen", "actually still happening");
       const [, patchInit] = fetchMock.mock.calls[1];
       expect(JSON.parse(patchInit.body as string)).toEqual({ state: "open" });
     });
 
     it("action=close 但 comment 为空 -> 跳过评论 POST，只有一次 PATCH 请求", async () => {
       const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-      const settings = makeSettings();
       const fetchMock = vi.fn(async () => ({
         status: 200,
         json: async () => ({ number: 99, html_url: "https://github.com/acme/widget/issues/99", title: "Closed" }),
@@ -559,7 +543,7 @@ describe("applyRepoIssueAction", () => {
       } as unknown as Response));
       vi.stubGlobal("fetch", fetchMock);
 
-      await applyRepoIssueAction(repo, 99, "close", "", settings);
+      await applyRepoIssueAction(repo, 99, "close", "");
       expect(fetchMock).toHaveBeenCalledTimes(1); // 只有 PATCH，没有评论 POST
       const [, init] = fetchMock.mock.calls[0];
       expect(init.method).toBe("PATCH");
@@ -567,25 +551,25 @@ describe("applyRepoIssueAction", () => {
 
     it("PATCH 失败(非 200) -> error", async () => {
       const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       fetchMock
         .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
         .mockResolvedValueOnce({ status: 500, json: async () => ({}), text: async () => "server error" } as unknown as Response);
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 99, "close", "x", settings);
+      const result = await applyRepoIssueAction(repo, 99, "close", "x");
       expect(result).toEqual({ error: "GitHub update API error (500): server error" });
     });
 
-    it("未配置 token -> error，零请求", async () => {
-      const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-      const settings = makeSettings({ APP_GITHUB_TOKEN: "" });
+    it("repo 没有 cred_token -> error，零请求", async () => {
+      const repo = makeRepo({ url: "https://github.com/acme/widget.git", cred_token: null });
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 99, "comment", "x", settings);
-      expect(result).toEqual({ error: "GitHub token not configured (set APP_GITHUB_TOKEN)" });
+      const result = await applyRepoIssueAction(repo, 99, "comment", "x");
+      expect(result).toEqual({
+        error: "This repo has no credentials configured — set them in 仓库管理 → 编辑 (needed to call the GitHub API, not just to clone)",
+      });
       expect(fetchMock).not.toHaveBeenCalled();
     });
   });
@@ -593,7 +577,6 @@ describe("applyRepoIssueAction", () => {
   describe("GitLab", () => {
     it("action=comment：notes POST 成功后额外发一次 GET 拿最新状态（不同于 GitHub 的合成 URL）", async () => {
       const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       fetchMock
         .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
@@ -604,7 +587,7 @@ describe("applyRepoIssueAction", () => {
         } as unknown as Response);
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 5, "comment", "note text", settings);
+      const result = await applyRepoIssueAction(repo, 5, "comment", "note text");
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
       const [notesUrl, notesInit] = fetchMock.mock.calls[0];
@@ -625,32 +608,29 @@ describe("applyRepoIssueAction", () => {
 
     it("action=comment：notes POST 成功但重新 GET 返回非 200 -> 仍报告 success，用原始 issue_number，url/title 为 null", async () => {
       const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       fetchMock
         .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
         .mockResolvedValueOnce({ status: 404, json: async () => ({}), text: async () => "not found" } as unknown as Response);
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 5, "comment", "note text", settings);
+      const result = await applyRepoIssueAction(repo, 5, "comment", "note text");
       expect(result).toEqual({ success: true, number: 5, url: null, title: null });
     });
 
     it("action=comment：notes POST 成功但重新 GET 抛网络异常 -> 异常向上传播（不是 success:true），与非 200 分支不同——faithful port of v1's apply_gitlab_issue_action，重新 GET 那一步没有 try/except 包裹", async () => {
       const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       fetchMock
         .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
         .mockRejectedValueOnce(new Error("ECONNRESET"));
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect(applyRepoIssueAction(repo, 5, "comment", "note text", settings)).rejects.toThrow("ECONNRESET");
+      await expect(applyRepoIssueAction(repo, 5, "comment", "note text")).rejects.toThrow("ECONNRESET");
     });
 
     it("notes POST 失败(非 201) -> error，不发 GET", async () => {
       const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-      const settings = makeSettings();
       const fetchMock = vi.fn(async () => ({
         status: 400,
         json: async () => ({}),
@@ -658,14 +638,13 @@ describe("applyRepoIssueAction", () => {
       } as unknown as Response));
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 5, "comment", "x", settings);
+      const result = await applyRepoIssueAction(repo, 5, "comment", "x");
       expect(result).toEqual({ error: "GitLab note API error (400): bad note" });
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it("action=close：notes POST + PUT state_event=close，返回 PUT 响应数据", async () => {
       const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       fetchMock
         .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
@@ -676,7 +655,7 @@ describe("applyRepoIssueAction", () => {
         } as unknown as Response);
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 5, "close", "resolved", settings);
+      const result = await applyRepoIssueAction(repo, 5, "close", "resolved");
       expect(fetchMock).toHaveBeenCalledTimes(2);
       const [putUrl, putInit] = fetchMock.mock.calls[1];
       expect(putUrl).toBe("https://gitlab.example.invalid/api/v4/projects/acme%2Fwidget/issues/5");
@@ -692,24 +671,22 @@ describe("applyRepoIssueAction", () => {
 
     it("PUT 失败(非 200) -> error", async () => {
       const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       fetchMock
         .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
         .mockResolvedValueOnce({ status: 500, json: async () => ({}), text: async () => "server error" } as unknown as Response);
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 5, "close", "x", settings);
+      const result = await applyRepoIssueAction(repo, 5, "close", "x");
       expect(result).toEqual({ error: "GitLab update API error (500): server error" });
     });
 
     it("没有 cred_token -> error，零请求", async () => {
       const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: null });
-      const settings = makeSettings();
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);
 
-      const result = await applyRepoIssueAction(repo, 5, "comment", "x", settings);
+      const result = await applyRepoIssueAction(repo, 5, "comment", "x");
       expect((result as { error: string }).error).toMatch(/no credentials configured/);
       expect(fetchMock).not.toHaveBeenCalled();
     });
@@ -723,7 +700,6 @@ describe("applyRepoIssueAction", () => {
 describe("searchRepoIssues", () => {
   it("GitHub: 查询参数是 repo:{owner}/{repo} is:issue {query}", async () => {
     const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-    const settings = makeSettings();
     const fetchMock = vi.fn(async () => ({
       status: 200,
       json: async () => ({
@@ -732,7 +708,7 @@ describe("searchRepoIssues", () => {
     } as unknown as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await searchRepoIssues(repo, "crash", 5, settings);
+    const result = await searchRepoIssues(repo, "crash", 5);
     expect(result).toEqual([{ number: 1, title: "Crash on save", url: "https://github.com/acme/widget/issues/1", state: "open" }]);
 
     const [calledUrl] = fetchMock.mock.calls[0];
@@ -744,35 +720,31 @@ describe("searchRepoIssues", () => {
 
   it("GitHub: 非 200 -> []", async () => {
     const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-    const settings = makeSettings();
     const fetchMock = vi.fn(async () => ({ status: 500, json: async () => ({}) } as unknown as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    expect(await searchRepoIssues(repo, "crash", 5, settings)).toEqual([]);
+    expect(await searchRepoIssues(repo, "crash", 5)).toEqual([]);
   });
 
   it("GitHub: fetch 抛异常 -> 外层 try/catch 兜住，返回 []（不向上传播）", async () => {
     const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-    const settings = makeSettings();
     const fetchMock = vi.fn().mockRejectedValueOnce(new Error("ECONNREFUSED"));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(searchRepoIssues(repo, "crash", 5, settings)).resolves.toEqual([]);
+    await expect(searchRepoIssues(repo, "crash", 5)).resolves.toEqual([]);
   });
 
-  it("GitHub: 未配置 token -> []，零请求", async () => {
-    const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
-    const settings = makeSettings({ APP_GITHUB_TOKEN: "" });
+  it("GitHub: repo 没有 cred_token -> []，零请求", async () => {
+    const repo = makeRepo({ url: "https://github.com/acme/widget.git", cred_token: null });
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    expect(await searchRepoIssues(repo, "crash", 5, settings)).toEqual([]);
+    expect(await searchRepoIssues(repo, "crash", 5)).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("GitLab: 查询参数是 search/in=title/per_page/order_by=updated_at，字段用 iid/web_url 映射", async () => {
     const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-    const settings = makeSettings();
     const fetchMock = vi.fn(async () => ({
       status: 200,
       json: async () => ([
@@ -781,7 +753,7 @@ describe("searchRepoIssues", () => {
     } as unknown as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await searchRepoIssues(repo, "crash", 5, settings);
+    const result = await searchRepoIssues(repo, "crash", 5);
     expect(result).toEqual([{ number: 9, title: "Crash on save", url: "https://gitlab.example.invalid/acme/widget/-/issues/9", state: "opened" }]);
 
     const [calledUrl] = fetchMock.mock.calls[0];
@@ -794,20 +766,18 @@ describe("searchRepoIssues", () => {
 
   it("GitLab: 非 200 -> []", async () => {
     const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-    const settings = makeSettings();
     const fetchMock = vi.fn(async () => ({ status: 500, json: async () => ({}) } as unknown as Response));
     vi.stubGlobal("fetch", fetchMock);
 
-    expect(await searchRepoIssues(repo, "crash", 5, settings)).toEqual([]);
+    expect(await searchRepoIssues(repo, "crash", 5)).toEqual([]);
   });
 
   it("GitLab: fetch 抛异常 -> []", async () => {
     const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
-    const settings = makeSettings();
     const fetchMock = vi.fn().mockRejectedValueOnce(new Error("network down"));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(searchRepoIssues(repo, "crash", 5, settings)).resolves.toEqual([]);
+    await expect(searchRepoIssues(repo, "crash", 5)).resolves.toEqual([]);
   });
 });
 
