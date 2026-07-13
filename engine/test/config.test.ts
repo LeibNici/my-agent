@@ -221,6 +221,35 @@ describe("config", () => {
       expect(secret).toBe(existingSecret);
     });
 
+    // QA-reported (GitHub issue #6, 2026-07-13): the webhook secret files
+    // must be pre-touched as empty placeholders on the host BEFORE the
+    // first `docker compose up` — Docker creates a directory instead of
+    // erroring if a bind-mount source doesn't exist at all. That pre-touch
+    // convention means loadOrCreate always meets an EXISTING-but-EMPTY
+    // file, which used to just return a fresh in-memory secret WITHOUT
+    // persisting it — so every container restart generated (and silently
+    // discarded) a new secret, and whatever had been registered on
+    // GitHub/GitLab went stale the moment the container restarted.
+    it("should PERSIST a freshly generated secret into an existing-but-empty file, not just return it in memory", () => {
+      const secretFile = path.join(tmpDir, ".jwt_secret");
+      fs.writeFileSync(secretFile, "", { mode: 0o600 }); // pre-touched empty, like the Docker bind-mount case
+
+      const secret = loadOrCreateJwtSecret(tmpDir);
+      expect(secret.length).toBe(64);
+
+      const fileContent = fs.readFileSync(secretFile, "utf-8").trim();
+      expect(fileContent).toBe(secret); // must actually be written, not just returned
+    });
+
+    it("should return the SAME secret on a second call after an empty-file first call (proves it's now stable across restarts)", () => {
+      const secretFile = path.join(tmpDir, ".jwt_secret");
+      fs.writeFileSync(secretFile, "", { mode: 0o600 });
+
+      const first = loadOrCreateJwtSecret(tmpDir);
+      const second = loadOrCreateJwtSecret(tmpDir); // simulates the next container restart
+      expect(second).toBe(first);
+    });
+
     it("should handle pre-created file atomically (both callers race to create)", () => {
       const secretFile = path.join(tmpDir, ".jwt_secret");
 

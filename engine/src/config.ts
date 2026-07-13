@@ -68,8 +68,18 @@ function loadOrCreateSecretFile(repoRoot: string, filename: string): string {
       if (existingSecret) {
         return existingSecret;
       }
-      // If file is empty (race condition), use our generated one
-      // This shouldn't happen in normal operation but handle gracefully
+      // The file exists but is empty — this is NOT a rare race, it's the
+      // normal steady state for a bind-mounted secret file that had to be
+      // pre-touched as an empty placeholder before the very first `docker
+      // compose up` (Docker creates a DIRECTORY instead of erroring if the
+      // host path doesn't exist at all — see docker-compose.yml's own
+      // comment). The exclusive-create above always hits EEXIST against
+      // that empty file, so without persisting here, every single restart
+      // silently generates a brand-new secret and never saves it — exactly
+      // what an operator sees as "the webhook secret changes on every
+      // deploy" (QA-reported, GitHub issue #6): whatever was registered on
+      // GitHub/GitLab goes stale the moment the container restarts.
+      fs.writeFileSync(secretFile, secret, { mode: 0o600 });
       return secret;
     }
     // Re-throw other errors (permission, disk full, etc.)
