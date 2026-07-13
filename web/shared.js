@@ -2,6 +2,45 @@
 // no bundler/module system — so this one file is the single source instead
 // of each page keeping its own copy).
 
+// ===== Global 401 handling =====
+// app.js's own authFetch used to catch this itself, but admin.js's many
+// direct fetch()+authHeaders() calls had no equivalent — an expired token
+// on the admin page just left every action silently failing forever, no
+// error, no redirect. Wrapping window.fetch once here (loaded before
+// app.js/admin.js on both pages) covers every call site in both files at
+// once instead of chasing down each one. login.html doesn't load shared.js
+// at all, so its own login-attempt 401 (wrong password, not an expired
+// session) is untouched by this.
+(function installGlobal401Handler() {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        return nativeFetch(input, init).then((resp) => {
+            if (resp.status === 401 && !location.pathname.startsWith("/login")) {
+                localStorage.removeItem("token");
+                localStorage.removeItem("user");
+                location.href = "/login?reason=expired";
+            }
+            return resp;
+        });
+    };
+})();
+
+// ===== Git SHA badge =====
+// Shows which commit the running site is actually serving — a real
+// recurring question during deploy work ("is this the version I just
+// pushed?") with no way to answer it from the UI before this. Both
+// app.js and admin.js call this once their own /api/config fetch (which
+// now carries git_sha, see app.ts's readGitSha) resolves.
+function showGitSha(sha, container) {
+    if (!container || !sha || document.getElementById("git-sha-label")) return;
+    const el = document.createElement("div");
+    el.id = "git-sha-label";
+    el.className = "git-sha-label";
+    el.textContent = sha === "unknown" ? "commit: unknown" : `commit: ${sha.slice(0, 9)}`;
+    el.title = sha;
+    container.appendChild(el);
+}
+
 function escapeHtml(str) {
     // Manual replace (not the div.textContent/innerHTML trick) so this is safe
     // both in text-node context and when interpolated into an HTML attribute value.

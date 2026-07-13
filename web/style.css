@@ -230,6 +230,19 @@ body {
     border-top: 1px solid var(--line-soft);
 }
 
+/* Which commit the running site is actually serving (app.js/admin.js,
+   shared.js's showGitSha) — deliberately quiet, not another bordered
+   row: overrides the generic ".sidebar-header > div" separator above. */
+.git-sha-label {
+    margin-top: 4px !important;
+    padding-top: 0 !important;
+    border-top: none !important;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--faint);
+    cursor: default;
+}
+
 /* Theme toggle — built by shared.js, dropped into the user-info row (index)
    or the admin header actions row (admin.html). Deliberately a plain glyph
    button matching #menu-btn's understatement, not a decorative icon. */

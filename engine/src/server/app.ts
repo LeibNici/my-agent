@@ -13,8 +13,10 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { serveStatic } from "@hono/node-server/serve-static";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 
 import type { DbClient } from "../db/client.js";
 import type { Settings } from "../config.js";
@@ -65,6 +67,33 @@ export type Env = { Variables: { user: CurrentUser } };
 // process is launched from anywhere but the repo root — an absolute root
 // sidesteps that entirely.
 const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../web");
+const ENGINE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const REPO_ROOT = path.resolve(ENGINE_ROOT, "..");
+
+// So the running site can show which commit it's actually serving (QA
+// asked for this after a deploy-mechanics investigation made "is this the
+// version I just pushed?" a real recurring question). deploy.sh writes
+// `engine/.git-sha` at build time (picked up by the Dockerfile's `COPY
+// engine/ ./` automatically) since the container has no `.git` directory
+// of its own to ask — the git-cli fallback below only ever fires in local
+// dev, where `.git` genuinely exists at REPO_ROOT. Resolved once at
+// startup (matches this file's own WEB_ROOT — computed once, not
+// per-request) since the running process is always one fixed commit.
+function readGitSha(): string {
+  try {
+    return fs.readFileSync(path.join(ENGINE_ROOT, ".git-sha"), "utf8").trim();
+  } catch {
+    // fall through to the git-cli fallback below
+  }
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT, stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim();
+  } catch {
+    return "unknown";
+  }
+}
+const GIT_SHA = readGitSha();
 
 // v1 app/main.py:80-83 — static client-side limits, unrelated to any
 // specific request; the frontend's loadConfig() unconditionally reads
@@ -225,6 +254,7 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
       max_images_per_message: MAX_IMAGES_PER_MESSAGE,
       max_image_bytes: Math.round((MAX_IMAGE_BASE64_CHARS * 3) / 4),
       repo_sync_interval_minutes: deps.settings.repoSyncIntervalMinutes,
+      git_sha: GIT_SHA,
     })
   );
 

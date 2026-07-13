@@ -11,6 +11,14 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "==> git pull (fast-forward only)"
 git pull --ff-only
 
+# So the running site can show which commit it's actually serving (see
+# app.ts's readGitSha comment) — the container has no .git of its own
+# (Dockerfile only COPYs engine/ and web/, not the whole repo), so this
+# file is the only way it finds out. Written into engine/ so the existing
+# `COPY engine/ ./` picks it up with no Dockerfile change; gitignored so
+# it never becomes a tracked/committed file.
+git rev-parse HEAD > engine/.git-sha
+
 echo "==> docker compose build"
 docker compose build
 

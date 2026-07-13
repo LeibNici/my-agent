@@ -345,6 +345,13 @@
         }
     }
 
+    // shared.js's global 401 handler (app.js/admin.js pages) redirects here
+    // with ?reason=expired after clearing the stale token — surface why the
+    // user landed back on the login page instead of leaving them to wonder.
+    if (new URLSearchParams(window.location.search).get("reason") === "expired") {
+        document.getElementById("error-msg").textContent = "登录已过期，请重新登录";
+    }
+
     // If already logged in, redirect — unless a password change is still
     // mandatory, in which case show that gate immediately rather than
     // letting a stale must_change_password:true session bypass it.

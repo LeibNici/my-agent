@@ -793,14 +793,18 @@ describe("auth middleware — 401 shape matches v1 FastAPI's {detail: ...}", () 
 // ==================== GET /api/config, /api/skills ====================
 
 describe("GET /api/config", () => {
-  it("返回 v1 main.py 的静态限额形状：max_images_per_message/max_image_bytes/repo_sync_interval_minutes", async () => {
+  it("返回 v1 main.py 的静态限额形状：max_images_per_message/max_image_bytes/repo_sync_interval_minutes，另加 git_sha", async () => {
     const { token } = await seedUser();
     const app = buildApp({ db: client, settings, engine: stubEngine([]) });
     const resp = await authedRequest(app, token, "/api/config");
+    // git_sha is resolved once at module load (readGitSha in app.ts) —
+    // whatever this checkout's real HEAD/`.git-sha` fallback happens to
+    // be, not a value this test can pin; just assert it's a non-empty string.
     expect(await resp.json()).toEqual({
       max_images_per_message: 5,
       max_image_bytes: 4_500_000,
       repo_sync_interval_minutes: settings.repoSyncIntervalMinutes,
+      git_sha: expect.any(String),
     });
   });
 });

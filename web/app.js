@@ -8,12 +8,12 @@ function authHeaders() {
     return { "Authorization": `Bearer ${_token}` };
 }
 
+// 401 handling itself lives in shared.js's global fetch wrap (loaded
+// before this file) so it's shared with admin.js instead of duplicated —
+// this just adds the auth header.
 function authFetch(url, opts = {}) {
     opts.headers = { ...(opts.headers || {}), ...authHeaders() };
-    return fetch(url, opts).then(resp => {
-        if (resp.status === 401) { localStorage.removeItem("token"); window.location.href = "/login"; }
-        return resp;
-    });
+    return fetch(url, opts);
 }
 
 function logout() {
@@ -44,6 +44,7 @@ async function loadConfig() {
         const config = await resp.json();
         if (config.max_images_per_message) MAX_IMAGES_PER_MESSAGE = config.max_images_per_message;
         if (config.max_image_bytes) MAX_IMAGE_BYTES = config.max_image_bytes;
+        showGitSha(config.git_sha, document.querySelector(".sidebar-header"));
     } catch {} // keep the fallback defaults above if this fails
 }
 

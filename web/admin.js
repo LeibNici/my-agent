@@ -159,6 +159,7 @@ async function loadRepos() {
                 ? `自动同步间隔：${cfg.repo_sync_interval_minutes} 分钟`
                 : "自动同步已禁用（仅手动）";
         }
+        showGitSha(cfg.git_sha, document.getElementById("admin-header-actions"));
     } catch {}
 })();
 
