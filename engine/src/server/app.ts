@@ -45,6 +45,7 @@ import {
 import { mountAdminRoutes, type SyncAndPersistFn } from "./admin-routes.js";
 import { mountAdminDashboardRoutes } from "./admin-dashboard-routes.js";
 import { mountIssueRoutes } from "./issue-routes.js";
+import { mountWebhookRoutes } from "./webhook-routes.js";
 
 export type BuildAppDeps = {
   db: DbClient;
@@ -152,7 +153,10 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
   // until the token naturally expires.
 
   app.use("/api/*", async (c, next) => {
-    if (c.req.path === "/api/auth/login") {
+    // Same bypass shape as /api/auth/login: GitHub/GitLab never send our JWT
+    // — these two routes authenticate the REQUEST itself (HMAC signature /
+    // shared token, verified inside webhook-routes.ts) instead of a user.
+    if (c.req.path === "/api/auth/login" || c.req.path.startsWith("/api/webhooks/")) {
       await next();
       return;
     }
@@ -391,6 +395,11 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
   // app/main.py "Issues" section. See issue-routes.ts's own header for the
   // full rationale and the getRepoAdmin/listReposFull credential warning.
   mountIssueRoutes(app, deps);
+
+  // GitHub/GitLab webhook receiver (2026-07-13) — see webhook-routes.ts's
+  // own header. Bypasses the /api/* auth middleware above (GitHub/GitLab
+  // never send our JWT); authenticates the request itself instead.
+  mountWebhookRoutes(app, deps);
 
   // ==================== Admin ====================
   // Task 7: user/repo/permission CRUD, port of v1's

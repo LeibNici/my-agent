@@ -26,9 +26,9 @@
 //     a Task-5-scoped fix, this file tracks id->name locally from the
 //     tool_use events it already sees and enriches the wire frame only.
 import type { DbClient } from "../db/client.js";
-import type { LlmMetricsRow } from "../db/storage.js";
+import type { LlmMetricsRow, IssueSubmissionRow, IssueActionRow } from "../db/storage.js";
 import type { Settings } from "../config.js";
-import type { RunTurnFn, RunTurnDeps } from "../engine/turn.js";
+import type { RunTurnFn, RunTurnDeps, LinkedIssueSummary } from "../engine/turn.js";
 import type { ToolDef, ToolContext } from "../tools/registry.js";
 import type { DomainBlock, ImageBlock } from "../domain.js";
 import { domainToLegacy } from "../codec-legacy.js";
@@ -144,6 +144,33 @@ export async function resolveToolContext(db: DbClient, user: CurrentUser, repoId
     db,
     grantedRepos: granted.map((r) => ({ id: r.id, name: r.name, localPath: r.local_path })),
   };
+}
+
+// QA-reported (2026-07-13): feeds turn.ts's per-turn "which issue(s) has
+// this session already touched" reminder — see LinkedIssueSummary/
+// formatLinkedIssuesReminder there. Keyed by repo+number so a submission
+// and later actions on the SAME issue collapse into one entry rather than
+// listing it twice; the submission's own track_status (real tracker state)
+// wins over an action-only row's generic label when both exist. Rows with
+// no issue_number (a submission that somehow never completed) are skipped
+// — nothing for the model to reference yet.
+function buildLinkedIssueSummaries(
+  submissions: IssueSubmissionRow[],
+  actions: IssueActionRow[],
+): LinkedIssueSummary[] {
+  const byKey = new Map<string, LinkedIssueSummary>();
+  for (const a of actions) {
+    const key = `${a.repo_id}:${a.issue_number}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, { repoId: a.repo_id, issueNumber: a.issue_number, issueUrl: a.issue_url, status: "已处理（评论/关闭/重新打开）" });
+    }
+  }
+  for (const s of submissions) {
+    if (s.issue_number === null) continue;
+    const key = `${s.repo_id}:${s.issue_number}`;
+    byKey.set(key, { repoId: s.repo_id, issueNumber: s.issue_number, issueUrl: s.issue_url, status: s.track_status });
+  }
+  return [...byKey.values()];
 }
 
 /** v1's `_sse_reject`: the standard "reject this request" sequence shared by
@@ -293,11 +320,17 @@ export async function* chatEventStream(
   // resolveToolContext's own comment for the v1 correspondence.
   const ctx = await resolveToolContext(db, user, req.repo_id);
   const runTurnDeps: RunTurnDeps = { db, settings, tools, ctx };
+  const [issueSubmissions, issueActions] = await Promise.all([
+    db.getIssueSubmissionsForSession(sessionId),
+    db.getIssueActionsForSession(sessionId),
+  ]);
+  const linkedIssues = buildLinkedIssueSummaries(issueSubmissions, issueActions);
   const engineIter = engine(runTurnDeps, {
     sessionId,
     history,
     userText: req.message,
     images: domainImages.length > 0 ? domainImages : undefined,
+    linkedIssues: linkedIssues.length > 0 ? linkedIssues : undefined,
   })[Symbol.asyncIterator]();
 
   try {

@@ -231,6 +231,22 @@ export function initSchema(dbPath: string): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_semantic_search_log_created ON semantic_search_log(created_at)"
   );
+  // Idempotent-submit guard (2026-07-13): draft_tool_use_id is stable per
+  // draft card, so a retried /api/issues/submit under the same id must not
+  // file a second real GitHub/GitLab issue — a partial unique index (only
+  // enforced where the value is actually present) lets recordIssueSubmission
+  // detect and recover from the collision instead of throwing blind.
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_submissions_draft_tool_use_id " +
+      "ON issue_submissions(draft_tool_use_id) WHERE draft_tool_use_id IS NOT NULL"
+  );
+  // Lets manage_issue's post-action recheck (getSubmissionByIssue) find the
+  // right row without a full-table scan — issue_number alone isn't unique
+  // across repos, so this is a compound index, not a second unique one.
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_issue_submissions_repo_issue " +
+      "ON issue_submissions(repo_id, issue_number)"
+  );
 
   db.close();
 }

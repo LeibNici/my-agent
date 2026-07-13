@@ -198,6 +198,77 @@ describe("runTurn — turn engine (Task 4)", () => {
   });
 });
 
+// QA-reported (2026-07-13): sessions no longer force-resolve after an issue
+// action, so a user can say "close it" without repeating the issue number —
+// but only if the model is actually told which issue(s) this session has
+// already touched. Fed in per-turn via req.linkedIssues, injected through
+// the same transformContext hook the budget reminder already uses.
+describe("runTurn — linkedIssues 上下文注入", () => {
+  it("非空 linkedIssues：首次 LLM 调用的请求体里带上 issue 编号和状态；第二次调用不重复注入", async () => {
+    const mock = startMock([
+      textThenToolTurn("查一下", "calculator", { expression: "1+1" }, "tu_1"),
+      textTurn("答案是2"),
+    ]);
+    const settings = testSettings({ baseUrl: mock.url });
+    await collect(
+      runTurn(
+        { settings, tools: [calculatorTool], ctx: EMPTY_CTX },
+        {
+          sessionId: "s1",
+          history: [],
+          userText: "关闭它",
+          linkedIssues: [{ repoId: 3, issueNumber: 42, issueUrl: "https://gitlab.example.com/g/p/-/issues/42", status: "submitted" }],
+        },
+      ),
+    );
+    expect(mock.requests.length).toBe(2);
+    const firstBody = JSON.stringify(mock.requests[0]?.body);
+    expect(firstBody).toContain("#42");
+    expect(firstBody).toContain("submitted");
+    expect(firstBody).toContain("https://gitlab.example.com/g/p/-/issues/42");
+    // Second call (after the tool result) must NOT repeat it — only the
+    // first LLM call of the turn gets it.
+    const secondBody = JSON.stringify(mock.requests[1]?.body);
+    expect(secondBody).not.toContain("[系统提示] 本次会话已经提交/操作过以下 issue");
+    await mock.close();
+  });
+
+  it("linkedIssues 为空/未传：不注入任何内容（回归保护，不影响现有无 issue 的普通对话）", async () => {
+    const mock = startMock([textTurn("你好")]);
+    const settings = testSettings({ baseUrl: mock.url });
+    await collect(
+      runTurn({ settings, tools: [], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "hi", linkedIssues: [] }),
+    );
+    const body = JSON.stringify(mock.requests[0]?.body);
+    expect(body).not.toContain("[系统提示]");
+    await mock.close();
+  });
+
+  it("同一次调用里 issue 上下文和 budget reminder 同时触发时，两段文本都在", async () => {
+    const mock = startMock(exhaustingTurns());
+    // maxToolIterations=6 -> MIDPOINT_CHECK fires at nextIteration===3, not 0,
+    // so use a small budget where the FIRST call (nextIteration 0) is also
+    // within the endgame window (remaining 1..3) by setting maxToolIterations
+    // low enough that call 0 already sees remaining<=3.
+    const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 2 });
+    await collect(
+      runTurn(
+        { settings, tools: [calculatorTool], ctx: EMPTY_CTX },
+        {
+          sessionId: "s1",
+          history: [],
+          userText: "查",
+          linkedIssues: [{ repoId: null, issueNumber: 7, issueUrl: null, status: "已处理（评论/关闭/重新打开）" }],
+        },
+      ),
+    );
+    const firstBody = JSON.stringify(mock.requests[0]?.body);
+    expect(firstBody).toContain("#7");
+    expect(firstBody).toContain("仅剩"); // endgame reminder's own text
+    await mock.close();
+  });
+});
+
 // v1-python-final:app/agent.py::_WRAPUP_FALLBACK, verbatim (byte-verified
 // against the tagged source via the same extraction script as the other
 // reminder strings — 180 bytes). Deliberately HARDCODED here rather than

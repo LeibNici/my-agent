@@ -71,6 +71,9 @@ export type DbClient = {
   markSessionResolved(sessionId: string): Promise<void>;
   recordIssueSubmission(fields: RecordIssueSubmissionFields): Promise<number>;
   getIssueSubmissionsForSession(sessionId: string): Promise<IssueSubmissionRow[]>;
+  getSubmissionByDraftToolUseId(draftToolUseId: string): Promise<IssueSubmissionRow | null>;
+  getSubmissionForTracking(id: number): Promise<TrackableSubmissionRow | null>;
+  getSubmissionByIssue(repoId: number | null, issueNumber: number): Promise<TrackableSubmissionRow | null>;
   getTrackableSubmissions(): Promise<TrackableSubmissionRow[]>;
   updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields): Promise<void>;
   upsertFixReport(fields: UpsertFixReportFields): Promise<number>;
@@ -223,6 +226,11 @@ export function createDbClient(dbPath: string): DbClient {
     recordIssueSubmission: (fields) => call<number>("recordIssueSubmission", [fields]),
     getIssueSubmissionsForSession: (sessionId) =>
       call<IssueSubmissionRow[]>("getIssueSubmissionsForSession", [sessionId]),
+    getSubmissionByDraftToolUseId: (draftToolUseId) =>
+      call<IssueSubmissionRow | null>("getSubmissionByDraftToolUseId", [draftToolUseId]),
+    getSubmissionForTracking: (id) => call<TrackableSubmissionRow | null>("getSubmissionForTracking", [id]),
+    getSubmissionByIssue: (repoId, issueNumber) =>
+      call<TrackableSubmissionRow | null>("getSubmissionByIssue", [repoId, issueNumber]),
     getTrackableSubmissions: () => call<TrackableSubmissionRow[]>("getTrackableSubmissions", []),
     updateIssueTracking: (submissionId, fields) =>
       call<void>("updateIssueTracking", [submissionId, fields]),

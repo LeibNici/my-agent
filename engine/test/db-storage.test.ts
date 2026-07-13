@@ -587,6 +587,98 @@ describe("recordIssueSubmission / getIssueSubmissionsForSession（v1 database.py
   });
 });
 
+describe("getSubmissionByDraftToolUseId / recordIssueSubmission 幂等化（2026-07-13，防止重试重复建 issue）", () => {
+  it("命中：按 draft_tool_use_id 查到之前提交的那一行", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const subId = storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t", body: "b", labels: [], issueNumber: 1, issueUrl: "https://x/1",
+      draftToolUseId: "tu_abc",
+    });
+    const row = storage.getSubmissionByDraftToolUseId("tu_abc");
+    expect(row).not.toBeNull();
+    expect(row!.id).toBe(subId);
+    expect(row!.issue_number).toBe(1);
+  });
+
+  it("未命中 ⇒ null", () => {
+    expect(storage.getSubmissionByDraftToolUseId("tu_never_existed")).toBeNull();
+  });
+
+  it("重复调用 recordIssueSubmission 传同一个 draft_tool_use_id ⇒ 返回第一行的 id，不抛错，不产生第二行", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const firstId = storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t1", body: "b1", labels: [], issueNumber: 1, issueUrl: "https://x/1",
+      draftToolUseId: "tu_retry",
+    });
+    const secondId = storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t2", body: "b2", labels: [], issueNumber: 999, issueUrl: "https://x/999",
+      draftToolUseId: "tu_retry",
+    });
+    expect(secondId).toBe(firstId);
+    expect(storage.getIssueSubmissionsForSession("s1")).toHaveLength(1);
+    // The FIRST row's data survives untouched — the retry never overwrote it.
+    expect(storage.getIssueSubmissionsForSession("s1")[0].issue_number).toBe(1);
+  });
+
+  it("draft_tool_use_id 为 null 的多行不会互相冲突（局部索引只约束非 null 值）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    expect(() => {
+      storage.recordIssueSubmission({
+        sessionId: "s1", repoId, userId: uid,
+        title: "t1", body: "b1", labels: [], issueNumber: 1, issueUrl: "https://x/1",
+      });
+      storage.recordIssueSubmission({
+        sessionId: "s1", repoId, userId: uid,
+        title: "t2", body: "b2", labels: [], issueNumber: 2, issueUrl: "https://x/2",
+      });
+    }).not.toThrow();
+    expect(storage.getIssueSubmissionsForSession("s1")).toHaveLength(2);
+  });
+});
+
+describe("getSubmissionForTracking / getSubmissionByIssue（2026-07-13，操作后单条 recheck 用的查询）", () => {
+  it("getSubmissionForTracking：按 id 查到已有 issue_number/issue_url 的行", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const subId = storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "t", body: "b", labels: [], issueNumber: 5, issueUrl: "https://x/5",
+    });
+    const row = storage.getSubmissionForTracking(subId);
+    expect(row).not.toBeNull();
+    expect(row!.issue_number).toBe(5);
+  });
+
+  it("getSubmissionForTracking：id 不存在 ⇒ null，不像 getTrackableSubmissions 那样受“是否到期”限制", () => {
+    expect(storage.getSubmissionForTracking(999999)).toBeNull();
+  });
+
+  it("getSubmissionByIssue：按 repo_id + issue_number 查到，多行时取最新的一行", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "old", body: "b", labels: [], issueNumber: 7, issueUrl: "https://x/7",
+    });
+    const newerId = storage.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: uid,
+      title: "new", body: "b", labels: [], issueNumber: 7, issueUrl: "https://x/7",
+    });
+    const row = storage.getSubmissionByIssue(repoId, 7);
+    expect(row!.id).toBe(newerId);
+  });
+
+  it("getSubmissionByIssue：没有匹配的 repo_id/issue_number 组合 ⇒ null", () => {
+    expect(storage.getSubmissionByIssue(999999, 1)).toBeNull();
+  });
+});
+
 describe("getTrackableSubmissions（v1 database.py:710 同语义：open/未知恒轮询，closed 每天至多查一次）", () => {
   function seedSubmission(issueNumber: number, issueUrl: string | null = `https://x/${issueNumber}`): number {
     const uid = storage.createUser(`u${issueNumber}`, "pw");

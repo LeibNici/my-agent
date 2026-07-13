@@ -593,6 +593,51 @@ describe("POST /api/chat — image attachments", () => {
   });
 });
 
+// ==================== req.linkedIssues (2026-07-13) ====================
+// Feeds turn.ts's per-turn "which issue(s) has this session already
+// touched" reminder — see buildLinkedIssueSummaries in sse.ts.
+
+describe("POST /api/chat — req.linkedIssues", () => {
+  it("session 已有一条 issue_submissions 记录 -> engine 收到的 req.linkedIssues 带上它的 repoId/issueNumber/status", async () => {
+    const { id: userId, token } = await seedUser("user", "linked-issue-user");
+    const repoId = await client.createRepo({ name: "demo", url: "https://example.com/demo.git" });
+    const sessionId = await client.createSession("New Chat", userId);
+    await client.recordIssueSubmission({
+      sessionId, repoId, userId,
+      title: "t", body: "b", labels: [], issueNumber: 42, issueUrl: "https://x/42",
+    });
+
+    let captured: unknown;
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: (async function* (_deps, req) {
+        captured = req.linkedIssues;
+        yield { type: "done", data: { text: "ok", success: true, budgetExhausted: false } };
+      }) as RunTurnFn,
+    });
+    await postChat(app, token, { message: "关闭它", session_id: sessionId });
+
+    expect(captured).toEqual([{ repoId, issueNumber: 42, issueUrl: "https://x/42", status: "submitted" }]);
+  });
+
+  it("session 没有任何 issue_submissions/issue_actions -> req.linkedIssues 是 undefined（不是空数组占位）", async () => {
+    const { token } = await seedUser("user", "no-linked-issue-user");
+    let captured: unknown = "not set";
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: (async function* (_deps, req) {
+        captured = req.linkedIssues;
+        yield { type: "done", data: { text: "ok", success: true, budgetExhausted: false } };
+      }) as RunTurnFn,
+    });
+    await postChat(app, token, { message: "普通问题，没有 issue" });
+
+    expect(captured).toBeUndefined();
+  });
+});
+
 // ==================== POST /api/auth/login ====================
 
 describe("POST /api/auth/login", () => {

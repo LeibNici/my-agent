@@ -5,6 +5,8 @@ venv/
 .venv/
 .env
 .jwt_secret
+.github_webhook_secret
+.gitlab_webhook_secret
 .ccg/
 deploy/auto-deploy.log
 engine/.git-sha

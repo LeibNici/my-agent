@@ -78,7 +78,7 @@ const ACCESS_LEVELS = new Set(["read", "write", "admin"]);
 // case (not case-folded — git hosts are commonly case-sensitive on the
 // path segment, only case-INsensitive on the host, and collapsing that
 // would risk conflating two genuinely different repos).
-function normalizeRepoUrl(url: string): string {
+export function normalizeRepoUrl(url: string): string {
   let u = url.trim().replace(/\/+$/, "");
   if (u.toLowerCase().endsWith(".git")) u = u.slice(0, -4);
   return u;

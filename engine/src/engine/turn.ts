@@ -90,6 +90,35 @@ function budgetReminder(nextIteration: number, maxIterations: number): string | 
   return null;
 }
 
+// QA-reported (2026-07-13): with sessions no longer force-resolved after an
+// issue-tracker action (see issue-routes.ts), a user can say "close it" or
+// "comment on it" without repeating the issue number — but only if the
+// model actually knows which issue(s) this session already touched. Fed in
+// per-turn (sse.ts queries issue_submissions/issue_actions for the current
+// session) rather than baked into the system prompt, since it's genuinely
+// per-conversation state, not a static instruction.
+export type LinkedIssueSummary = {
+  repoId: number | null;
+  issueNumber: number;
+  issueUrl: string | null;
+  status: string;
+};
+
+/** Deliberately no branching on `issues.length` — a single template covers
+ * 0 (never called, see call site), 1, or many entries; resolving which
+ * issue "it" refers to is left to the model's own reasoning over the list,
+ * per the user's explicit choice not to build a deterministic disambiguator. */
+function formatLinkedIssuesReminder(issues: LinkedIssueSummary[] | undefined): string | null {
+  if (!issues || issues.length === 0) return null;
+  const lines = issues.map((i) => `#${i.issueNumber}（状态: ${i.status}）${i.issueUrl ?? ""}`);
+  return (
+    "[系统提示] 本次会话已经提交/操作过以下 issue：\n" +
+    lines.join("\n") +
+    "\n如果用户接下来说“关闭它”“再评论一下”“重新打开”等未指明编号的请求，请根据以上列表判断具体指向" +
+    "哪一个 issue；如果这里有超过一个 issue 且无法从对话上下文确定具体指向哪个，先向用户确认，不要臆测。"
+  );
+}
+
 // ==================== Agent assembly (lifted from test/agent-harness.ts) ====================
 
 export type ModelSetup = { models: MutableModels; model: Model<"anthropic-messages">; streamFn: StreamFn };
@@ -311,6 +340,7 @@ export type RunTurnRequest = {
   history: unknown[];
   userText: string;
   images?: ImageBlock[];
+  linkedIssues?: LinkedIssueSummary[];
 };
 
 // The injectable shape of runTurn itself (Task 5's buildApp takes this as
@@ -336,6 +366,7 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
   // (checklist item 6) hold: nothing here can leak into the next call.
   let callsMade = 0;
   let budgetExhausted = false;
+  const issueContextText = formatLinkedIssuesReminder(req.linkedIssues);
 
   const agent = new Agent({
     initialState: {
@@ -356,9 +387,18 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
     transformContext: async (messages) => {
       const nextIteration = callsMade;
       callsMade += 1;
+      const extras: AgentMessage[] = [];
+      // Only on the first call of the turn — the model acts on it then (and
+      // its own subsequent tool calls carry that context forward within the
+      // same turn), so repeating it on every later call would just be noise.
+      if (nextIteration === 0 && issueContextText) {
+        extras.push({ role: "user", content: [{ type: "text", text: issueContextText }], timestamp: Date.now() });
+      }
       const reminder = budgetReminder(nextIteration, settings.maxToolIterations);
-      if (!reminder) return messages;
-      return [...messages, { role: "user", content: [{ type: "text", text: reminder }], timestamp: Date.now() }];
+      if (reminder) {
+        extras.push({ role: "user", content: [{ type: "text", text: reminder }], timestamp: Date.now() });
+      }
+      return extras.length > 0 ? [...messages, ...extras] : messages;
     },
     // Budget checkpoint 3 (exhaustion): once every call in the budget has
     // been made, stop the pi loop after this tool batch instead of starting

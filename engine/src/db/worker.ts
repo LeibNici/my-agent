@@ -197,6 +197,21 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.getIssueSubmissionsForSession(sessionId) });
         break;
       }
+      case "getSubmissionByDraftToolUseId": {
+        const [draftToolUseId] = args as [string];
+        reply({ id, ok: true, result: storage.getSubmissionByDraftToolUseId(draftToolUseId) });
+        break;
+      }
+      case "getSubmissionForTracking": {
+        const [submissionId] = args as [number];
+        reply({ id, ok: true, result: storage.getSubmissionForTracking(submissionId) });
+        break;
+      }
+      case "getSubmissionByIssue": {
+        const [repoId, issueNumber] = args as [number | null, number];
+        reply({ id, ok: true, result: storage.getSubmissionByIssue(repoId, issueNumber) });
+        break;
+      }
       case "getTrackableSubmissions": {
         reply({ id, ok: true, result: storage.getTrackableSubmissions() });
         break;

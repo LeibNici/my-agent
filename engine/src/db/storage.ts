@@ -448,6 +448,9 @@ export type Storage = {
   markSessionResolved(sessionId: string): void;
   recordIssueSubmission(fields: RecordIssueSubmissionFields): number;
   getIssueSubmissionsForSession(sessionId: string): IssueSubmissionRow[];
+  getSubmissionByDraftToolUseId(draftToolUseId: string): IssueSubmissionRow | null;
+  getSubmissionForTracking(id: number): TrackableSubmissionRow | null;
+  getSubmissionByIssue(repoId: number | null, issueNumber: number): TrackableSubmissionRow | null;
   getTrackableSubmissions(): TrackableSubmissionRow[];
   updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields): void;
   upsertFixReport(fields: UpsertFixReportFields): number;
@@ -1061,25 +1064,92 @@ export function openStorage(dbPath: string): Storage {
     // shows the draft card live, never whether/where it was actually filed.
     recordIssueSubmission(fields: RecordIssueSubmissionFields): number {
       const now = pyLocalIsoNow();
-      const res = db
+      try {
+        const res = db
+          .prepare(
+            "INSERT INTO issue_submissions " +
+              "(session_id, repo_id, user_id, title, body, labels, issue_number, issue_url, draft_tool_use_id, submitted_at) " +
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          )
+          .run(
+            fields.sessionId,
+            fields.repoId,
+            fields.userId,
+            fields.title,
+            fields.body,
+            pythonJsonDumps(fields.labels),
+            fields.issueNumber,
+            fields.issueUrl,
+            fields.draftToolUseId ?? null,
+            now
+          );
+        return Number(res.lastInsertRowid);
+      } catch (err) {
+        // Narrow backstop for the route-level idempotency check's own race
+        // window (two requests both pass "not yet submitted" before either
+        // INSERT lands) — same narrow-match style as createSession's
+        // PK-collision retry above, not a blanket SQLITE_CONSTRAINT* catch.
+        if (
+          err instanceof Database.SqliteError &&
+          err.code === "SQLITE_CONSTRAINT_UNIQUE" &&
+          fields.draftToolUseId
+        ) {
+          const existing = db
+            .prepare("SELECT id FROM issue_submissions WHERE draft_tool_use_id = ?")
+            .get(fields.draftToolUseId) as { id: number } | undefined;
+          if (existing) return existing.id;
+        }
+        throw err;
+      }
+    },
+
+    // Idempotency lookup for /api/issues/submit — draft_tool_use_id is
+    // stable per draft card, so a hit here means this exact draft was
+    // already filed; the route hands back the existing issue instead of
+    // calling the tracker again.
+    getSubmissionByDraftToolUseId(draftToolUseId: string): IssueSubmissionRow | null {
+      const row = db
         .prepare(
-          "INSERT INTO issue_submissions " +
-            "(session_id, repo_id, user_id, title, body, labels, issue_number, issue_url, draft_tool_use_id, submitted_at) " +
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          `SELECT id, repo_id, user_id, title, body, labels, issue_number, issue_url, draft_tool_use_id, submitted_at,
+                  COALESCE(track_status, 'submitted') as track_status, reopen_count
+           FROM issue_submissions WHERE draft_tool_use_id = ?`
         )
-        .run(
-          fields.sessionId,
-          fields.repoId,
-          fields.userId,
-          fields.title,
-          fields.body,
-          pythonJsonDumps(fields.labels),
-          fields.issueNumber,
-          fields.issueUrl,
-          fields.draftToolUseId ?? null,
-          now
-        );
-      return Number(res.lastInsertRowid);
+        .get(draftToolUseId) as (Omit<IssueSubmissionRow, "labels"> & { labels: string }) | undefined;
+      return row ? { ...row, labels: parseJsonArray(row.labels) } : null;
+    },
+
+    // On-demand single-submission recheck (right after the user's own
+    // submit/action) — same shape as getTrackableSubmissions but by id and
+    // with no "is it due yet" staleness filter, since an on-demand recheck
+    // always runs regardless of when it was last checked.
+    getSubmissionForTracking(id: number): TrackableSubmissionRow | null {
+      const row = db
+        .prepare(
+          `SELECT id, repo_id, issue_number, issue_url, track_status, remote_state,
+                  reopen_count, closed_at, last_checked_at
+           FROM issue_submissions
+           WHERE id = ? AND issue_number IS NOT NULL AND issue_url IS NOT NULL`
+        )
+        .get(id);
+      return (row as TrackableSubmissionRow) ?? null;
+    },
+
+    // manage_issue can act on an issue CodeAxis never itself filed, so
+    // "the issue this action just touched" isn't always the same row as
+    // "the submission this session filed" — look it up by repo+number
+    // instead. Most-recent row wins if somehow more than one exists.
+    getSubmissionByIssue(repoId: number | null, issueNumber: number): TrackableSubmissionRow | null {
+      const row = db
+        .prepare(
+          `SELECT id, repo_id, issue_number, issue_url, track_status, remote_state,
+                  reopen_count, closed_at, last_checked_at
+           FROM issue_submissions
+           WHERE repo_id ${repoId === null ? "IS NULL" : "= ?"} AND issue_number = ?
+             AND issue_number IS NOT NULL AND issue_url IS NOT NULL
+           ORDER BY id DESC LIMIT 1`
+        )
+        .get(...(repoId === null ? [issueNumber] : [repoId, issueNumber]));
+      return (row as TrackableSubmissionRow) ?? null;
     },
 
     // v1's get_issue_submissions_for_session (database.py:688) — used to

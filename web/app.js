@@ -465,6 +465,7 @@ async function openSession(sessionId) {
     });
 
     if (data.session && data.session.resolved_at) appendResolvedNotice();
+    renderLinkedIssuesBanner(data.issue_submissions);
 
     loadSessions(); // refresh active highlight
 }
@@ -1216,10 +1217,18 @@ async function submitIssueCardRequest(card, endpoint, buildBody, successLabel) {
 
         renderIssueStatusLink(statusEl, successLabel, result.issue_url, result.issue_number);
 
-        // Submitting closes out this thread's task server-side (resolved_at) —
-        // reflect that here so the user isn't surprised when their next
-        // message lands in a brand new session.
-        appendResolvedNotice();
+        // The session stays open (no more auto-resolve, QA-reported
+        // 2026-07-13) so the user can keep talking about this same issue —
+        // refresh the pinned banner instead of announcing "task complete".
+        // Re-fetching (rather than patching state in locally) also picks up
+        // whatever the server's own post-action recheck just wrote.
+        if (currentSessionId) {
+            const sessResp = await authFetch(`/api/sessions/${currentSessionId}`);
+            if (sessResp.ok) {
+                const sessData = await sessResp.json();
+                renderLinkedIssuesBanner(sessData.issue_submissions);
+            }
+        }
         loadSessions();
     } catch (err) {
         statusEl.textContent = `网络错误: ${escapeHtml(err.message)}`;
@@ -1236,6 +1245,41 @@ function appendResolvedNotice() {
     div.textContent = "✅ 本次任务已完结 — 发送新消息将开始一个新会话";
     messagesDiv.appendChild(div);
     scrollToBottom();
+}
+
+// Persistent "this conversation is about issue #N" strip — pinned at the
+// top of the message stream, not appended into it like the notices above
+// (this gets re-rendered every time the underlying data changes, so it
+// must replace itself in place rather than pile up duplicates). Sessions
+// are no longer force-resolved after an issue action (QA-reported,
+// 2026-07-13) specifically so a conversation CAN keep going across
+// submit → comment → close → reopen — this banner is what lets the user
+// see which issue(s) that now-longer-lived conversation is tracking
+// without scrolling back up to the original draft card. Reuses the same
+// MI_STATUS vocabulary/data shape "我的提报" already uses — no new status
+// enum invented here.
+function renderLinkedIssuesBanner(submissions) {
+    const messagesDiv = document.getElementById("messages");
+    const existing = document.getElementById("linked-issues-banner");
+    if (existing) existing.remove();
+
+    const withIssue = (submissions || []).filter(s => s.issue_number);
+    if (withIssue.length === 0) return;
+
+    const div = document.createElement("div");
+    div.id = "linked-issues-banner";
+    div.className = "linked-issues-banner";
+    withIssue.forEach(s => {
+        const row = document.createElement("div");
+        row.className = "linked-issue-row";
+        const st = MI_STATUS[s.track_status] || MI_STATUS.submitted;
+        row.innerHTML =
+            `<span class="linked-issue-dot" style="background:${st.color}"></span>` +
+            `<a href="${escapeHtml(s.issue_url || '#')}" target="_blank" rel="noopener">#${s.issue_number}</a>` +
+            `<span class="linked-issue-status" style="color:${st.color}">${escapeHtml(st.label)}</span>`;
+        div.appendChild(row);
+    });
+    messagesDiv.insertBefore(div, messagesDiv.firstChild);
 }
 
 // The turn ran out of tool-call budget and wrapped up with a checkpoint

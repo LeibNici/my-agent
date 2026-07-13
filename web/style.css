@@ -1213,6 +1213,44 @@ body {
     background: var(--ink-900);
 }
 
+/* Pinned at the top of the message stream (not appended into it) — which
+   issue(s) this conversation is tracking, now that a session stays open
+   across submit/comment/close/reopen instead of force-ending. wire (passive
+   status readout), not moss/amber — the per-issue dot/label carries the
+   actual status color from MI_STATUS. */
+.linked-issues-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0 auto 14px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    background: var(--wire-dim);
+    border: 1px solid var(--wire);
+    font-size: 13px;
+}
+.linked-issue-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.linked-issue-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.linked-issue-row a {
+    color: var(--paper);
+    font-family: var(--font-mono);
+    text-decoration: none;
+}
+.linked-issue-row a:hover { text-decoration: underline; }
+.linked-issue-status {
+    font-size: 12px;
+    margin-left: auto;
+}
+
 /* Shown once a thread's task is done — the next message starts fresh. */
 .session-resolved-notice {
     margin: 10px auto 14px;

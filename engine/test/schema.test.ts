@@ -210,6 +210,38 @@ describe("initSchema", () => {
     expect(indexNames).toContain("idx_issue_actions_session");
     expect(indexNames).toContain("idx_sessions_owner");
     expect(indexNames).toContain("idx_semantic_search_log_created");
+    expect(indexNames).toContain("idx_issue_submissions_draft_tool_use_id");
+    expect(indexNames).toContain("idx_issue_submissions_repo_issue");
+  });
+
+  it("idempotent-submit guard: draft_tool_use_id unique index actually rejects a second non-null duplicate at the raw SQL level; re-running initSchema on an already-migrated db doesn't error", () => {
+    initSchema(tmpDbPath);
+    // Idempotency of the CREATE UNIQUE INDEX IF NOT EXISTS statement itself
+    // (matches this file's own "schema is idempotent" test above, just
+    // pinned specifically to the new index rather than the whole schema).
+    expect(() => initSchema(tmpDbPath)).not.toThrow();
+
+    const db = new Database(tmpDbPath);
+    const insert = db.prepare(
+      "INSERT INTO issue_submissions " +
+        "(session_id, repo_id, user_id, title, body, labels, issue_number, issue_url, draft_tool_use_id, submitted_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    );
+    db.prepare("INSERT INTO sessions (id, title, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+      .run("s1", "t", null, "2026-01-01 00:00:00.000000", "2026-01-01 00:00:00.000000");
+    insert.run("s1", null, null, "t1", "b1", "[]", 1, "https://x/1", "tu_dup", "2026-01-01 00:00:00.000000");
+    expect(() =>
+      insert.run("s1", null, null, "t2", "b2", "[]", 2, "https://x/2", "tu_dup", "2026-01-01 00:00:00.000000")
+    ).toThrow(/UNIQUE constraint failed/);
+    // NULL draft_tool_use_id is explicitly exempted (WHERE draft_tool_use_id
+    // IS NOT NULL) — two rows with no draft id at all must NOT collide.
+    expect(() =>
+      insert.run("s1", null, null, "t3", "b3", "[]", 3, "https://x/3", null, "2026-01-01 00:00:00.000000")
+    ).not.toThrow();
+    expect(() =>
+      insert.run("s1", null, null, "t4", "b4", "[]", 4, "https://x/4", null, "2026-01-01 00:00:00.000000")
+    ).not.toThrow();
+    db.close();
   });
 
   it("BUG-003: retrofits must_change_password onto a pre-existing users table (a prior real deployment) via ALTER TABLE, without losing existing rows", () => {

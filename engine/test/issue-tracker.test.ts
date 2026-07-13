@@ -25,6 +25,7 @@ import type { IssueTrackingOverviewRow, FixReportRow } from "../src/db/storage.j
 import {
   deriveStatus,
   pollTrackedIssues,
+  pollSubmissionById,
   verifyPendingFixReports,
   periodicTrackingLoop,
   computeTrackingMetrics,
@@ -539,6 +540,128 @@ describe("pollTrackedIssues", () => {
     expect(raw2.track_status).toBe("submitted");
     expect(raw2.remote_state).toBe("opened");
     expect(raw2.reopen_count).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pollSubmissionById — the on-demand single-submission recheck
+// issue-routes.ts triggers right after a user's own submit/comment/close/
+// reopen (2026-07-13), instead of waiting for pollTrackedIssues' next
+// scheduled round. Reuses pollOne's exact same branch logic/host-guard/
+// deriveStatus internally — these tests exercise it directly by id rather
+// than through the bulk loop.
+// ---------------------------------------------------------------------------
+
+describe("pollSubmissionById", () => {
+  let dir: string, dbPath: string, client: DbClient;
+
+  beforeEach(() => {
+    const seeded = makeSeededDb();
+    dir = seeded.dir;
+    dbPath = seeded.dbPath;
+    client = createDbClient(seeded.dbPath);
+  });
+
+  afterEach(async () => {
+    await client.close();
+    rmSync(dir, { recursive: true, force: true });
+    vi.unstubAllGlobals();
+  });
+
+  it("GitHub 成功路径：单条记录被正确 recheck，落库 derived status/remote_state/labels", async () => {
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://github.com/acme/widgets.git",
+      credToken: "repo-own-github-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 42,
+      issueUrl: "https://github.com/acme/widgets/issues/42",
+    });
+
+    const fetchMock = vi.fn(async () => ({
+      status: 200,
+      json: async () => ({ state: "closed", labels: [], closed_at: "2026-07-13 10:00:00.000000" }),
+    })) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollSubmissionById(client, subId);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.track_status).toBe("closed");
+    expect(raw.remote_state).toBe("closed");
+  });
+
+  it("GitLab 成功路径：和 pollTrackedIssues 走同一套 GET+resource_state_events 逻辑", async () => {
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://gitlab.example.com/group/proj.git",
+      credToken: "tok",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 5,
+      issueUrl: "https://gitlab.example.com/group/proj/-/issues/5",
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/resource_state_events")) {
+        return { status: 200, json: async () => [] } as unknown as Response;
+      }
+      if (url.includes("/issues/5")) {
+        return { status: 200, json: async () => ({ state: "opened", labels: ["bug"], closed_at: null }) } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch url in test: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollSubmissionById(client, subId);
+
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.track_status).toBe("submitted");
+    expect(raw.remote_state).toBe("opened");
+    expect(JSON.parse(raw.remote_labels)).toEqual(["bug"]);
+  });
+
+  it("找不到对应记录（id 不存在，或没有 issue_number/issue_url）-> 安静 no-op，不发起任何 fetch，不抛错", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(pollSubmissionById(client, 999999)).resolves.toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("仓库已被删除 -> 写 track_error，和 pollTrackedIssues 的行为一致", async () => {
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId: 999999, // 不存在的仓库
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 1,
+      issueUrl: "https://gitlab.example.com/g/p/-/issues/1",
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollSubmissionById(client, subId);
+
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.track_error).toBe("关联仓库已被删除，无法追踪");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

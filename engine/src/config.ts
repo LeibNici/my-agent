@@ -25,6 +25,10 @@ export interface Settings {
   issueTrackIntervalMinutes: number;
   issueFixTargetBranch: string;
   corsOrigins: string;
+  // Populated from loadOrCreateGithubWebhookSecret/loadOrCreateGitlabWebhookSecret
+  // in main.ts (same pattern as jwtSecret) — not read from .env.
+  githubWebhookSecret: string;
+  gitlabWebhookSecret: string;
 
   // Embedding settings
   embeddingBaseUrl: string;
@@ -39,8 +43,13 @@ You have NO tool that edits, writes, or creates files — only read-only tools (
 
 If you have a draft_issue tool: draft at most ONE issue per confirmed problem per conversation. Once you've drafted an issue, that is your deliverable for this problem — do not draft a second, reworded issue for the same thing (e.g. because you couldn't also apply the code change). If you later realize the draft should change, say so in text and ask the user whether to redraft; never silently call draft_issue again as a way to conclude the turn.`;
 
-export function loadOrCreateJwtSecret(repoRoot: string): string {
-  const secretFile = path.join(repoRoot, ".jwt_secret");
+/** Atomic create-if-absent for a secret persisted as a plain file (0600) at
+ * the repo root — `.jwt_secret` was the original use; webhook secrets
+ * (2026-07-13) reuse the exact same "generate, exclusive-create, re-read on
+ * EEXIST" shape rather than duplicating it, since there's no meaningful
+ * difference beyond the filename. */
+function loadOrCreateSecretFile(repoRoot: string, filename: string): string {
+  const secretFile = path.join(repoRoot, filename);
   const secret = crypto.randomBytes(32).toString("hex");
 
   // Atomic create with exclusive flag; if it exists, re-read and return its contents
@@ -66,6 +75,23 @@ export function loadOrCreateJwtSecret(repoRoot: string): string {
     // Re-throw other errors (permission, disk full, etc.)
     throw err;
   }
+}
+
+export function loadOrCreateJwtSecret(repoRoot: string): string {
+  return loadOrCreateSecretFile(repoRoot, ".jwt_secret");
+}
+
+// Auto-generated, not read from .env — the operator's only job is to copy
+// the printed value into GitHub/GitLab's webhook config (Settings ->
+// Webhooks -> Secret), not to invent a secure secret themselves. One
+// shared secret per provider, not per-repo — see webhook-routes.ts's
+// module header for why that's an acceptable simplification here.
+export function loadOrCreateGithubWebhookSecret(repoRoot: string): string {
+  return loadOrCreateSecretFile(repoRoot, ".github_webhook_secret");
+}
+
+export function loadOrCreateGitlabWebhookSecret(repoRoot: string): string {
+  return loadOrCreateSecretFile(repoRoot, ".gitlab_webhook_secret");
 }
 
 export function loadSettings(env?: Record<string, string | undefined>): Settings {
@@ -112,6 +138,10 @@ export function loadSettings(env?: Record<string, string | undefined>): Settings
     // (non-ANTHROPIC_*) settings below.
     port: getEnvNum("APP_PORT", 8000),
     jwtSecret: getEnvStr("APP_JWT_SECRET", ""),
+    // Empty here by default — same "override via .env if set, else main.ts
+    // auto-generates and persists a file" pattern as jwtSecret above.
+    githubWebhookSecret: getEnvStr("APP_GITHUB_WEBHOOK_SECRET", ""),
+    gitlabWebhookSecret: getEnvStr("APP_GITLAB_WEBHOOK_SECRET", ""),
     tokenExpireHours: getEnvNum("APP_TOKEN_EXPIRE_HOURS", 24),
     adminUsername: getEnvStr("APP_ADMIN_USERNAME", "admin"),
     adminPassword: getEnvStr("APP_ADMIN_PASSWORD", "admin123"),

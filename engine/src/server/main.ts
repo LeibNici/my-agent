@@ -22,7 +22,13 @@ import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
 
-import { loadSettings, loadOrCreateJwtSecret, type Settings } from "../config.js";
+import {
+  loadSettings,
+  loadOrCreateJwtSecret,
+  loadOrCreateGithubWebhookSecret,
+  loadOrCreateGitlabWebhookSecret,
+  type Settings,
+} from "../config.js";
 import { initSchema } from "../db/schema.js";
 import { createDbClient, type DbClient } from "../db/client.js";
 import type { FullRepoRow } from "../db/storage.js";
@@ -148,6 +154,18 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   const settings = loadSettings(opts.env);
   if (!settings.jwtSecret) {
     settings.jwtSecret = loadOrCreateJwtSecret(REPO_ROOT);
+  }
+  // Webhook secrets: same override-or-generate pattern as jwtSecret above.
+  // Printed once at startup (not logged again on every request) so an
+  // operator can copy it straight into GitHub/GitLab's Settings -> Webhooks
+  // -> Secret field — this is the only place either value is ever surfaced.
+  if (!settings.githubWebhookSecret) {
+    settings.githubWebhookSecret = loadOrCreateGithubWebhookSecret(REPO_ROOT);
+    console.log(`GitHub webhook secret (Settings → Webhooks → Secret): ${settings.githubWebhookSecret}`);
+  }
+  if (!settings.gitlabWebhookSecret) {
+    settings.gitlabWebhookSecret = loadOrCreateGitlabWebhookSecret(REPO_ROOT);
+    console.log(`GitLab webhook secret (Settings → Webhooks → Secret Token): ${settings.gitlabWebhookSecret}`);
   }
 
   const dbPath = resolveDbPath(opts.env ?? process.env);

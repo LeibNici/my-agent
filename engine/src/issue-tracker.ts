@@ -263,7 +263,7 @@ async function pollGithub(sub: TrackableSubmissionRow, credToken: string | null,
   });
 }
 
-async function pollOne(
+export async function pollOne(
   sub: TrackableSubmissionRow,
   reposById: Map<number, FullRepoRow>,
   db: DbClient,
@@ -344,6 +344,25 @@ async function pollOne(
     closedAt,
     clearError: true,
   });
+}
+
+/** On-demand recheck of exactly ONE submission — called right after the
+ * user's own submit/comment/close/reopen (issue-routes.ts) so the UI
+ * reflects the just-made change without waiting for the next scheduled
+ * `pollTrackedIssues` round (default every 10 minutes). Reuses `pollOne`'s
+ * GitHub/GitLab branch logic, host-match guard, and `deriveStatus`
+ * verbatim — no separate recheck implementation to keep in sync. A no-op
+ * (not an error) if the submission has no issue_number/issue_url yet, or
+ * the row/repo has since been deleted. */
+export async function pollSubmissionById(db: DbClient, submissionId: number): Promise<void> {
+  const sub = await db.getSubmissionForTracking(submissionId);
+  if (!sub) return;
+  const reposById = new Map<number, FullRepoRow>();
+  if (sub.repo_id !== null) {
+    const repo = await db.getRepoAdmin(sub.repo_id);
+    if (repo) reposById.set(repo.id, repo);
+  }
+  await pollOne(sub, reposById, db);
 }
 
 /** One reconciliation round over every due submission. Returns how many

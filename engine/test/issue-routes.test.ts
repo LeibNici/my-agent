@@ -127,6 +127,22 @@ const isIssuesSearch = (url: string, init: RequestInit) =>
 const isIssueNote = (url: string, init: RequestInit) =>
   init.method === "POST" && /\/issues\/\d+\/notes$/.test(url);
 const isIssueState = (url: string, init: RequestInit) => init.method === "PUT" && /\/issues\/\d+$/.test(url);
+// The recheck path (pollOne, called via issue-routes.ts's post-action
+// bestEffortRecheck) does a plain GET on the issue, then unconditionally a
+// second GET for resource_state_events (reopen-count derivation) — both
+// need their own routes or the recheck 404s/throws internally (silently,
+// since bestEffortRecheck swallows the error — but then the row never
+// actually updates, which the recheck-specific tests below need to see).
+const isIssueGet = (url: string, init: RequestInit) =>
+  (!init.method || init.method === "GET") && /\/issues\/\d+$/.test(url);
+const isResourceStateEvents = (url: string, init: RequestInit) =>
+  (!init.method || init.method === "GET") && url.includes("/resource_state_events");
+// A "closed"/"merged"/"reopened" derived status makes pollOne ALSO fetch
+// existing notes (fetchAndStoreReports, looking for a codex-report/v1
+// marker) — a GET on the same /notes path issueNoteRoute's POST matcher
+// doesn't cover.
+const isNotesGet = (url: string, init: RequestInit) =>
+  (!init.method || init.method === "GET") && /\/issues\/\d+\/notes\?/.test(url);
 
 const LABELS_ROUTE: MockRoute = {
   when: isLabelsGet,
@@ -146,6 +162,13 @@ function issueStateRoute(status: number, body: unknown, text?: string): MockRout
 function issuesSearchRoute(status: number, body: unknown): MockRoute {
   return { when: isIssuesSearch, status, body };
 }
+function issueGetRoute(status: number, body: unknown): MockRoute {
+  return { when: isIssueGet, status, body };
+}
+// Empty page is enough — fetchGitlabStateEvents stops as soon as a page
+// comes back shorter than its 100-per-page size.
+const RESOURCE_STATE_EVENTS_ROUTE: MockRoute = { when: isResourceStateEvents, status: 200, body: [] };
+const NOTES_GET_ROUTE: MockRoute = { when: isNotesGet, status: 200, body: [] };
 
 // ==================== POST /api/issues/submit ====================
 
@@ -291,13 +314,15 @@ describe("POST /api/issues/submit", () => {
     expect((await resp.json()).detail).toContain("提交的仓库与草稿时确认的仓库不一致");
   });
 
-  it("successful submit (with session_id): {ok, issue_number, issue_url}; recorded row; session resolved", async () => {
+  it("successful submit (with session_id): {ok, issue_number, issue_url}; recorded row; session stays OPEN (QA-reported: used to force-resolve here)", async () => {
     const { id: userId, token } = await seedUser("admin", "submit-admin");
     const repoId = await seedRepo();
     const sessionId = await client.createSession("New Chat", userId);
     stubFetch([
       LABELS_ROUTE,
       issuesCreateRoute(201, { iid: 55, web_url: "https://gitlab.example.com/group/proj/-/issues/55", title: "Bug title" }),
+      issueGetRoute(200, { state: "opened", labels: ["bug"], closed_at: null }),
+      RESOURCE_STATE_EVENTS_ROUTE,
     ]);
     const app = buildTestApp();
     const resp = await authed(app, token, "/api/issues/submit", {
@@ -323,9 +348,92 @@ describe("POST /api/issues/submit", () => {
     });
     expect(rows[0].body).toContain("提报人");
     expect(rows[0].body).toContain("submit-admin");
+    // The on-demand recheck (bestEffortRecheck + pollSubmissionById) ran
+    // synchronously before the response — track_status/last_checked_at
+    // reflect it having actually completed, not just been kicked off.
+    expect(rows[0].track_status).toBe("submitted");
 
     const session = await client.getSession(sessionId);
-    expect(session!.resolved_at).not.toBeNull();
+    expect(session!.resolved_at).toBeNull();
+  });
+
+  it("idempotency: resubmitting the SAME draft_tool_use_id returns the existing issue, never calls the tracker a second time", async () => {
+    const { id: userId, token } = await seedUser("admin", "submit-idem");
+    const repoId = await seedRepo();
+    const sessionId = await client.createSession("New Chat", userId);
+    const fetchMock = stubFetch([
+      LABELS_ROUTE,
+      issuesCreateRoute(201, { iid: 61, web_url: "https://gitlab.example.com/group/proj/-/issues/61", title: "Bug title" }),
+      issueGetRoute(200, { state: "opened", labels: [], closed_at: null }),
+      RESOURCE_STATE_EVENTS_ROUTE,
+    ]);
+    const app = buildTestApp();
+    const body = {
+      repo_id: repoId,
+      title: "Bug title",
+      body: "Bug body",
+      session_id: sessionId,
+      draft_tool_use_id: "tu_dup_1",
+    };
+
+    const first = await authed(app, token, "/api/issues/submit", { method: "POST", body: JSON.stringify(body) });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({
+      ok: true,
+      issue_number: 61,
+      issue_url: "https://gitlab.example.com/group/proj/-/issues/61",
+    });
+    const createCallsAfterFirst = fetchMock.mock.calls.filter(([url, init]) => isIssuesCreate(url as string, (init ?? {}) as RequestInit)).length;
+    expect(createCallsAfterFirst).toBe(1);
+
+    const second = await authed(app, token, "/api/issues/submit", { method: "POST", body: JSON.stringify(body) });
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({
+      ok: true,
+      issue_number: 61,
+      issue_url: "https://gitlab.example.com/group/proj/-/issues/61",
+      already_submitted: true,
+    });
+    // Still exactly one — the retry never reached submitRepoIssue at all.
+    const createCallsAfterSecond = fetchMock.mock.calls.filter(([url, init]) => isIssuesCreate(url as string, (init ?? {}) as RequestInit)).length;
+    expect(createCallsAfterSecond).toBe(1);
+
+    const rows = await client.getIssueSubmissionsForSession(sessionId);
+    expect(rows).toHaveLength(1); // no duplicate row either
+  });
+
+  it("session stays open across a full issue lifecycle: submit → comment → close → reopen, all against the SAME session_id, resolved_at null throughout", async () => {
+    const { id: userId, token } = await seedUser("admin", "lifecycle-admin");
+    const repoId = await seedRepo();
+    const sessionId = await client.createSession("New Chat", userId);
+    stubFetch([
+      LABELS_ROUTE,
+      issuesCreateRoute(201, { iid: 88, web_url: "https://gitlab.example.com/group/proj/-/issues/88", title: "T" }),
+      issueGetRoute(200, { state: "opened", labels: [], closed_at: null }),
+      RESOURCE_STATE_EVENTS_ROUTE,
+      issueNoteRoute(201),
+      issueStateRoute(200, { iid: 88, web_url: "https://gitlab.example.com/group/proj/-/issues/88", title: "T" }),
+    ]);
+    const app = buildTestApp();
+
+    const submit = await authed(app, token, "/api/issues/submit", {
+      method: "POST",
+      body: JSON.stringify({ repo_id: repoId, title: "T", body: "B", session_id: sessionId }),
+    });
+    expect(submit.status).toBe(200);
+    expect((await client.getSession(sessionId))!.resolved_at).toBeNull();
+
+    for (const action of ["comment", "close", "reopen"] as const) {
+      const resp = await authed(app, token, "/api/issues/action", {
+        method: "POST",
+        body: JSON.stringify({ action, repo_id: repoId, issue_number: 88, comment: `doing ${action}`, session_id: sessionId }),
+      });
+      expect(resp.status).toBe(200);
+      expect((await client.getSession(sessionId))!.resolved_at).toBeNull();
+    }
+
+    const actions = await client.getIssueActionsForSession(sessionId);
+    expect(actions.map((a) => a.action)).toEqual(["comment", "close", "reopen"]);
   });
 
   it("successful submit (no session_id): submission still succeeds, but nothing is recorded/resolved", async () => {
@@ -535,7 +643,7 @@ describe("POST /api/issues/action", () => {
     expect((await resp.json()).detail).toContain("提交的仓库与草稿时确认的仓库不一致");
   });
 
-  it("successful action (close): {ok, issue_number, issue_url}; recorded row; session resolved", async () => {
+  it("successful action (close): {ok, issue_number, issue_url}; recorded row; session stays OPEN (QA-reported: used to force-resolve here)", async () => {
     const { id: userId, token } = await seedUser("admin", "action-admin");
     const repoId = await seedRepo();
     const sessionId = await client.createSession("New Chat", userId);
@@ -573,7 +681,47 @@ describe("POST /api/issues/action", () => {
     });
 
     const session = await client.getSession(sessionId);
-    expect(session!.resolved_at).not.toBeNull();
+    expect(session!.resolved_at).toBeNull();
+    // No prior submission for repo+issue 9 in this test — getSubmissionByIssue
+    // finds nothing, so the post-action recheck is skipped entirely (no
+    // extra fetch calls beyond the note+state routes already stubbed above).
+  });
+
+  it("recheck fires when the acted-on issue DOES have a matching submission, and updates its tracker state", async () => {
+    const { id: userId, token } = await seedUser("admin", "action-recheck");
+    const repoId = await seedRepo();
+    const sessionId = await client.createSession("New Chat", userId);
+    // Seed a prior submission for repo+issue 9 (a real submit isn't needed —
+    // recordIssueSubmission directly, matching this file's existing style
+    // for tests that only care about a pre-existing row).
+    await client.recordIssueSubmission({
+      sessionId,
+      repoId,
+      userId,
+      title: "T",
+      body: "B",
+      labels: [],
+      issueNumber: 9,
+      issueUrl: "https://gitlab.example.com/group/proj/-/issues/9",
+    });
+
+    stubFetch([
+      issueNoteRoute(201),
+      issueStateRoute(200, { iid: 9, web_url: "https://gitlab.example.com/group/proj/-/issues/9", title: "T" }),
+      issueGetRoute(200, { state: "closed", labels: [], closed_at: "2026-07-13 12:00:00.000000" }),
+      RESOURCE_STATE_EVENTS_ROUTE,
+      NOTES_GET_ROUTE, // derived status "closed" -> pollOne also fetches notes looking for a codex-report marker
+    ]);
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/issues/action", {
+      method: "POST",
+      body: JSON.stringify({ action: "close", repo_id: repoId, issue_number: 9, comment: "Closing", session_id: sessionId }),
+    });
+    expect(resp.status).toBe(200);
+
+    const rows = await client.getIssueSubmissionsForSession(sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].track_status).toBe("closed");
   });
 
   it("tracker returns a non-201 error shape on the note call -> 502; PUT never reached; nothing recorded", async () => {
