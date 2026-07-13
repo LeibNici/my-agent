@@ -118,7 +118,19 @@ export function buildModelSetup(
         provider: PROVIDER_ID,
         baseUrl: settings.baseUrl,
         reasoning: false,
-        input: ["text"],
+        // QA-reported (2026-07-13): "text" only made pi-ai silently replace
+        // every uploaded image with "(image omitted: model does not
+        // support images)" — a stale/incorrect local capability
+        // declaration, not a real DashScope limitation. Verified against
+        // Alibaba's own docs (Model Studio's Anthropic-compatible Messages
+        // API page has a dedicated "Image Understanding" section using
+        // qwen3.7-plus itself as the example model) — the naming
+        // assumption "qwen-plus family is text-only, only qwen-vl-* sees
+        // images" stopped holding as of this model generation, which folds
+        // vision into the main "-plus" line instead of a separate -vl-
+        // variant. pi-ai gates purely on this array (model.input.includes
+        // ("image")) in transform-messages.js — nothing else to change.
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: settings.maxTokens,

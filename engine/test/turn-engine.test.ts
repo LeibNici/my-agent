@@ -11,7 +11,7 @@
 import { describe, it, expect } from "vitest";
 import { loadSettings, type Settings } from "../src/config.js";
 import { calculatorTool } from "../src/tools/calculator.js";
-import { runTurn } from "../src/engine/turn.js";
+import { runTurn, buildModelSetup } from "../src/engine/turn.js";
 import { startMock, textTurn, toolTurn, textThenToolTurn, type MockServer, type SseEvent } from "./mock-anthropic.js";
 import type { DomainEvent } from "../src/domain.js";
 import type { ToolContext } from "../src/tools/registry.js";
@@ -43,6 +43,14 @@ function exhaustingTurns() {
   turns.push(textTurn("阶段性汇报"));
   return turns;
 }
+
+describe("buildModelSetup", () => {
+  it("declares image input support (QA-reported: stale \"text\"-only declaration made pi-ai silently drop every uploaded image — verified live against DashScope that qwen3.7-plus genuinely understands images via the Anthropic-compatible endpoint)", () => {
+    const { model } = buildModelSetup(testSettings());
+    expect(model.input).toContain("image");
+    expect(model.input).toContain("text");
+  });
+});
 
 describe("runTurn — turn engine (Task 4)", () => {
   it("1. 纯文本回合：text_delta* → llm_metrics → done{success:true}（Phase-1 golden 复用）", async () => {
