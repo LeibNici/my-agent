@@ -60,6 +60,7 @@ async function loadUsers() {
             <td>
                 <button class="btn btn-sm btn-primary" onclick="resetPwd(${u.id})">重置密码</button>
                 ${u.role !== 'admin' ? `<button class="btn btn-sm btn-danger" onclick="toggleUser(${u.id}, ${u.is_active})">${u.is_active ? '停用' : '启用'}</button>` : ''}
+                ${u.role !== 'admin' ? `<button class="btn btn-sm btn-danger" onclick="deleteUser(${u.id}, this)">删除</button>` : ''}
             </td>
         </tr>
     `).join("");
@@ -99,6 +100,23 @@ async function toggleUser(userId, currentActive) {
         body: JSON.stringify({ is_active: !currentActive }),
     });
     showMsg(!currentActive ? "用户已启用" : "用户已停用");
+    loadUsers();
+}
+
+// `btn` (not the username as a template-literal argument) sidesteps quoting
+// a username into an inline onclick string — reading it back from the
+// row's own cell is safe regardless of what characters it contains.
+async function deleteUser(userId, btn) {
+    const username = btn.closest("tr").querySelector("td:nth-child(2)").textContent;
+    const ok = await confirmDialog({
+        title: "删除用户",
+        message: `确定删除用户 ${username}？此操作不可恢复：该用户的仓库权限会被一并移除，但已产生的会话/用量记录会保留。`,
+        confirmLabel: "删除", danger: true,
+    });
+    if (!ok) return;
+    const { ok: reqOk, data } = await apiRequest(`/api/admin/users/${userId}`, { method: "DELETE" });
+    if (!reqOk) return showMsg(data.detail || "删除失败", false);
+    showMsg("用户已删除");
     loadUsers();
 }
 
