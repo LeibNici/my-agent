@@ -268,6 +268,19 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     const usernameChanged = credUsername !== undefined && credUsername !== (repo.cred_username ?? "");
     const tokenChanged = credToken !== undefined && credToken !== (repo.cred_token ?? "");
 
+    // BUG-001 follow-up (QA report, 2026-07-13): POST's duplicate-URL check
+    // only ever guarded creation — retargeting an EXISTING repo's url via
+    // PATCH to match another repo's url bypassed it entirely (create A,
+    // create B, then PATCH B's url to A's). Same normalizeRepoUrl rule,
+    // just scoped to exclude this repo's own (about-to-be-replaced) row.
+    if (urlChanged) {
+      const normalizedNewUrl = normalizeRepoUrl(url);
+      const otherRepos = (await deps.db.listRepos()).filter((r) => r.id !== repoId);
+      if (otherRepos.some((r) => normalizeRepoUrl(r.url) === normalizedNewUrl)) {
+        return c.json({ detail: "A repository with this URL already exists" }, 409);
+      }
+    }
+
     if (urlChanged || branchChanged || usernameChanged || tokenChanged) {
       const result = await sync(deps.db, {
         repoId,

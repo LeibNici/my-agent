@@ -400,6 +400,53 @@ describe("repos", () => {
     expect(row!.last_sync_status).toBe("error");
   });
 
+  it("PATCH url 改成另一仓库的 URL → 409，不触发 sync，不绕过 BUG-001（QA follow-up）", async () => {
+    const { token } = await seedUser("admin");
+    const urlA = "https://example.com/repo-a.git";
+    await client.createRepo({ name: "a", url: urlA });
+    const repoB = await client.createRepo({ name: "b", url: "https://example.com/repo-b.git" });
+    let syncCalls = 0;
+    const spySync: SyncAndPersistFn = async (db, opts, onSyncSuccess) => {
+      syncCalls++;
+      return __internal.syncAndPersistUnvalidated(db, opts, onSyncSuccess);
+    };
+    const app = buildTestApp({ syncAndPersist: spySync });
+    const resp = await authed(app, token, `/api/admin/repos/${repoB}`, {
+      method: "PATCH",
+      body: JSON.stringify({ url: urlA }),
+    });
+    expect(resp.status).toBe(409);
+    expect(await resp.json()).toEqual({ detail: "A repository with this URL already exists" });
+    expect(syncCalls).toBe(0);
+    const row = await client.getRepoAdmin(repoB);
+    expect(row!.url).toBe("https://example.com/repo-b.git");
+  });
+
+  it("PATCH url 只差末尾斜杠命中另一仓库 → 仍判定重复 → 409", async () => {
+    const { token } = await seedUser("admin");
+    const urlA = "https://example.com/repo-slash.git";
+    await client.createRepo({ name: "a", url: urlA });
+    const repoB = await client.createRepo({ name: "b", url: "https://example.com/repo-slash-b.git" });
+    const app = buildTestApp();
+    const resp = await authed(app, token, `/api/admin/repos/${repoB}`, {
+      method: "PATCH",
+      body: JSON.stringify({ url: `${urlA}/` }),
+    });
+    expect(resp.status).toBe(409);
+  });
+
+  it("PATCH url 改回自己原来的值（未变化）→ 不触发重复检查", async () => {
+    const { token } = await seedUser("admin");
+    const url = "https://example.com/repo-self.git";
+    const repoId = await client.createRepo({ name: "r1", url });
+    const app = buildTestApp();
+    const resp = await authed(app, token, `/api/admin/repos/${repoId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ url, name: "renamed" }),
+    });
+    expect(resp.status).toBe(200);
+  });
+
   it("DELETE removes a repo", async () => {
     const { token } = await seedUser("admin");
     const repoId = await client.createRepo({ name: "r1", url: "https://example.com/r1.git" });
