@@ -157,7 +157,15 @@ function _mountModal(overlay, resolve, resultForKey) {
     overlay.addEventListener("click", (e) => {
         if (e.target === overlay) finish(resultForKey({ key: "Escape" }));
     });
-    document.addEventListener("keydown", onKeydown);
+    // Deferred, not attached synchronously: a modal opened from inside a
+    // keydown handler (e.g. sendMessage's Enter-to-send guard) is still
+    // mid-bubble on the SAME keypress when this function runs — an
+    // immediately-attached document listener would catch that same
+    // in-flight Enter and instantly self-close the modal before it's ever
+    // visible (confirmed: this silently ate the workspace-selection guard
+    // in testing). Adding it after the current dispatch finishes means it
+    // only ever sees genuinely NEW keypresses.
+    setTimeout(() => document.addEventListener("keydown", onKeydown), 0);
     return finish;
 }
 

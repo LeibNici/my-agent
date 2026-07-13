@@ -118,6 +118,11 @@ async function deleteUser(userId, btn) {
     if (!reqOk) return showMsg(data.detail || "删除失败", false);
     showMsg("用户已删除");
     loadUsers();
+    // The backend cascades the user's permission rows on delete (see
+    // schema's ON DELETE CASCADE) — refresh the permissions tab's own
+    // cached list too, or switching there right after shows the now-stale
+    // rows until a manual reload (QA-reported: NEW-001).
+    loadPerms();
 }
 
 // ===== Repos =====

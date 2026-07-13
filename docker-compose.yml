@@ -8,6 +8,14 @@ services:
       - "18082:8000"
     environment:
       APP_REPOS_DIR: /data/repos
+      # DB timestamps are "local-naive" (py-compat.ts's pyLocalIsoNow — a
+      # deliberate v1-compat convention, no UTC/offset marker at all) — they
+      # record whatever the OS clock says. Base images default to UTC, so
+      # without this every timestamp in the admin UI read ~8h behind real
+      # Shanghai time (QA-reported: NEW-003). Fixing at the OS-clock layer
+      # keeps the naive-timestamp convention intact instead of changing the
+      # storage format or attempting to guess/convert timezone at display time.
+      TZ: Asia/Shanghai
     volumes:
       # File-bind-mounts — the host-side file must already exist (Docker
       # creates a directory instead of erroring if it doesn't), see the

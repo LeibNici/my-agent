@@ -230,11 +230,12 @@ async function loadRepos() {
     const repos = await resp.json();
     reposCache = repos;
     const container = document.getElementById("repos-list");
+    updateSendAvailability();
     if (!container) return;
     container.innerHTML = "";
 
     if (repos.length === 0) {
-        container.innerHTML = '<p style="font-size:12px;color:var(--text-secondary);padding:4px 0;">暂无可访问的仓库</p>';
+        container.innerHTML = '<p style="font-size:12px;color:var(--text-secondary);padding:4px 0;">暂无可访问的仓库，请联系管理员分配权限</p>';
         return;
     }
 
@@ -247,6 +248,16 @@ async function loadRepos() {
         chip.onclick = () => selectRepo(chip, r.id);
         container.appendChild(chip);
     });
+
+    // Exactly one visible repo -> no real choice to make, auto-select it
+    // (matches access.ts's own getActiveRepo single-repo default on the
+    // backend, so draft_issue/manage_issue never see a "多个仓库未选择"
+    // mismatch against what the user actually sees selected here).
+    if (repos.length === 1) {
+        selectedRepoId = repos[0].id;
+        container.querySelector(".repo-chip").classList.add("active");
+    }
+    updateSendAvailability();
 }
 
 function selectRepo(chip, repoId) {
@@ -257,6 +268,32 @@ function selectRepo(chip, repoId) {
     } else {
         selectedRepoId = repoId;
         chip.classList.add("active");
+    }
+    updateSendAvailability();
+}
+
+// UX-001 (QA-reported): sending with no workspace selected while the user
+// has 2+ visible repos let every tool call search/read across ALL of them
+// per turn — technically correct (see access.ts's getAllowedPaths) but
+// wastes retrieval budget and makes draft_issue's target repo ambiguous.
+// Only gates the SEND action; browsing/reading elsewhere in the UI is
+// unaffected.
+function updateSendAvailability() {
+    const sendBtn = document.getElementById("send-btn");
+    const input = document.getElementById("message-input");
+    if (!sendBtn || !input) return;
+    if (reposCache.length === 0) {
+        sendBtn.disabled = true;
+        input.disabled = true;
+        input.placeholder = "暂无可访问的仓库，请联系管理员分配权限";
+    } else if (reposCache.length > 1 && !selectedRepoId) {
+        sendBtn.disabled = true;
+        input.disabled = false;
+        input.placeholder = "请先在左侧选择一个 Workspace，以确定代码检索和 Issue 操作的目标仓库";
+    } else {
+        sendBtn.disabled = false;
+        input.disabled = false;
+        input.placeholder = "描述问题，或直接粘贴系统截图…";
     }
 }
 async function loadSkills() {
@@ -490,6 +527,14 @@ async function sendMessage() {
     const input = document.getElementById("message-input");
     const text = input.value.trim();
     if ((!text && pendingImages.length === 0) || isStreaming) return;
+
+    // Enter-to-send bypasses the disabled send-btn state (the input field
+    // itself stays enabled so the user can still type while nudged to pick
+    // a workspace) — re-check here so Enter can't slip past it.
+    if (reposCache.length > 1 && !selectedRepoId) {
+        await alertDialog({ title: "请先选择 Workspace", message: "你有多个可访问的仓库，请先在左侧选择一个 Workspace，以确定代码检索和 Issue 操作的目标仓库。" });
+        return;
+    }
 
     // Validate message size
     if (text.length > 10000) {
