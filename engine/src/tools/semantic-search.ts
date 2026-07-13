@@ -245,8 +245,21 @@ async function runSemanticSearch(
     return zeroHitsMessage(input.query);
   }
 
+  // QA-reported (2026-07-13): joining repoId onto path with "/" reads as a
+  // single reconstructable path — `file_reader`/`code_search` both expect
+  // a bare relative path (resolvePath's own comment: "as returned by
+  // code_search, which strips the repo prefix"), so the model was passing
+  // this whole "repoId/path" string straight to file_reader and getting a
+  // not-found. Confirmed as a v1-inherited format (semantic_index.py:405
+  // did the exact same join), not a v2 regression — fixing it here rather
+  // than perpetuating it. The repo tag is disambiguation info for when a
+  // user has more than one granted repo; keep it, but bracket it OUTSIDE
+  // the path instead of concatenating, and only show it when it's actually
+  // needed (a single granted repo has no ambiguity to disambiguate).
   const lines = topHits.map((h) => {
-    const base = `${h.score.toFixed(3)}  ${h.repoId}/${h.path}:${h.start}-${h.end}`;
+    const loc = `${h.path}:${h.start}-${h.end}`;
+    const repoTag = allowedPaths.length > 1 ? ` [repo ${h.repoId}]` : "";
+    const base = `${h.score.toFixed(3)}  ${loc}${repoTag}`;
     return h.name ? `${base} (${h.name})` : base;
   });
   return (
