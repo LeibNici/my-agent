@@ -12,6 +12,8 @@ import type {
   PermissionRow,
   RecordSemanticSearchLogRow,
   RecordIssueSubmissionFields,
+  ClaimDraftSubmissionFields,
+  ClaimDraftSubmissionResult,
   IssueSubmissionRow,
   TrackableSubmissionRow,
   UpdateIssueTrackingFields,
@@ -70,6 +72,9 @@ export type DbClient = {
   recordSemanticSearchLog(row: RecordSemanticSearchLogRow): Promise<void>;
   markSessionResolved(sessionId: string): Promise<void>;
   recordIssueSubmission(fields: RecordIssueSubmissionFields): Promise<number>;
+  claimDraftSubmission(fields: ClaimDraftSubmissionFields): Promise<ClaimDraftSubmissionResult>;
+  finalizeIssueSubmission(id: number, issueNumber: number, issueUrl: string | null): Promise<void>;
+  releaseDraftSubmission(id: number): Promise<void>;
   getIssueSubmissionsForSession(sessionId: string): Promise<IssueSubmissionRow[]>;
   getSubmissionByDraftToolUseId(draftToolUseId: string): Promise<IssueSubmissionRow | null>;
   getSubmissionForTracking(id: number): Promise<TrackableSubmissionRow | null>;
@@ -224,6 +229,10 @@ export function createDbClient(dbPath: string): DbClient {
     recordSemanticSearchLog: (row) => call<void>("recordSemanticSearchLog", [row]),
     markSessionResolved: (sessionId) => call<void>("markSessionResolved", [sessionId]),
     recordIssueSubmission: (fields) => call<number>("recordIssueSubmission", [fields]),
+    claimDraftSubmission: (fields) => call<ClaimDraftSubmissionResult>("claimDraftSubmission", [fields]),
+    finalizeIssueSubmission: (id, issueNumber, issueUrl) =>
+      call<void>("finalizeIssueSubmission", [id, issueNumber, issueUrl]),
+    releaseDraftSubmission: (id) => call<void>("releaseDraftSubmission", [id]),
     getIssueSubmissionsForSession: (sessionId) =>
       call<IssueSubmissionRow[]>("getIssueSubmissionsForSession", [sessionId]),
     getSubmissionByDraftToolUseId: (draftToolUseId) =>

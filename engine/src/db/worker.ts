@@ -192,6 +192,23 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.recordIssueSubmission(fields) });
         break;
       }
+      case "claimDraftSubmission": {
+        const [fields] = args as [Parameters<typeof storage.claimDraftSubmission>[0]];
+        reply({ id, ok: true, result: storage.claimDraftSubmission(fields) });
+        break;
+      }
+      case "finalizeIssueSubmission": {
+        const [submissionId, issueNumber, issueUrl] = args as [number, number, string | null];
+        storage.finalizeIssueSubmission(submissionId, issueNumber, issueUrl);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "releaseDraftSubmission": {
+        const [submissionId] = args as [number];
+        storage.releaseDraftSubmission(submissionId);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
       case "getIssueSubmissionsForSession": {
         const [sessionId] = args as [string];
         reply({ id, ok: true, result: storage.getIssueSubmissionsForSession(sessionId) });

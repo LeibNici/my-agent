@@ -642,6 +642,87 @@ describe("getSubmissionByDraftToolUseId / recordIssueSubmission 幂等化（2026
   });
 });
 
+describe("claimDraftSubmission / finalizeIssueSubmission / releaseDraftSubmission（2026-07-14，幂等提交的结构性修复）", () => {
+  it("首次 claim 成功，行存在但 issue_number 为 null", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_1",
+    });
+    expect(claim.claimed).toBe(true);
+    if (!claim.claimed) throw new Error("unreachable");
+    const row = storage.getSubmissionByDraftToolUseId("tu_claim_1");
+    expect(row).not.toBeNull();
+    expect(row!.id).toBe(claim.id);
+    expect(row!.issue_number).toBeNull();
+  });
+
+  it("同一 draft_tool_use_id 第二次 claim ⇒ claimed:false，返回已存在的行（这是原子去重的关键点）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const first = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_2",
+    });
+    expect(first.claimed).toBe(true);
+    const second = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t-different", body: "b-different", labels: [], draftToolUseId: "tu_claim_2",
+    });
+    expect(second.claimed).toBe(false);
+    if (second.claimed) throw new Error("unreachable");
+    expect(second.existing.id).toBe((first as { claimed: true; id: number }).id);
+    // Still exactly one row — the second call never inserted anything.
+    expect(storage.getIssueSubmissionsForSession("s1")).toHaveLength(1);
+  });
+
+  it("finalizeIssueSubmission 之后，第二次 claim 返回的已存在行带着真实 issue_number", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_3",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+    storage.finalizeIssueSubmission(claim.id, 77, "https://x/77");
+
+    const second = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_3",
+    });
+    expect(second.claimed).toBe(false);
+    if (second.claimed) throw new Error("unreachable");
+    expect(second.existing.issue_number).toBe(77);
+    expect(second.existing.issue_url).toBe("https://x/77");
+  });
+
+  it("releaseDraftSubmission 之后，同一 draft_tool_use_id 可以重新 claim（追踪器调用失败后的重试路径）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_4",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+    storage.releaseDraftSubmission(claim.id);
+    expect(storage.getSubmissionByDraftToolUseId("tu_claim_4")).toBeNull();
+
+    const retry = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_4",
+    });
+    expect(retry.claimed).toBe(true);
+  });
+
+  it("releaseDraftSubmission 不会删除已经 finalize 过的行（守卫 issue_number IS NULL）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_5",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+    storage.finalizeIssueSubmission(claim.id, 88, "https://x/88");
+    storage.releaseDraftSubmission(claim.id); // must be a no-op now
+    const row = storage.getSubmissionByDraftToolUseId("tu_claim_5");
+    expect(row).not.toBeNull();
+    expect(row!.issue_number).toBe(88);
+  });
+});
+
 describe("getSubmissionForTracking / getSubmissionByIssue（2026-07-13，操作后单条 recheck 用的查询）", () => {
   it("getSubmissionForTracking：按 id 查到已有 issue_number/issue_url 的行", () => {
     const uid = storage.createUser("alice", "hashed-pw", "user");

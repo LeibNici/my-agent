@@ -191,28 +191,6 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     const draftResp = await verifyDraftRepoId(c, deps.db, sessionId, draftToolUseId, body.repo_id);
     if (draftResp) return draftResp;
 
-    // Idempotency: a retried request (network blip, double-click after the
-    // confirm button re-enables on error) must not re-file the same draft
-    // as a second real GitHub/GitLab issue. draft_tool_use_id is stable per
-    // draft card, so a prior successful submit under the same id means this
-    // is a replay — hand back the issue that already exists instead of
-    // calling the tracker again. Narrow window not covered: two requests
-    // racing through this check before either's INSERT lands (see
-    // recordIssueSubmission's own UNIQUE-constraint backstop) — that can
-    // still fire submitRepoIssue twice upstream even though our own
-    // bookkeeping never records a duplicate row.
-    if (draftToolUseId) {
-      const existing = await deps.db.getSubmissionByDraftToolUseId(draftToolUseId);
-      if (existing) {
-        return c.json({
-          ok: true,
-          issue_number: existing.issue_number,
-          issue_url: existing.issue_url,
-          already_submitted: true,
-        });
-      }
-    }
-
     // Backstop for the draft-time validation in draft_issue: the client
     // sends back the card's labels verbatim, so re-filter against the
     // tracker's vocabulary here too — unknown labels are dropped, never
@@ -246,21 +224,76 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
       `${expectedSection}${body.body}${screenshotsSection}\n\n---\n\n` +
       `**提报人**: ${user.username}（经内部代码助手确认后提交）`;
 
+    // Idempotency (QA-reported 2026-07-14, structural fix): claim the draft
+    // BEFORE ever calling the tracker, not after. The earlier version did
+    // "check getSubmissionByDraftToolUseId, THEN submitRepoIssue, THEN
+    // recordIssueSubmission" — a real double-click sent two requests through
+    // that check before either's INSERT landed, and both went on to file a
+    // real GitHub/GitLab issue even though local bookkeeping never showed a
+    // duplicate row. This INSERT (claimDraftSubmission, via the unique index
+    // on draft_tool_use_id) is now the single atomic decision point: only
+    // one caller can ever win it and proceed to actually file the issue.
+    // Only meaningful when there's a stable draftToolUseId to dedupe against
+    // AND a session to attribute the claim row to (session_id is NOT NULL
+    // in the schema) — the no-draft-id legacy path has no key to dedupe on
+    // and falls through to the direct recordIssueSubmission below, same as
+    // before.
+    let claimedId: number | null = null;
+    if (sessionId && draftToolUseId) {
+      const claim = await deps.db.claimDraftSubmission({
+        sessionId,
+        repoId: body.repo_id,
+        userId: user.id,
+        title: body.title,
+        body: fullBody,
+        labels,
+        draftToolUseId,
+      });
+      if (!claim.claimed) {
+        if (claim.existing.issue_number !== null) {
+          return c.json({
+            ok: true,
+            issue_number: claim.existing.issue_number,
+            issue_url: claim.existing.issue_url,
+            already_submitted: true,
+          });
+        }
+        // Another request already claimed this draft and is still filing it
+        // (or crashed before finalizing/releasing its claim) — never file a
+        // second real issue for the same draft. The client should back off
+        // and retry shortly; a subsequent retry finds the finalized result
+        // via the branch above once the winning request completes.
+        return c.json(
+          { detail: "This draft is already being submitted — please wait a moment and retry." },
+          409
+        );
+      }
+      claimedId = claim.id;
+    }
+
     // Submits against the stored repo URL/credentials (not client-supplied).
     const result = await submitRepoIssue(repo, body.title, fullBody, labels);
-    if ("error" in result) return c.json({ detail: result.error }, 502);
+    if ("error" in result) {
+      // Release the claim on failure so a legitimate retry (the tracker API
+      // was down, network blip, etc.) isn't permanently locked out by its
+      // own earlier claim — otherwise this draft_tool_use_id stays claimed
+      // forever with issue_number still NULL.
+      if (claimedId !== null) await deps.db.releaseDraftSubmission(claimedId);
+      return c.json({ detail: result.error }, 502);
+    }
 
-    if (sessionId) {
-      // This is the only place the real submission outcome (issue number,
-      // URL, who filed it) is durably recorded — chat history only ever
-      // showed the draft card live, and never remembered whether it was
-      // actually filed. Persist the SAME body that was actually posted
-      // (with the reporter stamp), not the unstamped draft. The session is
-      // deliberately left open (no markSessionResolved) — QA-reported
-      // (2026-07-13): resolving it here forced every follow-up on the same
-      // issue (comment/close/reopen) into a brand-new session with no
-      // memory of which issue it was even about.
-      const submissionId = await deps.db.recordIssueSubmission({
+    // This is the only place the real submission outcome (issue number,
+    // URL, who filed it) is durably recorded — chat history only ever
+    // showed the draft card live, and never remembered whether it was
+    // actually filed. The session is deliberately left open (no
+    // markSessionResolved) — QA-reported (2026-07-13): resolving it here
+    // forced every follow-up on the same issue (comment/close/reopen) into
+    // a brand-new session with no memory of which issue it was even about.
+    let submissionId: number | null = claimedId;
+    if (claimedId !== null) {
+      await deps.db.finalizeIssueSubmission(claimedId, result.number, result.url);
+    } else if (sessionId) {
+      submissionId = await deps.db.recordIssueSubmission({
         sessionId,
         repoId: body.repo_id,
         userId: user.id,
@@ -271,6 +304,8 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
         issueUrl: result.url,
         draftToolUseId,
       });
+    }
+    if (submissionId !== null) {
       // Best-effort, doesn't block the response — reflects the just-filed
       // issue's real tracker state (e.g. auto-labels a bot applied) without
       // waiting for the next 10-minute background poll.

@@ -611,6 +611,10 @@ async function sendMessage() {
         // before it, so the reply reads as continuous prose with the tool
         // activity log tucked at the end instead of interrupting it.
         let messageToolGroup = null;
+        // Tracks the current turn's still-unsubmitted draft_issue card (if
+        // any) so a second draft_issue call in the SAME turn supersedes it
+        // instead of leaving two live cards (QA-reported 2026-07-14).
+        let activeIssueDraftCard = null;
 
         // Named so it can be invoked once more after the read loop below,
         // for a final line the server wrote without its trailing "\n" (see
@@ -690,7 +694,8 @@ async function sendMessage() {
                             try {
                                 const draft = JSON.parse(data.result);
                                 if (draft.type === "issue_draft") {
-                                    appendIssueCard(contentEl, draft, null, data.id);
+                                    if (activeIssueDraftCard) supersedeIssueCard(activeIssueDraftCard);
+                                    activeIssueDraftCard = appendIssueCard(contentEl, draft, null, data.id);
                                 }
                             } catch {}
                         } else if (data.name === "manage_issue") {
@@ -1186,6 +1191,13 @@ async function submitIssueCardRequest(card, endpoint, buildBody, successLabel) {
     const confirmBtn = card.querySelector(".btn-confirm");
     const cancelBtn = card.querySelector(".btn-cancel");
 
+    // QA-reported 2026-07-14: a fast double-click could reach this function
+    // twice before the first call's `await` ever yielded, firing two real
+    // submit requests for the same draft (the backend now also closes this
+    // structurally, but this guard stops the second request from ever being
+    // sent at all). `disabled` alone wasn't enough — nothing previously
+    // checked it, so a second call just set it to true again and proceeded.
+    if (confirmBtn.disabled) return;
     confirmBtn.disabled = true;
     cancelBtn.disabled = true;
     statusEl.textContent = "提交中...";
@@ -1220,15 +1232,7 @@ async function submitIssueCardRequest(card, endpoint, buildBody, successLabel) {
         // The session stays open (no more auto-resolve, QA-reported
         // 2026-07-13) so the user can keep talking about this same issue —
         // refresh the pinned banner instead of announcing "task complete".
-        // Re-fetching (rather than patching state in locally) also picks up
-        // whatever the server's own post-action recheck just wrote.
-        if (currentSessionId) {
-            const sessResp = await authFetch(`/api/sessions/${currentSessionId}`);
-            if (sessResp.ok) {
-                const sessData = await sessResp.json();
-                renderLinkedIssuesBanner(sessData.issue_submissions);
-            }
-        }
+        await refreshLinkedIssuesBanner();
         loadSessions();
     } catch (err) {
         statusEl.textContent = `网络错误: ${escapeHtml(err.message)}`;
@@ -1281,6 +1285,31 @@ function renderLinkedIssuesBanner(submissions) {
     });
     messagesDiv.insertBefore(div, messagesDiv.firstChild);
 }
+
+// Re-fetches the current session and redraws the linked-issues banner from
+// its live issue_submissions — the single source of truth is always the
+// server (picks up whatever a webhook or the background poller just wrote),
+// never a locally-patched guess. Safe to call whenever there's an open
+// session; a no-op otherwise.
+async function refreshLinkedIssuesBanner() {
+    if (!currentSessionId) return;
+    const sessResp = await authFetch(`/api/sessions/${currentSessionId}`);
+    if (sessResp.ok) {
+        const sessData = await sessResp.json();
+        renderLinkedIssuesBanner(sessData.issue_submissions);
+    }
+}
+
+// QA-reported 2026-07-14: webhook-driven state changes (someone closes an
+// issue on GitHub's own web UI) land in the DB near-instantly, but the
+// banner only ever redrew on session open or right after the user's own
+// submit/action — so an externally-closed issue kept showing "待处理" until
+// the user happened to send another message. Poll gently while a session is
+// open, and refresh immediately whenever the tab regains focus (the cheap,
+// no-new-transport-layer option — see the QA report's own suggested list).
+const LINKED_ISSUES_POLL_MS = 20_000;
+setInterval(() => { if (currentSessionId) refreshLinkedIssuesBanner(); }, LINKED_ISSUES_POLL_MS);
+window.addEventListener("focus", () => { if (currentSessionId) refreshLinkedIssuesBanner(); });
 
 // The turn ran out of tool-call budget and wrapped up with a checkpoint
 // report instead of a finished answer. Not an error state — the report above
@@ -1374,6 +1403,23 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
     }
 
     scrollToBottom();
+    return card;
+}
+
+// QA-reported 2026-07-14: the model occasionally calls draft_issue twice in
+// the same turn for what's really the same problem, despite the system
+// prompt saying at most one — leaving two live, both-submittable cards.
+// Called when a newer draft arrives while an earlier one from the SAME turn
+// is still unsubmitted: disables it and marks it as replaced rather than
+// leaving both actionable (submitting the stale one would still file a real,
+// now-orphaned GitHub/GitLab issue).
+function supersedeIssueCard(card) {
+    const confirmBtn = card.querySelector(".btn-confirm");
+    const cancelBtn = card.querySelector(".btn-cancel");
+    const statusEl = card.querySelector(".issue-status");
+    if (confirmBtn) confirmBtn.disabled = true;
+    if (cancelBtn) cancelBtn.disabled = true;
+    if (statusEl) statusEl.textContent = "已被新草稿替换";
 }
 
 async function submitIssue(btn) {

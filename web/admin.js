@@ -668,6 +668,20 @@ async function copyWebhookField(id) {
     }
 }
 
+// QA-reported 2026-07-14: webhook-driven status changes land in the DB
+// near-instantly, but this table only ever redrew on tab switch or the
+// explicit "刷新"/"立即同步" buttons — an externally-closed issue kept
+// showing "已提报" until an admin happened to click something. Poll gently
+// (a cheap DB read, not a real tracker API call — that's what "立即同步"
+// is for) while the 工单 tab is the one actually visible, and refresh
+// immediately when the tab regains focus.
+const ISSUE_TRACKING_POLL_MS = 20_000;
+function issuesTabActive() {
+    return document.getElementById("panel-issues").classList.contains("active");
+}
+setInterval(() => { if (isAuthorizedAdmin && issuesTabActive()) loadIssueTracking(); }, ISSUE_TRACKING_POLL_MS);
+window.addEventListener("focus", () => { if (isAuthorizedAdmin && issuesTabActive()) loadIssueTracking(); });
+
 // ===== Init =====
 if (isAuthorizedAdmin) {
     loadUsers();

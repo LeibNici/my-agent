@@ -402,6 +402,58 @@ describe("POST /api/issues/submit", () => {
     expect(rows).toHaveLength(1); // no duplicate row either
   });
 
+  // QA-reported 2026-07-14: a real double-click on the confirm button
+  // reproducibly filed TWO real GitHub issues for the same draft, even
+  // though the sequential test above (one request fully completes before
+  // the next starts) always passed — the bug only shows up when both
+  // requests are genuinely in flight together. This exercises the actual
+  // race via Promise.all against the real worker-backed DbClient, proving
+  // claimDraftSubmission's unique-index INSERT (not the old
+  // check-then-call-then-record pattern) is what makes only one caller ever
+  // win.
+  it("idempotency: two CONCURRENT requests for the SAME draft only ever create one real issue", async () => {
+    const { id: userId, token } = await seedUser("admin", "submit-concurrent");
+    const repoId = await seedRepo();
+    const sessionId = await client.createSession("New Chat", userId);
+    const fetchMock = stubFetch([
+      LABELS_ROUTE,
+      issuesCreateRoute(201, { iid: 62, web_url: "https://gitlab.example.com/group/proj/-/issues/62", title: "Bug title" }),
+      issueGetRoute(200, { state: "opened", labels: [], closed_at: null }),
+      RESOURCE_STATE_EVENTS_ROUTE,
+    ]);
+    const app = buildTestApp();
+    const body = {
+      repo_id: repoId,
+      title: "Bug title",
+      body: "Bug body",
+      session_id: sessionId,
+      draft_tool_use_id: "tu_concurrent_1",
+    };
+
+    const [respA, respB] = await Promise.all([
+      authed(app, token, "/api/issues/submit", { method: "POST", body: JSON.stringify(body) }),
+      authed(app, token, "/api/issues/submit", { method: "POST", body: JSON.stringify(body) }),
+    ]);
+
+    // Exactly one real issue filed upstream — never two.
+    const createCalls = fetchMock.mock.calls.filter(([url, init]) =>
+      isIssuesCreate(url as string, (init ?? {}) as RequestInit)
+    ).length;
+    expect(createCalls).toBe(1);
+
+    // Whichever response reflects the loser of the race, it must be either
+    // a 409 (told to retry) or a 200 reporting the SAME issue number as the
+    // winner — never a 200 with a different, second issue number.
+    const bodies = await Promise.all([respA.json(), respB.json()]);
+    for (const [resp, respBody] of [[respA, bodies[0]], [respB, bodies[1]]] as const) {
+      expect([200, 409]).toContain(resp.status);
+      if (resp.status === 200) expect(respBody.issue_number).toBe(62);
+    }
+
+    const rows = await client.getIssueSubmissionsForSession(sessionId);
+    expect(rows).toHaveLength(1); // never a duplicate row
+  });
+
   it("session stays open across a full issue lifecycle: submit → comment → close → reopen, all against the SAME session_id, resolved_at null throughout", async () => {
     const { id: userId, token } = await seedUser("admin", "lifecycle-admin");
     const repoId = await seedRepo();

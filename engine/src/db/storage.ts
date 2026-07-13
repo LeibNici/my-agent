@@ -163,6 +163,26 @@ export type RecordIssueSubmissionFields = {
   draftToolUseId?: string | null;
 };
 
+// claimDraftSubmission's input — same shape as RecordIssueSubmissionFields
+// minus issueNumber/issueUrl (not known yet — the whole point is to claim
+// the draft_tool_use_id BEFORE calling the tracker) and with draftToolUseId
+// required rather than optional (only the draft-card submit path claims;
+// the no-draft-id legacy path still goes straight through
+// recordIssueSubmission, nothing to dedupe against there).
+export type ClaimDraftSubmissionFields = {
+  sessionId: string;
+  repoId: number;
+  userId: number;
+  title: string;
+  body: string;
+  labels: string[];
+  draftToolUseId: string;
+};
+
+export type ClaimDraftSubmissionResult =
+  | { claimed: true; id: number }
+  | { claimed: false; existing: IssueSubmissionRow };
+
 // get_issue_submissions_for_session's row (database.py:688) — used to
 // reconcile historical draft cards to their real final state on replay.
 export type IssueSubmissionRow = {
@@ -447,6 +467,9 @@ export type Storage = {
   recordSemanticSearchLog(row: RecordSemanticSearchLogRow): void;
   markSessionResolved(sessionId: string): void;
   recordIssueSubmission(fields: RecordIssueSubmissionFields): number;
+  claimDraftSubmission(fields: ClaimDraftSubmissionFields): ClaimDraftSubmissionResult;
+  finalizeIssueSubmission(id: number, issueNumber: number, issueUrl: string | null): void;
+  releaseDraftSubmission(id: number): void;
   getIssueSubmissionsForSession(sessionId: string): IssueSubmissionRow[];
   getSubmissionByDraftToolUseId(draftToolUseId: string): IssueSubmissionRow | null;
   getSubmissionForTracking(id: number): TrackableSubmissionRow | null;
@@ -1101,6 +1124,71 @@ export function openStorage(dbPath: string): Storage {
         }
         throw err;
       }
+    },
+
+    // Structural idempotency fix (QA-reported 2026-07-14): the route used to
+    // check getSubmissionByDraftToolUseId, THEN call the tracker, THEN
+    // recordIssueSubmission — leaving a real window where two
+    // near-simultaneous requests (an actual double-click, not just a
+    // theoretical race) both passed the check and both called
+    // submitRepoIssue, filing two real GitHub issues even though local
+    // bookkeeping only ever showed one. Claiming draft_tool_use_id via this
+    // INSERT BEFORE the tracker is ever called makes the unique index the
+    // single atomic decision point — only one caller can ever proceed past
+    // it to actually file the issue. Pair with finalizeIssueSubmission (on
+    // tracker success) or releaseDraftSubmission (on tracker failure).
+    claimDraftSubmission(fields: ClaimDraftSubmissionFields): ClaimDraftSubmissionResult {
+      const now = pyLocalIsoNow();
+      try {
+        const res = db
+          .prepare(
+            "INSERT INTO issue_submissions " +
+              "(session_id, repo_id, user_id, title, body, labels, draft_tool_use_id, submitted_at) " +
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          )
+          .run(
+            fields.sessionId,
+            fields.repoId,
+            fields.userId,
+            fields.title,
+            fields.body,
+            pythonJsonDumps(fields.labels),
+            fields.draftToolUseId,
+            now
+          );
+        return { claimed: true, id: Number(res.lastInsertRowid) };
+      } catch (err) {
+        if (err instanceof Database.SqliteError && err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+          const row = db
+            .prepare(
+              `SELECT id, repo_id, user_id, title, body, labels, issue_number, issue_url, draft_tool_use_id, submitted_at,
+                      COALESCE(track_status, 'submitted') as track_status, reopen_count
+               FROM issue_submissions WHERE draft_tool_use_id = ?`
+            )
+            .get(fields.draftToolUseId) as (Omit<IssueSubmissionRow, "labels"> & { labels: string }) | undefined;
+          if (row) return { claimed: false, existing: { ...row, labels: parseJsonArray(row.labels) } };
+        }
+        throw err;
+      }
+    },
+
+    // Fills in the real outcome once submitRepoIssue actually succeeds for a
+    // row claimDraftSubmission already created.
+    finalizeIssueSubmission(id: number, issueNumber: number, issueUrl: string | null): void {
+      db.prepare("UPDATE issue_submissions SET issue_number = ?, issue_url = ? WHERE id = ?").run(
+        issueNumber,
+        issueUrl,
+        id
+      );
+    },
+
+    // Releases a claim when the tracker call itself failed (network error,
+    // 502, etc.) — otherwise draft_tool_use_id stays permanently claimed
+    // with issue_number still NULL and a legitimate retry can never get past
+    // claimDraftSubmission again. Guarded on issue_number IS NULL so this can
+    // never delete a row a concurrent request has since finalized.
+    releaseDraftSubmission(id: number): void {
+      db.prepare("DELETE FROM issue_submissions WHERE id = ? AND issue_number IS NULL").run(id);
     },
 
     // Idempotency lookup for /api/issues/submit — draft_tool_use_id is
