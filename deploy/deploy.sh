@@ -9,7 +9,27 @@ set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "==> git pull (fast-forward only)"
+before_sha="$(git rev-parse HEAD)"
 git pull --ff-only
+after_sha="$(git rev-parse HEAD)"
+
+# Self-modification race: this script IS one of the files `git pull` just
+# rewrote on disk, but the bash process already executing it had buffered
+# earlier content into memory — bash doesn't necessarily re-read a script
+# file line-by-line as it runs, so lines added below THIS point by the
+# pull just now can silently never execute during this exact invocation
+# (confirmed: engine/.git-sha never got written on the deploy that first
+# added the next line, even though the pull itself succeeded and the build
+# went on to complete normally). Re-exec once with the freshly-pulled
+# content so every line after this point is guaranteed to be the new
+# version — the DEPLOY_SH_REEXECED guard stops this from looping forever
+# (the second run's pull is a no-op, so before_sha==after_sha and it falls
+# through instead of re-execing again).
+if [ "$before_sha" != "$after_sha" ] && [ -z "${DEPLOY_SH_REEXECED:-}" ]; then
+  echo "==> deploy.sh changed — re-executing the freshly-pulled script"
+  export DEPLOY_SH_REEXECED=1
+  exec bash "${BASH_SOURCE[0]}"
+fi
 
 # So the running site can show which commit it's actually serving (see
 # app.ts's readGitSha comment) — the container has no .git of its own
