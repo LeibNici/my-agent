@@ -44,6 +44,28 @@ export const MAX_IMAGES_PER_MESSAGE = 5;
 export const MAX_IMAGE_BASE64_CHARS = 6_000_000;
 const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
+// Codex full-repo review (2026-07-14, Warning): per-session turn lock — see
+// chatEventStream's own comment at the acquire/release call sites for the
+// race this closes. Session id -> started-at epoch ms, not just a Set, so a
+// turn whose generator never got properly closed (a crash, not a clean
+// disconnect) doesn't block that session FOREVER — same staleness-reclaim
+// shape as the issue-submission claim TTL elsewhere in this codebase.
+const activeSessionTurns = new Map<string, number>();
+const SESSION_TURN_STALE_MS = 10 * 60 * 1000;
+
+function acquireSessionTurnLock(sessionId: string): boolean {
+  const startedAt = activeSessionTurns.get(sessionId);
+  if (startedAt !== undefined && Date.now() - startedAt < SESSION_TURN_STALE_MS) {
+    return false;
+  }
+  activeSessionTurns.set(sessionId, Date.now());
+  return true;
+}
+
+function releaseSessionTurnLock(sessionId: string): void {
+  activeSessionTurns.delete(sessionId);
+}
+
 export type ChatImage = { media_type: string; data: string };
 
 export type ChatRequestBody = {
@@ -288,6 +310,23 @@ export async function* chatEventStream(
     switchReason = "resolved";
   }
 
+  // Codex full-repo review (2026-07-14, Warning): two concurrent requests
+  // for the SAME session both read getMessages() before either's addMessage
+  // landed, so each ran the engine against a stale/incomplete history and
+  // both wrote their own tool_use/tool_result/assistant sequences back —
+  // interleaved, neither grounded in the other's context. A per-session
+  // lock, acquired here (immediately after sessionId is finalized, with no
+  // await between finalization and acquisition) and released in the
+  // `finally` below, makes a second concurrent request for the same
+  // session fail fast instead of corrupting history. Frontend already
+  // disables the input while streaming (isStreaming), so this only ever
+  // fires for a client that bypasses that guard or a genuine network retry
+  // — not normal use.
+  if (!acquireSessionTurnLock(sessionId)) {
+    yield* sseReject("This session already has a message in progress — please wait for it to finish.");
+    return;
+  }
+  try {
   // Tell the client the real session_id right away, not just at "done" — a
   // tool_result event can render UI the user acts on before "done" ever
   // fires (see v1's comment on this same yield in app/main.py).
@@ -481,4 +520,10 @@ export async function* chatEventStream(
     yield { event: "done", data: JSON.stringify({ session_id: sessionId, text: fullText }) };
   }
   yield { event: "end", data: "" };
+  } finally {
+    // Runs on every exit from the try above — normal completion, the
+    // mid-turn disconnect `return`, or an exception escaping the inner
+    // try/catch — so the lock never outlives this specific turn.
+    releaseSessionTurnLock(sessionId);
+  }
 }

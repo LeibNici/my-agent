@@ -264,6 +264,71 @@ describe("POST /api/chat — SSE contract (oracle: v1-python-final:tests/test_ss
       await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
     }
   }, 10000);
+
+  // Codex full-repo review (2026-07-14, Warning): two concurrent requests
+  // for the SAME session both used to read getMessages() before either's
+  // addMessage landed — each ran the engine against a stale/incomplete
+  // history and both wrote back their own interleaved sequences. Proves
+  // the per-session lock actually fires: a second request arriving while
+  // the first is still mid-turn gets rejected immediately, and history is
+  // untouched by the rejected one.
+  it("5. 并发：同一 session 有请求在飞行中时，第二个并发请求立即被拒绝，历史不被破坏", async () => {
+    const { token } = await seedUser();
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([{ type: "text_delta", data: { text: "第一条还没写完" } }, "hang"]),
+    });
+    const server: Server = serve({ fetch: app.fetch, port: 0 });
+    try {
+      await new Promise<void>((resolve) => server.once("listening", resolve));
+      const port = (server.address() as AddressInfo).port;
+
+      const firstResp = await fetch(`http://127.0.0.1:${port}/api/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ message: "第一条" }),
+      });
+      const reader = firstResp.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (!buf.includes("event: text")) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error("stream ended before a text event arrived");
+        buf += decoder.decode(value, { stream: true });
+      }
+      const sessionId = JSON.parse(parseFrames(buf)[0].data).session_id as string;
+
+      // Second request for the SAME session while the first is still
+      // hanging mid-turn — must be rejected, not queued or run concurrently.
+      const secondResp = await fetch(`http://127.0.0.1:${port}/api/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ message: "第二条", session_id: sessionId }),
+      });
+      const secondFrames = parseFrames(await secondResp.text());
+      expect(secondFrames.map((f) => f.event)).toEqual(["error", "done", "end"]);
+      expect(JSON.parse(secondFrames[0].data).message).toContain("already has a message in progress");
+
+      // History shows only the FIRST request's user message — the rejected
+      // second request never touched it.
+      const msgs = await client.getMessages(sessionId);
+      expect(msgs.map((m) => m.role)).toEqual(["user"]);
+
+      // Let the still-hanging first request's stream finish tearing down
+      // server-side BEFORE this test returns (same reasoning as test 4
+      // above) — otherwise its cleanup path can still be mid-flight when
+      // afterEach closes the db client out from under it.
+      await reader.cancel();
+      await waitFor(async () => {
+        const finalMsgs = await client.getMessages(sessionId);
+        const last = finalMsgs.at(-1);
+        return typeof last?.content === "string" && last.content.includes("连接已中断");
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    }
+  }, 10000);
 });
 
 // ==================== Supplementary SSE semantics (beyond the four core scenarios) ====================
