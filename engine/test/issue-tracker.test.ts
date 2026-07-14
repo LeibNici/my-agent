@@ -319,10 +319,82 @@ describe("pollTrackedIssues", () => {
 
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_error).toBe(
-      "issue 所在主机(host-b.example.com)与仓库当前主机(host-a.example.com)不一致，凭证不外发，暂停追踪"
+      "issue 所在项目(host-b.example.com/group/proj)与仓库当前配置(host-a.example.com/group/proj)不一致，凭证不外发，暂停追踪"
     );
     // 这条护栏在任何网络调用之前就返回了 —— 仓库的 cred_token 从未有机会外发。
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // Codex full-repo review (2026-07-14, Warning): 原来的护栏只比较了主机名
+  // —— 挡住了"仓库迁移到完全不同的 tracker/主机"这种最坏情况，但对"同一个
+  // GitLab 实例上，仓库被改指向另一个 group/project"完全没有防护：仓库当
+  // 前的（新）cred_token 会被发到旧 issue_url 所在的、和这个 token 毫无关
+  // 系的另一个项目——这是真的凭证外泄，不只是数据错位。
+  it("issue_url 与仓库当前 url 同主机、不同 project（仓库被改指向了另一个 group/project）-> 同样被护栏拦截，新 token 不外发到旧项目", async () => {
+    const settings = makeSettings();
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://gitlab.example.com/team-b/project-y.git", // 仓库现在指向 team-b/project-y
+      credToken: "new-token-after-migration",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 7,
+      // 这条记录是仓库还指向 team-a/project-x 时提交的，issue_url 还留在旧项目。
+      issueUrl: "https://gitlab.example.com/team-a/project-x/-/issues/7",
+    });
+
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollTrackedIssues(client, settings);
+
+    // 关键断言：即使主机相同，新 token 也绝不能被发到旧项目 team-a/project-x。
+    expect(fetchMock).not.toHaveBeenCalled();
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.track_error).toBe(
+      "issue 所在项目(gitlab.example.com/team-a/project-x)与仓库当前配置(gitlab.example.com/team-b/project-y)不一致，凭证不外发，暂停追踪"
+    );
+  });
+
+  it("issue_url 与仓库当前 url 主机、project 都一致 -> 正常放行轮询（回归保护：新护栏不误伤正常场景）", async () => {
+    const settings = makeSettings();
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://gitlab.example.com/team-a/project-x.git",
+      credToken: "still-valid-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 7,
+      issueUrl: "https://gitlab.example.com/team-a/project-x/-/issues/7",
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/resource_state_events")) return { status: 200, json: async () => [] } as unknown as Response;
+      if (url.includes("/issues/7")) {
+        return { status: 200, json: async () => ({ state: "opened", labels: [], closed_at: null }) } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch url in test: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollTrackedIssues(client, settings);
+
+    expect(fetchMock).toHaveBeenCalled();
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.track_error).toBeNull();
+    expect(raw.track_status).toBe("submitted");
   });
 
   it("issue_url 是 github.com 且主机与仓库一致 -> 走 GitHub 轮询路径，用仓库自己的 cred_token 认证（不再有单独的全局 token）", async () => {
@@ -390,7 +462,7 @@ describe("pollTrackedIssues", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_error).toBe(
-      "issue 所在主机(github.com)与仓库当前主机(gitlab.example.com)不一致，凭证不外发，暂停追踪"
+      "issue 所在项目(github.com/acme/widgets)与仓库当前配置(gitlab.example.com/group/proj)不一致，凭证不外发，暂停追踪"
     );
   });
 

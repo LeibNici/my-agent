@@ -44,6 +44,36 @@ function safeHostname(url: string): string {
   }
 }
 
+// Codex full-repo review (2026-07-14, Warning): pollOne's original guard
+// only compared hostnames (issueHost !== repoHost) — that closes the worst
+// case (a repo migrating to an entirely different tracker/host) but does
+// nothing for a same-host migration: an admin repointing repo_id=5 from
+// gitlab.example.com/team-a/project-x to gitlab.example.com/team-b/project-y
+// (a different project, same GitLab instance) would still pass the
+// hostname check, and the repo's NEW cred_token would then be sent as a
+// PRIVATE-TOKEN header to project-x's API on every poll of a
+// pre-migration submission — real credential exposure to a project that
+// token was never meant to authenticate against, not just stale/wrong
+// status data. Extracts a normalized "host + project path" identity from
+// EITHER a repo git URL or an issue web URL (stripping the /issues/N or
+// /-/issues/N suffix and a trailing .git) so pollOne can require the
+// submission's issue and the repo's CURRENT url to point at the exact
+// same project, not just the same host.
+function projectIdentityFromUrl(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  let path = parsed.pathname.replace(/^\/+|\/+$/g, "");
+  if (path.includes("/-/issues/")) path = path.split("/-/issues/")[0]; // GitLab issue URL
+  else if (path.includes("/issues/")) path = path.split("/issues/")[0]; // GitHub issue URL
+  if (path.toLowerCase().endsWith(".git")) path = path.slice(0, -4);
+  if (!path) return null;
+  return `${parsed.hostname.toLowerCase()}/${path.toLowerCase()}`;
+}
+
 function isPlainObject(val: unknown): val is Record<string, unknown> {
   return val !== null && typeof val === "object" && !Array.isArray(val);
 }
@@ -315,18 +345,21 @@ export async function pollOne(
 
   const issueUrl = sub.issue_url ?? "";
   const issueHost = safeHostname(issueUrl).toLowerCase();
-  const repoHost = safeHostname(repo.url).toLowerCase();
 
-  // The poll target's host comes from the submission's OWN stored
+  // The poll target's host/project comes from the submission's OWN stored
   // issue_url, never the repo's current url (see module header) — but the
   // credential still comes from the repo record, and only gets used if
-  // that repo's CURRENT host still matches where the issue actually lives.
-  // Applies to GitHub too, now that it authenticates with the repo's own
-  // cred_token instead of a separate global token.
-  if (issueHost !== repoHost) {
+  // that repo's CURRENT url still resolves to the SAME project the issue
+  // actually lives in (not just the same host — see projectIdentityFromUrl's
+  // own comment on why a same-host migration to a DIFFERENT project needed
+  // its own check). Applies to GitHub too, now that it authenticates with
+  // the repo's own cred_token instead of a separate global token.
+  const issueIdentity = projectIdentityFromUrl(issueUrl);
+  const repoIdentity = projectIdentityFromUrl(repo.url);
+  if (!issueIdentity || !repoIdentity || issueIdentity !== repoIdentity) {
     await db.updateIssueTracking(
       sub.id,
-      { trackError: `issue 所在主机(${issueHost})与仓库当前主机(${repoHost})不一致，凭证不外发，暂停追踪` },
+      { trackError: `issue 所在项目(${issueIdentity ?? issueUrl})与仓库当前配置(${repoIdentity ?? repo.url})不一致，凭证不外发，暂停追踪` },
       generation,
     );
     return;
