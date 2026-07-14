@@ -21,6 +21,18 @@ describe("createDbClient", () => {
     expect((await client.getMessages("s1"))[0].content).toEqual([{ type: "text", text: "你好" }]);
   });
 
+  it("getMessagesForTurn 经 worker 回环也生效：图片 block 被替换为占位文本（不是 getMessages 那样的真实数据）", async () => {
+    await client.addMessage("s1", "user", [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "REAL-BYTES" } },
+    ]);
+    const viaTurn = await client.getMessagesForTurn("s1");
+    expect(viaTurn[0].content).toEqual([
+      { type: "text", text: "[历史消息中的截图已省略；如需模型重看，请让用户重新发送图片]" },
+    ]);
+    const viaFull = await client.getMessages("s1");
+    expect(JSON.stringify(viaFull)).toContain("REAL-BYTES");
+  });
+
   it("并发调用全部正确关联（pending-map 不串号）", async () => {
     const results = await Promise.all(
       Array.from({ length: 20 }, (_, i) => client.addMessage("s1", "user", `m${i}`))

@@ -113,6 +113,52 @@ describe("addMessage / getMessages（test_message_codec goldens 对齐）", () =
   });
 });
 
+describe("getMessagesForTurn（Codex 全仓库审查，2026-07-14，Warning：整段历史（含图片）在 history-policy 有机会裁剪之前就被整体读进内存）", () => {
+  it("图片 block 被替换为与 history-policy.ts 完全一致的占位文本；同一 block 数组里的其它 block 原样保留", () => {
+    const blocks = [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+      { type: "text", text: "这是什么错误" },
+    ];
+    storage.addMessage("s1", "user", blocks);
+    const [msg] = storage.getMessagesForTurn("s1");
+    expect(msg.content).toEqual([
+      { type: "text", text: "[历史消息中的截图已省略；如需模型重看，请让用户重新发送图片]" },
+      { type: "text", text: "这是什么错误" },
+    ]);
+  });
+
+  it("同一条消息，getMessages 仍然返回真实图片数据，getMessagesForTurn 返回占位文本 —— 两者互不影响", () => {
+    const blocks = [{ type: "image", source: { type: "base64", media_type: "image/png", data: "REAL-BYTES" } }];
+    storage.addMessage("s1", "user", blocks);
+    expect(storage.getMessages("s1")[0].content).toEqual(blocks);
+    const stripped = storage.getMessagesForTurn("s1")[0].content as Array<{ type: string; text?: string }>;
+    expect(stripped[0].type).toBe("text");
+    expect(JSON.stringify(stripped)).not.toContain("REAL-BYTES");
+  });
+
+  it("纯字符串内容原样保留（不含图片，无需处理）", () => {
+    storage.addMessage("s1", "assistant", "普通回答");
+    expect(storage.getMessagesForTurn("s1")[0].content).toBe("普通回答");
+  });
+
+  it("没有图片的 block 数组（tool_use/tool_result/text）原样保留，不被误伤", () => {
+    const blocks = [{ type: "tool_use", id: "tu_1", name: "code_search", input: { keyword: "x" } }];
+    storage.addMessage("s1", "assistant", blocks);
+    expect(storage.getMessagesForTurn("s1")[0].content).toEqual(blocks);
+  });
+
+  it("插入顺序 = 读取顺序，和 getMessages 行为一致", () => {
+    storage.addMessage("s1", "user", "m0");
+    storage.addMessage("s1", "user", "m1");
+    expect(storage.getMessagesForTurn("s1").map((m) => m.content)).toEqual(["m0", "m1"]);
+  });
+
+  it("[ 开头的非 JSON 字符串原样保留（解析失败时不崩溃，回退到裸字符串，和 getMessages 行为一致）", () => {
+    storage.addMessage("s1", "user", "[系统] 这不是JSON");
+    expect(storage.getMessagesForTurn("s1")[0].content).toBe("[系统] 这不是JSON");
+  });
+});
+
 describe("recordLlmCallMetrics", () => {
   it("批量单事务、全批同一 created_at、空批 no-op", () => {
     storage.recordLlmCallMetrics([]);

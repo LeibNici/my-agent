@@ -41,6 +41,11 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.getMessages(sessionId) });
         break;
       }
+      case "getMessagesForTurn": {
+        const [sessionId] = args as [string];
+        reply({ id, ok: true, result: storage.getMessagesForTurn(sessionId) });
+        break;
+      }
       case "recordLlmCallMetrics": {
         const [rows] = args as [Parameters<typeof storage.recordLlmCallMetrics>[0]];
         storage.recordLlmCallMetrics(rows);

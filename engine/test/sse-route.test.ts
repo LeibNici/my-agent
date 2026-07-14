@@ -714,6 +714,44 @@ describe("POST /api/chat — req.linkedIssues", () => {
   });
 });
 
+// Codex full-repo review (2026-07-14, Warning): getMessages() loaded (and
+// JSON.parse'd) every historical message's full content — including base64
+// image blocks — into one array before history-policy.ts got a chance to
+// replace them with a lightweight placeholder. Fixed via a turn-only
+// getMessagesForTurn that strips images during row iteration instead of
+// after building the full array. This proves the wiring end-to-end: what
+// the engine actually receives in req.history for a past image is already
+// the placeholder, not real image bytes.
+describe("POST /api/chat — req.history 中的历史图片在到达 engine 之前已被替换为占位文本（getMessagesForTurn）", () => {
+  it("上一轮消息里的图片 block，本轮 engine 收到的 req.history 里是占位文本，不是真实 base64 数据", async () => {
+    const { id: userId, token } = await seedUser("user", "history-image-user");
+    const sessionId = await client.createSession("New Chat", userId);
+    await client.addMessage(sessionId, "user", [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "REAL-HISTORICAL-BYTES" } },
+      { type: "text", text: "这个报错是什么意思" },
+    ]);
+    await client.addMessage(sessionId, "assistant", "这是一个空指针异常");
+
+    let captured: unknown;
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: (async function* (_deps, req) {
+        captured = req.history;
+        yield { type: "done", data: { text: "ok", success: true, budgetExhausted: false } };
+      }) as RunTurnFn,
+    });
+    await postChat(app, token, { message: "还是没懂", session_id: sessionId });
+
+    const serialized = JSON.stringify(captured);
+    expect(serialized).not.toContain("REAL-HISTORICAL-BYTES");
+    expect(serialized).toContain("历史消息中的截图已省略");
+    // getMessages()（会话回放用的那份）不受影响，仍能读到真实图片数据。
+    const replayMessages = await client.getMessages(sessionId);
+    expect(JSON.stringify(replayMessages)).toContain("REAL-HISTORICAL-BYTES");
+  });
+});
+
 // ==================== POST /api/auth/login ====================
 
 describe("POST /api/auth/login", () => {

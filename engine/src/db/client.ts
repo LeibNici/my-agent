@@ -41,6 +41,7 @@ export type DbClient = {
   regenerateAppSecret(name: string): Promise<string>;
   addMessage(sessionId: string, role: string, content: string | unknown[]): Promise<number>;
   getMessages(sessionId: string): Promise<StoredMessageRow[]>;
+  getMessagesForTurn(sessionId: string): Promise<StoredMessageRow[]>;
   recordLlmCallMetrics(rows: LlmMetricsRow[]): Promise<void>;
   getUserByUsername(username: string): Promise<UserRow | null>;
   getUserById(userId: number): Promise<UserRow | null>;
@@ -209,6 +210,7 @@ export function createDbClient(dbPath: string): DbClient {
     regenerateAppSecret: (name) => call<string>("regenerateAppSecret", [name]),
     addMessage: (sessionId, role, content) => call<number>("addMessage", [sessionId, role, content]),
     getMessages: (sessionId) => call<StoredMessageRow[]>("getMessages", [sessionId]),
+    getMessagesForTurn: (sessionId) => call<StoredMessageRow[]>("getMessagesForTurn", [sessionId]),
     recordLlmCallMetrics: (rows) => call<void>("recordLlmCallMetrics", [rows]),
     getUserByUsername: (username) => call<UserRow | null>("getUserByUsername", [username]),
     createUser: (username, passwordHash, role, mustChangePassword) =>

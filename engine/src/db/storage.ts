@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { randomUUID, randomBytes } from "node:crypto";
 import { pythonJsonDumps, pyLocalIsoNow } from "./py-compat.js";
+import { HISTORY_IMAGE_PLACEHOLDER } from "../history-policy.js";
 
 export class SchemaError extends Error {}
 
@@ -477,6 +478,7 @@ export type Storage = {
   regenerateAppSecret(name: string): string;
   addMessage(sessionId: string, role: string, content: string | unknown[]): number;
   getMessages(sessionId: string): StoredMessageRow[];
+  getMessagesForTurn(sessionId: string): StoredMessageRow[];
   recordLlmCallMetrics(rows: LlmMetricsRow[]): void;
   getUserByUsername(username: string): UserRow | null;
   getUserById(userId: number): UserRow | null;
@@ -641,6 +643,27 @@ function parseJsonArray(raw: string | null): string[] {
   }
 }
 
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  return val !== null && typeof val === "object" && !Array.isArray(val);
+}
+
+// Reads the raw legacy content shape directly (duck-typed) rather than
+// going through codec-legacy.ts's legacyToDomain, matching
+// uploadSessionScreenshots'/verifyDraftRepoId's established rationale for
+// doing the same (see issue-tracker-client.ts) — this is a best-effort
+// "swap image blocks for the same placeholder history-policy.ts would
+// produce anyway", not a validating round-trip, so a block that doesn't
+// look exactly like an image block is left untouched rather than throwing.
+function stripLegacyImageBlocks(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((block) => {
+    if (isPlainObject(block) && block.type === "image") {
+      return { type: "text", text: HISTORY_IMAGE_PLACEHOLDER };
+    }
+    return block;
+  });
+}
+
 export function openStorage(dbPath: string): Storage {
   const db = new Database(dbPath);
 
@@ -781,6 +804,49 @@ export function openStorage(dbPath: string): Storage {
           timestamp: row.timestamp,
         };
       });
+    },
+
+    // Codex full-repo review (2026-07-14, Warning): getMessages() above
+    // loads (and JSON.parses) EVERY row's full content — including any
+    // base64 image blocks, up to MAX_IMAGE_BASE64_CHARS chars each — into
+    // one big array via better-sqlite3's .all(), before history-policy.ts's
+    // prepareModelMessages gets a chance to replace those images with a
+    // lightweight text placeholder. A long session with several past image
+    // uploads could force materializing tens of MB in memory on every
+    // single chat turn, only to immediately discard nearly all of it —
+    // prepareModelMessages strips 100% of the images in `history`
+    // unconditionally (it never sends a past image to the model, only the
+    // CURRENT turn's live image, which is passed to the engine separately
+    // from history — see sse.ts). This turn-only variant does the same
+    // strip DURING row iteration instead of after building the full array:
+    // .iterate() (unlike .all()) pulls one row at a time from SQLite rather
+    // than reading every row into memory up front, so at most one row's
+    // raw image bytes are ever alive at once, not the whole session's
+    // worth. getMessages() itself is untouched — session replay
+    // (GET /api/sessions/:id) and issue-drafting (uploadSessionScreenshots)
+    // both need the real image bytes and keep using it.
+    getMessagesForTurn(sessionId: string): StoredMessageRow[] {
+      const stmt = db.prepare(
+        "SELECT id, role, content, timestamp FROM messages WHERE session_id = ? ORDER BY id"
+      );
+      const result: StoredMessageRow[] = [];
+      for (const row of stmt.iterate(sessionId) as IterableIterator<{
+        id: number;
+        role: string;
+        content: string;
+        timestamp: string;
+      }>) {
+        let parsedContent: string | unknown[] = row.content;
+        if (typeof row.content === "string" && row.content.startsWith("[")) {
+          try {
+            parsedContent = stripLegacyImageBlocks(JSON.parse(row.content)) as string | unknown[];
+          } catch {
+            parsedContent = row.content;
+          }
+        }
+        result.push({ id: row.id, role: row.role, content: parsedContent, timestamp: row.timestamp });
+      }
+      return result;
     },
 
     recordLlmCallMetrics(rows: LlmMetricsRow[]): void {

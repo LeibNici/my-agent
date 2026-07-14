@@ -332,7 +332,14 @@ export async function* chatEventStream(
   // fires (see v1's comment on this same yield in app/main.py).
   yield { event: "session", data: JSON.stringify({ session_id: sessionId, reason: switchReason }) };
 
-  const history = await db.getMessages(sessionId);
+  // getMessagesForTurn (not getMessages) — this history feeds the model via
+  // prepareModelMessages, which unconditionally replaces every image block
+  // in it with a text placeholder anyway (the CURRENT turn's live image is
+  // passed separately below, never through `history`). Stripping images
+  // during row iteration instead of after materializing the whole array
+  // avoids peak memory scaling with how many images a long session has
+  // accumulated — see storage.ts's getMessagesForTurn doc comment.
+  const history = await db.getMessagesForTurn(sessionId);
   // v1 persists the SAME content it sends the model: images (if any) first,
   // then the text block, only when non-blank (app/main.py:413-420) — a
   // plain string when there's no image, matching the existing/common case.
