@@ -180,28 +180,50 @@ async function execute(
     return `Error: ${reason}`;
   }
 
-  if (!fs.existsSync(resolved)) {
-    return `Error: File not found: ${resolved}`;
-  }
-
-  const stat = fs.statSync(resolved);
-  if (!stat.isFile()) {
-    return `Error: Not a file: ${resolved}`;
-  }
-
-  if (stat.size > MAX_FILE_SIZE_BYTES) {
-    // Python: f"Error: File too large ({size / 1024 / 1024:.1f}MB). Max 5MB."
-    return `Error: File too large (${formatSizeMb(stat.size)}MB). Max 5MB.`;
-  }
-
-  const startIndex = Math.max(startLine, 1) - 1;
+  // Codex full-repo review (2026-07-14, Warning): the permission check
+  // above and the actual read used to be two independent path-string
+  // operations (existsSync/statSync/readFileSync each re-resolve the path
+  // from scratch) — a concurrent `git pull` (repo-sync.ts's periodic sync
+  // runs on a timer against these same checkout directories) landing
+  // between them could swap what that path points to, so a request
+  // checked-and-approved against one file's identity could end up reading
+  // a DIFFERENT one. Opening the file ONCE right after the check and doing
+  // every subsequent operation (stat, read) against that SAME file
+  // descriptor pins it to one fixed inode regardless of what the path
+  // string resolves to afterward. O_NOFOLLOW is safe here specifically
+  // because `resolved` already went through realpathSync above — a
+  // legitimate target is never itself a symlink by the time we get here,
+  // so if open() finds one anyway, something changed the path structure
+  // out from under this exact check and refusing is correct.
+  let fd: number;
   try {
+    fd = fs.openSync(resolved, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    const code = err && typeof err === "object" && "code" in err ? (err as { code: string }).code : undefined;
+    if (code === "ENOENT") return `Error: File not found: ${resolved}`;
+    if (code === "EISDIR") return `Error: Not a file: ${resolved}`;
+    const message = err instanceof Error ? err.message : String(err);
+    return `Error reading file: ${message}`;
+  }
+
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
+      return `Error: Not a file: ${resolved}`;
+    }
+
+    if (stat.size > MAX_FILE_SIZE_BYTES) {
+      // Python: f"Error: File too large ({size / 1024 / 1024:.1f}MB). Max 5MB."
+      return `Error: File too large (${formatSizeMb(stat.size)}MB). Max 5MB.`;
+    }
+
+    const startIndex = Math.max(startLine, 1) - 1;
     // errors="replace" equivalent: Node's toString("utf8") already replaces
     // invalid byte sequences with U+FFFD on decode, matching Python's
     // behavior closely enough (exact replacement-run granularity may
     // differ for pathological byte sequences — not chased, files this tool
     // reads are expected to be valid UTF-8 source).
-    const content = normalizeNewlines(fs.readFileSync(resolved).toString("utf8"));
+    const content = normalizeNewlines(fs.readFileSync(fd).toString("utf8"));
     const allLines = splitKeepingNewlines(content);
     const lines: string[] = [];
     for (let i = 0; i < allLines.length; i++) {
@@ -221,6 +243,8 @@ async function execute(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return `Error reading file: ${message}`;
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
