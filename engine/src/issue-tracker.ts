@@ -619,41 +619,55 @@ export async function pollSubmissionById(
  * and never abort the round. */
 export async function pollTrackedIssues(db: DbClient, settings: Settings): Promise<number> {
   const subs = await db.getTrackableSubmissions();
-  if (subs.length === 0) return 0;
 
-  const reposById = new Map<number, FullRepoRow>();
-  for (const r of await db.listReposFull()) reposById.set(r.id, r);
+  // Real production bug found while verifying the DB-timeout fix above
+  // (2026-07-15): this used to `return 0` right here when nothing was due
+  // for a tracking re-check, which skipped verifyPendingFixReports() below
+  // entirely for that whole tick. getTrackableSubmissions() excludes a
+  // closed issue for 24h after its last check (see that query's comment),
+  // so once every tracked issue is closed-and-recently-checked — exactly
+  // the production state right now — EVERY tick hit this early return and
+  // fix-report verification silently never ran again, regardless of how
+  // healthy the poll loop itself was. That's what actually left #1242's
+  // fix report stuck at verified=null, not the DB-timeout bug above (a
+  // manual replay of the same GitLab verify call succeeded immediately).
+  // Verification is an unrelated concern from "is any submission's tracking
+  // status due for a re-check" and must run every tick independent of it.
+  if (subs.length > 0) {
+    const reposById = new Map<number, FullRepoRow>();
+    for (const r of await db.listReposFull()) reposById.set(r.id, r);
 
-  // Codex review (2026-07-14, Warning): the return value here is an
-  // *attempted* count, not a success count — every failure is swallowed
-  // into that submission's track_error and the loop moves on by design (see
-  // the doc comment above). That's correct for "never abort the round", but
-  // it meant a round where every single submission failed still logged as
-  // "N submissions checked" below, indistinguishable from a healthy run.
-  // Tracked separately here (not via the return value, to avoid changing
-  // pollTrackedIssues's signature/the callers and tests keyed on a plain
-  // count) so a bad round is visible without inflating a "healthy" log line.
-  let failed = 0;
-  for (const sub of subs) {
-    try {
-      await pollOne(sub, reposById, db, settings);
-    } catch (e) {
-      failed++;
-      const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
+    // Codex review (2026-07-14, Warning): the return value here is an
+    // *attempted* count, not a success count — every failure is swallowed
+    // into that submission's track_error and the loop moves on by design (see
+    // the doc comment above). That's correct for "never abort the round", but
+    // it meant a round where every single submission failed still logged as
+    // "N submissions checked" below, indistinguishable from a healthy run.
+    // Tracked separately here (not via the return value, to avoid changing
+    // pollTrackedIssues's signature/the callers and tests keyed on a plain
+    // count) so a bad round is visible without inflating a "healthy" log line.
+    let failed = 0;
+    for (const sub of subs) {
       try {
-        // A fresh ticket, not whatever pollOne claimed internally before
-        // throwing — recording "this attempt failed" is itself the newest
-        // event for this submission, so it should win over anything an
-        // even-more-recent concurrent poll might still be mid-flight on.
-        const generation = await db.beginPoll(sub.id);
-        await db.updateIssueTracking(sub.id, { trackError: label }, generation);
-      } catch {
-        // best-effort — a failure recording the failure is not fatal
+        await pollOne(sub, reposById, db, settings);
+      } catch (e) {
+        failed++;
+        const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
+        try {
+          // A fresh ticket, not whatever pollOne claimed internally before
+          // throwing — recording "this attempt failed" is itself the newest
+          // event for this submission, so it should win over anything an
+          // even-more-recent concurrent poll might still be mid-flight on.
+          const generation = await db.beginPoll(sub.id);
+          await db.updateIssueTracking(sub.id, { trackError: label }, generation);
+        } catch {
+          // best-effort — a failure recording the failure is not fatal
+        }
       }
     }
-  }
-  if (failed > 0) {
-    console.log(`  ⚠️  issue tracking poll: ${failed}/${subs.length} submission(s) failed this round`);
+    if (failed > 0) {
+      console.log(`  ⚠️  issue tracking poll: ${failed}/${subs.length} submission(s) failed this round`);
+    }
   }
 
   try {
