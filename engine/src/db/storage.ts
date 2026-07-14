@@ -187,6 +187,18 @@ export type ClaimDraftSubmissionResult =
   | { claimed: true; id: number }
   | { claimed: false; existing: IssueSubmissionRow };
 
+export type FinalizeIssueSubmissionFields = {
+  issueNumber: number;
+  issueUrl: string | null;
+  body: string;
+};
+
+// How long a claim is allowed to stay unfinished (issue_number still NULL)
+// before it's treated as abandoned and reclaimable — generous enough to
+// cover a real GitHub/GitLab API call plus a screenshot upload, bounded
+// enough that a genuinely crashed request doesn't block that draft forever.
+export const CLAIM_TTL_MS = 60_000;
+
 // get_issue_submissions_for_session's row (database.py:688) — used to
 // reconcile historical draft cards to their real final state on replay.
 export type IssueSubmissionRow = {
@@ -473,8 +485,8 @@ export type Storage = {
   recordSemanticSearchLog(row: RecordSemanticSearchLogRow): void;
   markSessionResolved(sessionId: string): void;
   recordIssueSubmission(fields: RecordIssueSubmissionFields): number;
-  claimDraftSubmission(fields: ClaimDraftSubmissionFields): ClaimDraftSubmissionResult;
-  finalizeIssueSubmission(id: number, issueNumber: number, issueUrl: string | null): void;
+  claimDraftSubmission(fields: ClaimDraftSubmissionFields, retrying?: boolean): ClaimDraftSubmissionResult;
+  finalizeIssueSubmission(id: number, fields: FinalizeIssueSubmissionFields): void;
   releaseDraftSubmission(id: number): void;
   getIssueSubmissionsForSession(sessionId: string): IssueSubmissionRow[];
   getSubmissionByDraftToolUseId(draftToolUseId: string): IssueSubmissionRow | null;
@@ -1183,14 +1195,24 @@ export function openStorage(dbPath: string): Storage {
     // single atomic decision point — only one caller can ever proceed past
     // it to actually file the issue. Pair with finalizeIssueSubmission (on
     // tracker success) or releaseDraftSubmission (on tracker failure).
-    claimDraftSubmission(fields: ClaimDraftSubmissionFields): ClaimDraftSubmissionResult {
+    // claimTtlMs (Codex full-repo review, 2026-07-14, Warning): a claim
+    // whose owning request crashed/timed out before finalize/release used
+    // to block that draft_tool_use_id FOREVER (permanent 409, no recovery
+    // path). Anything still unfinished (issue_number IS NULL) past its own
+    // claim_expires_at is treated as abandoned and reclaimed — deleted and
+    // re-inserted in the SAME transaction as this call, so a genuinely
+    // concurrent second claimant still can't slip in between the delete and
+    // the insert. `retrying` guards against infinite recursion (there is
+    // at most one stale row to reclaim per call).
+    claimDraftSubmission(fields: ClaimDraftSubmissionFields, retrying = false): ClaimDraftSubmissionResult {
       const now = pyLocalIsoNow();
+      const claimExpiresAt = Date.now() + CLAIM_TTL_MS;
       try {
         const res = db
           .prepare(
             "INSERT INTO issue_submissions " +
-              "(session_id, repo_id, user_id, title, body, labels, draft_tool_use_id, submitted_at) " +
-              "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+              "(session_id, repo_id, user_id, title, body, labels, draft_tool_use_id, submitted_at, claim_expires_at) " +
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
           )
           .run(
             fields.sessionId,
@@ -1200,7 +1222,8 @@ export function openStorage(dbPath: string): Storage {
             fields.body,
             pythonJsonDumps(fields.labels),
             fields.draftToolUseId,
-            now
+            now,
+            claimExpiresAt
           );
         return { claimed: true, id: Number(res.lastInsertRowid) };
       } catch (err) {
@@ -1208,24 +1231,42 @@ export function openStorage(dbPath: string): Storage {
           const row = db
             .prepare(
               `SELECT id, repo_id, user_id, title, body, labels, issue_number, issue_url, draft_tool_use_id, submitted_at,
-                      COALESCE(track_status, 'submitted') as track_status, reopen_count
+                      COALESCE(track_status, 'submitted') as track_status, reopen_count, claim_expires_at
                FROM issue_submissions WHERE draft_tool_use_id = ?`
             )
-            .get(fields.draftToolUseId) as (Omit<IssueSubmissionRow, "labels"> & { labels: string }) | undefined;
-          if (row) return { claimed: false, existing: { ...row, labels: parseJsonArray(row.labels) } };
+            .get(fields.draftToolUseId) as
+            | (Omit<IssueSubmissionRow, "labels"> & { labels: string; claim_expires_at: number | null })
+            | undefined;
+          if (!row) throw err; // conflicted row vanished between INSERT and SELECT — surface the original error rather than loop
+          if (
+            !retrying &&
+            row.issue_number === null &&
+            row.claim_expires_at !== null &&
+            row.claim_expires_at < Date.now()
+          ) {
+            const txn = db.transaction(() => {
+              db.prepare("DELETE FROM issue_submissions WHERE id = ? AND issue_number IS NULL").run(row.id);
+            });
+            txn();
+            return storage.claimDraftSubmission(fields, true);
+          }
+          return { claimed: false, existing: { ...row, labels: parseJsonArray(row.labels) } };
         }
         throw err;
       }
     },
 
     // Fills in the real outcome once submitRepoIssue actually succeeds for a
-    // row claimDraftSubmission already created.
-    finalizeIssueSubmission(id: number, issueNumber: number, issueUrl: string | null): void {
-      db.prepare("UPDATE issue_submissions SET issue_number = ?, issue_url = ? WHERE id = ?").run(
-        issueNumber,
-        issueUrl,
-        id
-      );
+    // row claimDraftSubmission already created. Also persists the FINAL body
+    // (screenshots section folded in after the claim succeeded, see
+    // issue-routes.ts) and clears claim_expires_at — a finalized row is
+    // never eligible for staleness-reclaim regardless (issue_number is no
+    // longer NULL), but NULLing it out avoids a stale-looking timestamp
+    // hanging around on a row that's actually done.
+    finalizeIssueSubmission(id: number, fields: FinalizeIssueSubmissionFields): void {
+      db.prepare(
+        "UPDATE issue_submissions SET issue_number = ?, issue_url = ?, body = ?, claim_expires_at = NULL WHERE id = ?"
+      ).run(fields.issueNumber, fields.issueUrl, fields.body, id);
     },
 
     // Releases a claim when the tracker call itself failed (network error,

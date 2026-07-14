@@ -14,6 +14,7 @@ import type {
   RecordIssueSubmissionFields,
   ClaimDraftSubmissionFields,
   ClaimDraftSubmissionResult,
+  FinalizeIssueSubmissionFields,
   IssueSubmissionRow,
   TrackableSubmissionRow,
   UpdateIssueTrackingFields,
@@ -75,7 +76,7 @@ export type DbClient = {
   markSessionResolved(sessionId: string): Promise<void>;
   recordIssueSubmission(fields: RecordIssueSubmissionFields): Promise<number>;
   claimDraftSubmission(fields: ClaimDraftSubmissionFields): Promise<ClaimDraftSubmissionResult>;
-  finalizeIssueSubmission(id: number, issueNumber: number, issueUrl: string | null): Promise<void>;
+  finalizeIssueSubmission(id: number, fields: FinalizeIssueSubmissionFields): Promise<void>;
   releaseDraftSubmission(id: number): Promise<void>;
   getIssueSubmissionsForSession(sessionId: string): Promise<IssueSubmissionRow[]>;
   getSubmissionByDraftToolUseId(draftToolUseId: string): Promise<IssueSubmissionRow | null>;
@@ -234,8 +235,7 @@ export function createDbClient(dbPath: string): DbClient {
     markSessionResolved: (sessionId) => call<void>("markSessionResolved", [sessionId]),
     recordIssueSubmission: (fields) => call<number>("recordIssueSubmission", [fields]),
     claimDraftSubmission: (fields) => call<ClaimDraftSubmissionResult>("claimDraftSubmission", [fields]),
-    finalizeIssueSubmission: (id, issueNumber, issueUrl) =>
-      call<void>("finalizeIssueSubmission", [id, issueNumber, issueUrl]),
+    finalizeIssueSubmission: (id, fields) => call<void>("finalizeIssueSubmission", [id, fields]),
     releaseDraftSubmission: (id) => call<void>("releaseDraftSubmission", [id]),
     getIssueSubmissionsForSession: (sessionId) =>
       call<IssueSubmissionRow[]>("getIssueSubmissionsForSession", [sessionId]),

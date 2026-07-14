@@ -714,7 +714,7 @@ describe("claimDraftSubmission / finalizeIssueSubmission / releaseDraftSubmissio
       sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_3",
     });
     if (!claim.claimed) throw new Error("unreachable");
-    storage.finalizeIssueSubmission(claim.id, 77, "https://x/77");
+    storage.finalizeIssueSubmission(claim.id, { issueNumber: 77, issueUrl: "https://x/77", body: "final body" });
 
     const second = storage.claimDraftSubmission({
       sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_3",
@@ -748,11 +748,50 @@ describe("claimDraftSubmission / finalizeIssueSubmission / releaseDraftSubmissio
       sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_claim_5",
     });
     if (!claim.claimed) throw new Error("unreachable");
-    storage.finalizeIssueSubmission(claim.id, 88, "https://x/88");
+    storage.finalizeIssueSubmission(claim.id, { issueNumber: 88, issueUrl: "https://x/88", body: "final body" });
     storage.releaseDraftSubmission(claim.id); // must be a no-op now
     const row = storage.getSubmissionByDraftToolUseId("tu_claim_5");
     expect(row).not.toBeNull();
     expect(row!.issue_number).toBe(88);
+  });
+
+  // Codex full-repo review (2026-07-14, Warning): a claim whose owning
+  // request crashed/timed out before finalize/release used to block that
+  // draft_tool_use_id FOREVER (permanent 409 on every future retry, no
+  // recovery). Simulates that by directly backdating claim_expires_at
+  // (can't wait out the real 60s CLAIM_TTL_MS in a test) rather than
+  // waiting for a real timeout.
+  it("过期未完成的 claim（claim_expires_at 已过）在下一次 claim 时被回收，而不是永久 409", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_stale_1",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+
+    const db = new Database(dbPath);
+    db.prepare("UPDATE issue_submissions SET claim_expires_at = ? WHERE id = ?").run(Date.now() - 1000, claim.id);
+    db.close();
+
+    const retry = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b2", labels: [], draftToolUseId: "tu_stale_1",
+    });
+    expect(retry.claimed).toBe(true);
+    expect(storage.getIssueSubmissionsForSession("s1")).toHaveLength(1); // stale row replaced, not duplicated
+  });
+
+  it("未过期的 claim（claim_expires_at 还没到）不会被回收 — 仍然返回 claimed:false", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_stale_2",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+
+    const stillLive = storage.claimDraftSubmission({
+      sessionId: "s1", repoId, userId: uid, title: "t", body: "b2", labels: [], draftToolUseId: "tu_stale_2",
+    });
+    expect(stillLive.claimed).toBe(false);
   });
 });
 

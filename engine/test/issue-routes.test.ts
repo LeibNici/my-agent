@@ -454,6 +454,51 @@ describe("POST /api/issues/submit", () => {
     expect(rows).toHaveLength(1); // never a duplicate row
   });
 
+  // Codex full-repo review (2026-07-14, Warning): a card rendered from a
+  // session predating draft_tool_use_id tracking sends draft_tool_use_id:
+  // null while session_id IS present — this combination used to skip
+  // claiming ENTIRELY and had zero protection against a double-click. The
+  // synthetic session+repo+title key (issue-routes.ts's effectiveDraftKey)
+  // covers it via the exact same claim path as a real draftToolUseId.
+  it("idempotency also covers a SESSION-scoped submission with no draft_tool_use_id at all (legacy card replay)", async () => {
+    const { id: userId, token } = await seedUser("admin", "submit-no-draft-id");
+    const repoId = await seedRepo();
+    const sessionId = await client.createSession("New Chat", userId);
+    const fetchMock = stubFetch([
+      LABELS_ROUTE,
+      issuesCreateRoute(201, { iid: 63, web_url: "https://gitlab.example.com/group/proj/-/issues/63", title: "Bug title" }),
+      issueGetRoute(200, { state: "opened", labels: [], closed_at: null }),
+      RESOURCE_STATE_EVENTS_ROUTE,
+    ]);
+    const app = buildTestApp();
+    const body = {
+      repo_id: repoId,
+      title: "Bug title",
+      body: "Bug body",
+      session_id: sessionId,
+      // No draft_tool_use_id — the legacy/pre-tracking case.
+    };
+
+    const [respA, respB] = await Promise.all([
+      authed(app, token, "/api/issues/submit", { method: "POST", body: JSON.stringify(body) }),
+      authed(app, token, "/api/issues/submit", { method: "POST", body: JSON.stringify(body) }),
+    ]);
+
+    const createCalls = fetchMock.mock.calls.filter(([url, init]) =>
+      isIssuesCreate(url as string, (init ?? {}) as RequestInit)
+    ).length;
+    expect(createCalls).toBe(1);
+
+    const bodies = await Promise.all([respA.json(), respB.json()]);
+    for (const [resp, respBody] of [[respA, bodies[0]], [respB, bodies[1]]] as const) {
+      expect([200, 409]).toContain(resp.status);
+      if (resp.status === 200) expect(respBody.issue_number).toBe(63);
+    }
+
+    const rows = await client.getIssueSubmissionsForSession(sessionId);
+    expect(rows).toHaveLength(1);
+  });
+
   it("session stays open across a full issue lifecycle: submit → comment → close → reopen, all against the SAME session_id, resolved_at null throughout", async () => {
     const { id: userId, token } = await seedUser("admin", "lifecycle-admin");
     const repoId = await seedRepo();

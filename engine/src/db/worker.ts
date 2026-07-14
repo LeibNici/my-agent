@@ -208,8 +208,8 @@ parentPort.on("message", (req: Request) => {
         break;
       }
       case "finalizeIssueSubmission": {
-        const [submissionId, issueNumber, issueUrl] = args as [number, number, string | null];
-        storage.finalizeIssueSubmission(submissionId, issueNumber, issueUrl);
+        const [submissionId, fields] = args as [number, Parameters<typeof storage.finalizeIssueSubmission>[1]];
+        storage.finalizeIssueSubmission(submissionId, fields);
         reply({ id, ok: true, result: undefined });
         break;
       }

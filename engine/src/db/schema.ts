@@ -136,9 +136,19 @@ export function initSchema(dbPath: string): void {
       last_checked_at TEXT,
       track_error TEXT,
       status_changed_at TEXT,
+      claim_expires_at INTEGER,
       FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
     )
   `);
+  // Codex full-repo review (2026-07-14, Warning): a claimDraftSubmission
+  // row (issue-tracker.ts's idempotency claim, added 2026-07-14) whose
+  // owning request crashed or timed out AFTER claiming but BEFORE
+  // finalizeIssueSubmission/releaseDraftSubmission used to stay
+  // issue_number=NULL forever — every future retry of that exact draft got
+  // a permanent 409 with no way to recover. A JS epoch ms (not the
+  // local-naive TEXT format the rest of this table uses) so staleness
+  // comparison is a plain numeric compare, not string parsing.
+  ensureColumn(db, "issue_submissions", "claim_expires_at", "claim_expires_at INTEGER");
 
   // Issue actions
   db.exec(`
