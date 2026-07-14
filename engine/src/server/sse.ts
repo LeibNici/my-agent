@@ -32,6 +32,11 @@ import type { RunTurnFn, RunTurnDeps, LinkedIssueSummary } from "../engine/turn.
 import type { ToolDef, ToolContext } from "../tools/registry.js";
 import type { DomainBlock, ImageBlock } from "../domain.js";
 import { domainToLegacy } from "../codec-legacy.js";
+// stripLeakedThinkingTags is a pure string->string helper with no pi types
+// in its signature (verified: codec-pi.ts's own file header confines pi
+// TYPES to codec-pi.ts/event-adapter.ts — this function isn't one), so
+// importing it here doesn't cross that isolation boundary.
+import { stripLeakedThinkingTags } from "../codec-pi.js";
 
 // v1 app/main.py:75 — verbatim.
 export const MAX_MESSAGE_LENGTH = 10000;
@@ -350,6 +355,21 @@ export async function* chatEventStream(
   await db.addMessage(sessionId, "user", userContent);
 
   let fullText = "";
+  // Codex full-repo review (2026-07-14, Warning): the browser's "done"
+  // frame needs the SAME multi-segment concatenation fullText provides
+  // (a turn with tool calls has multiple assistant text segments, and the
+  // frame is meant to carry all of them — see this file's own e2e-smoke
+  // golden) but with each segment individually run through
+  // stripLeakedThinkingTags (codec-pi.ts's DashScope/Qwen reasoning-leak
+  // defense, FLOW-002) — the same scrub every segment already gets before
+  // being PERSISTED (tool_exchange via piAssistantToDomain, the final
+  // segment via event-adapter.ts's finish()). Built up per-segment (see
+  // the tool_exchange/done cases below) rather than scrubbing the fully
+  // concatenated fullText once at the end, which could eat an earlier
+  // clean segment's text if a LATER segment happened to leak (the
+  // orphan-close-tag case strips from the string START through the first
+  // close tag found, with no segment awareness of its own).
+  let scrubbedFullText = "";
   // Text streamed since the last fully-persisted tool exchange — the
   // fallback saved if the connection drops or the turn errors before a
   // normal "done".
@@ -437,6 +457,20 @@ export async function* chatEventStream(
           // error in this same turn. Never forwarded to the browser.
           await db.addMessage(sessionId, "assistant", legacyContent(event.data.assistant));
           await db.addMessage(sessionId, "user", legacyContent(event.data.results));
+          // Codex full-repo review (2026-07-14, Warning): this segment's
+          // text (everything streamed since the LAST tool_exchange, or
+          // turn start) is scrubbed and folded into scrubbedFullText HERE,
+          // per-segment — not by scrubbing the whole multi-segment
+          // fullText as one blob later. stripLeakedThinkingTags's
+          // orphan-close-tag handling strips from the STRING START through
+          // the first `</thinking>` it finds; running it once over several
+          // concatenated segments would incorrectly eat an earlier,
+          // perfectly clean segment if a LATER one happened to leak.
+          // Scrubbing each segment against its own boundary (this
+          // tool_exchange, or the final "done" segment below) keeps every
+          // other segment's legitimate text intact regardless of which
+          // segment actually leaked.
+          scrubbedFullText += stripLeakedThinkingTags(currentTextBuffer);
           currentTextBuffer = "";
           break;
         }
@@ -455,8 +489,22 @@ export async function* chatEventStream(
         }
         case "done": {
           let finalMessageId: number | null = null;
+          // Failure branch keeps the existing raw fullText fallback
+          // (below) — event.data.text is empty on failure by design (see
+          // that branch's own comment), and the "回复未完成" partial text
+          // it persists is already the pre-existing, unscrubbed behavior
+          // for that path, not the gap this review flagged.
+          let doneText = fullText;
           if (event.data.success) {
+            // event.data.text (finalText) is already scrubbed —
+            // event-adapter.ts's finish() sources it from
+            // piAssistantToDomain's stripLeakedThinkingTags, the same as
+            // every tool_exchange segment above. Folding it into
+            // scrubbedFullText here (not overwriting) preserves the
+            // multi-segment concatenation the browser's "done" frame is
+            // meant to carry.
             const finalText = event.data.text ?? "";
+            doneText = scrubbedFullText + finalText;
             if (finalText) {
               finalMessageId = await db.addMessage(sessionId, "assistant", finalText);
             }
@@ -505,7 +553,7 @@ export async function* chatEventStream(
             event: "done",
             data: JSON.stringify({
               session_id: sessionId,
-              text: fullText,
+              text: doneText,
               message_id: finalMessageId,
               budget_exhausted: event.data.budgetExhausted ?? false,
             }),

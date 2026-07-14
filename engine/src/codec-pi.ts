@@ -198,7 +198,14 @@ const ORPHAN_THINKING_CLOSE_RE = /^[\s\S]*?<\/(?:thinking|think)>/i;
 const HAS_OPEN_THINKING_TAG_RE = /<(?:thinking|think)>/i;
 const HAS_CLOSE_THINKING_TAG_RE = /<\/(?:thinking|think)>/i;
 
-function stripLeakedThinkingTags(text: string): string {
+// Exported (not just used internally by piAssistantToDomain below): the
+// wrap-up call (engine/turn.ts's runWrapup) streams text straight from
+// pi-ai's streamSimple, bypassing the Agent/piAssistantToDomain entirely —
+// it needs the exact same scrub applied to its own accumulated text before
+// persisting/emitting it, or a leaked span that's caught for every normal
+// tool-loop turn would sail through uncaught whenever a turn happens to
+// end in a wrap-up (budget-exhaustion) call instead.
+export function stripLeakedThinkingTags(text: string): string {
   // Properly paired tags anywhere in the text (either tag name): drop the
   // whole opening-to-closing span, wherever it falls.
   let cleaned = text.replace(PAIRED_THINKING_TAG_RE, "");

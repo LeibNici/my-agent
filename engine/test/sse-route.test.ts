@@ -334,6 +334,50 @@ describe("POST /api/chat — SSE contract (oracle: v1-python-final:tests/test_ss
 // ==================== Supplementary SSE semantics (beyond the four core scenarios) ====================
 
 describe("POST /api/chat — supplementary semantics", () => {
+  // Codex full-repo review (2026-07-14, Warning): the browser's terminal
+  // "done" frame used to always carry the raw accumulation of every
+  // text_delta this turn (fullText) — event-adapter.ts's done event
+  // (event.data.text) is what's ALREADY been through codec-pi.ts's
+  // stripLeakedThinkingTags (the DashScope/Qwen reasoning-leak defense,
+  // FLOW-002), and is also what gets persisted to the DB — so a leaked
+  // `<thinking>...</thinking>` span that got scrubbed out of the DB row
+  // was still reaching the browser's own final frame, even though a
+  // session replay (which re-reads from the DB) looked clean. This stub
+  // scenario mirrors that exact real shape: text_delta events stream the
+  // raw (unscrubbed) text — matching how event-adapter.ts forwards pi's
+  // raw per-delta text (never scrubbed on a per-chunk basis, see codec-pi.
+  // ts's own doc comment on why) — while the final done event's own
+  // data.text is already scrubbed, exactly as the real event-adapter
+  // produces it.
+  it("done 帧的 text 必须和落库文本一致（用 event.data.text，而不是逐字累加的 fullText）——已清洗的最终文本，不泄漏 <thinking> 标签残留", async () => {
+    const { token } = await seedUser();
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([
+        { type: "text_delta", data: { text: "Now let me think about this...</thinking>真正的回答" } },
+        {
+          type: "done",
+          data: { text: "真正的回答", success: true, budgetExhausted: false },
+        },
+      ]),
+    });
+    const { frames } = await postChat(app, token, { message: "问题" });
+    const doneFrame = frames.find((f) => f.event === "done")!;
+    const doneData = JSON.parse(doneFrame.data);
+    expect(doneData.text).toBe("真正的回答"); // scrubbed, matches event.data.text
+    expect(doneData.text).not.toContain("</thinking>");
+    expect(doneData.text).not.toContain("Now let me think");
+
+    // The persisted row must show the exact same (already-scrubbed) text —
+    // proving the browser's view and the DB's view are the SAME string,
+    // not two independently-derived copies that can drift apart.
+    const sessionId = JSON.parse(frames[0].data).session_id;
+    const messages = await client.getMessages(sessionId);
+    const assistantMsg = messages.find((m) => m.role === "assistant");
+    expect(assistantMsg!.content).toBe("真正的回答");
+  });
+
   it("resolved 会话来消息 → 透明新建，reason='resolved'", async () => {
     const { id: uid, token } = await seedUser();
     const oldSessionId = await client.createSession("New Chat", uid);

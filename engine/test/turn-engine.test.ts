@@ -381,6 +381,30 @@ describe("runTurn — wrap-up v1 parity（review fix：fallback 文本、metrics
     await mock.close();
   });
 
+  // Codex full-repo review (2026-07-14, Warning): runWrapup bypasses the
+  // Agent/event-adapter.ts entirely (see the file header's design note),
+  // so it never went through piAssistantToDomain's stripLeakedThinkingTags
+  // — the DashScope/Qwen reasoning-leak defense (FLOW-002) every normal
+  // tool-loop turn's final text gets. Worse than the sse.ts-level gap:
+  // for a wrap-up turn this meant even the PERSISTED text (not just what
+  // streamed live) carried the leaked span. Proven against a real mock
+  // response containing an orphan `</thinking>` close tag (the actually-
+  // observed production shape, per codec-pi.ts's own doc comment) in the
+  // wrap-up's text.
+  it("wrap-up 文本里的泄漏 <thinking> 残留同样被 stripLeakedThinkingTags 清洗（不只是循环调用的最终文本）", async () => {
+    const turns = exhaustingTurns();
+    turns[8] = textTurn("Now I have enough info to answer.</thinking>真正的阶段性汇报");
+    const mock = startMock(turns);
+    const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
+    const events = await collect(
+      runTurn({ settings, tools: [calculatorTool], ctx: EMPTY_CTX }, { sessionId: "s1", history: [], userText: "查" }),
+    );
+    const done = events.at(-1)!;
+    expect(done.type).toBe("done");
+    expect(done.data).toEqual({ text: "真正的阶段性汇报", success: true, budgetExhausted: true });
+    await mock.close();
+  });
+
   it("wrap-up 有自己的 llm_metrics 行：共 maxToolIterations+1 条，末条 iteration === maxToolIterations（v1 的 numbering），usage 来自 wrap-up 响应", async () => {
     const mock = startMock(exhaustingTurns());
     const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });

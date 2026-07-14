@@ -36,7 +36,7 @@ import { toPiTools } from "./pi-tools.js";
 import { createEventAdapter } from "../event-adapter.js";
 import { legacyListToDomain } from "../codec-legacy.js";
 import { prepareModelMessages } from "../history-policy.js";
-import { domainToPi } from "../codec-pi.js";
+import { domainToPi, stripLeakedThinkingTags } from "../codec-pi.js";
 import type { DomainEvent, ImageBlock } from "../domain.js";
 
 const PROVIDER_ID = "anthropic";
@@ -319,6 +319,18 @@ async function runWrapup(
       totalMs: Date.now() - callStartMs,
     },
   });
+  // Codex full-repo review (2026-07-14, Warning): this call bypasses the
+  // Agent entirely (see file header), so it never goes through
+  // piAssistantToDomain — the DashScope/Qwen reasoning-leak defense
+  // (FLOW-002, stripLeakedThinkingTags) that every normal tool-loop turn's
+  // final text gets. Applied here to the ACCUMULATED text (not each live
+  // text_delta — a leaked span isn't identifiable until its closing tag
+  // arrives, same reasoning as codec-pi.ts's own doc comment), so both the
+  // persisted DB row (sse.ts's "done" handler) and the browser's "done"
+  // frame end up scrubbed, matching the normal-loop path — only the live
+  // per-delta stream (line 298 above) can still show it in transit, same
+  // accepted trade-off as the main loop.
+  text = stripLeakedThinkingTags(text);
   // v1 order preserved: metrics first, THEN the fallback delta (if the
   // stream produced nothing), then done carrying the same text.
   if (!text.trim()) {
