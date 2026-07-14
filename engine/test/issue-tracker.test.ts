@@ -1124,6 +1124,92 @@ describe("verifyPendingFixReports", () => {
     expect(raw.verified).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  // Codex 审查（2026-07-14，C1，已核实并修复）：这个函数从功能上线起就
+  // 不分平台，任何 GitHub 报告都会被塞进 GitLab 专用的 parseIssueApiBase，
+  // 拼出 https://github.com/api/v4/projects/... 这种不存在的地址，404
+  // 后被永久判 verified=false（getUnverifiedFixReports 只捞 verified IS
+  // NULL 的行，错判的 false 再也不会重试）——今天新增的 GitHub 完成报告
+  // 解析会因此永远显示"已验证修复: 0"。下面三条测试对应真实用
+  // api.github.com 验证过的 Compare API 语义：ahead_by=0 表示 commit 已
+  // 被目标分支包含（无论是分支尖端还是更早的祖先提交）。
+  async function seedGithubUnverifiedReport(): Promise<{ repoId: number; subId: number; reportId: number }> {
+    const repoId = await client.createRepo({
+      name: "gh-proj",
+      url: "https://github.com/acme/widgets.git",
+      credToken: "gh-verify-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 9,
+      issueUrl: "https://github.com/acme/widgets/issues/9",
+    });
+    const reportId = await client.upsertFixReport({
+      submissionId: subId,
+      noteId: 1,
+      workerId: "w1",
+      commitSha: "deadbeef1234",
+      files: ["a.ts"],
+      reportedAt: null,
+    });
+    return { repoId, subId, reportId };
+  }
+
+  it("GitHub: Compare API 返回 ahead_by=0（commit 已被目标分支包含）-> verified 变为 1，走的是 compare 端点而不是 GitLab 的 refs 端点", async () => {
+    const { reportId } = await seedGithubUnverifiedReport();
+    const fetchMock = vi.fn(async (url: string, init?: { headers?: Record<string, string> }) => {
+      expect(url).toBe("https://api.github.com/repos/acme/widgets/compare/test...deadbeef1234");
+      expect(init?.headers?.Authorization).toBe("token gh-verify-token");
+      return { status: 200, json: async () => ({ status: "behind", ahead_by: 0, behind_by: 3 }) } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const settings = makeSettings({ APP_ISSUE_FIX_TARGET_BRANCH: "test" });
+    const verdicts = await verifyPendingFixReports(client, settings);
+    expect(verdicts).toBe(1);
+    expect(readFixReportRaw(dbPath, reportId).verified).toBe(1);
+  });
+
+  it("GitHub: Compare API 返回 404（commit 或分支不存在）-> verified 变为 0", async () => {
+    const { reportId } = await seedGithubUnverifiedReport();
+    const fetchMock = vi.fn(async () => ({ status: 404, json: async () => ({}) })) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", fetchMock);
+
+    const settings = makeSettings({ APP_ISSUE_FIX_TARGET_BRANCH: "test" });
+    const verdicts = await verifyPendingFixReports(client, settings);
+    expect(verdicts).toBe(1);
+    expect(readFixReportRaw(dbPath, reportId).verified).toBe(0);
+  });
+
+  it("GitHub: Compare API 返回 ahead_by>0（commit 还没合入目标分支）-> verified 变为 0", async () => {
+    const { reportId } = await seedGithubUnverifiedReport();
+    const fetchMock = vi.fn(async () => ({
+      status: 200,
+      json: async () => ({ status: "diverged", ahead_by: 2, behind_by: 1 }),
+    })) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", fetchMock);
+
+    const settings = makeSettings({ APP_ISSUE_FIX_TARGET_BRANCH: "test" });
+    const verdicts = await verifyPendingFixReports(client, settings);
+    expect(verdicts).toBe(1);
+    expect(readFixReportRaw(dbPath, reportId).verified).toBe(0);
+  });
+
+  it("GitHub: Compare API 瞬时错误（500）-> 保持未验证（verified 仍是 NULL），不猜测、留给下一轮重试", async () => {
+    const { reportId } = await seedGithubUnverifiedReport();
+    const fetchMock = vi.fn(async () => ({ status: 500, json: async () => ({}) })) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", fetchMock);
+
+    const settings = makeSettings({ APP_ISSUE_FIX_TARGET_BRANCH: "test" });
+    const verdicts = await verifyPendingFixReports(client, settings);
+    expect(verdicts).toBe(0);
+    expect(readFixReportRaw(dbPath, reportId).verified).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

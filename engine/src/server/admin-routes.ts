@@ -72,6 +72,24 @@ function adminRepoView(repo: FullRepoRow): Record<string, unknown> {
 
 const ACCESS_LEVELS = new Set(["read", "write", "admin"]);
 
+// Codex review (2026-07-14, W3): llm-config/issue-tracking-config's POST
+// handlers used to fail their own `typeof value === "string"` check
+// silently for a wrong-typed field (a number, object, array) — the field
+// just got treated as "omitted" and the request still returned 200 {ok:
+// true}, misleading an admin into thinking a bad value was saved when it
+// was actually dropped. FIELD_INVALID is a third state distinct from both
+// "absent/blank" (undefined — the merge-preserving "don't touch this
+// field" default) and "a valid trimmed string", so callers can 422 on it
+// instead of silently no-op'ing.
+const FIELD_INVALID = Symbol("field-invalid");
+function optionalStringField(value: unknown, maxLen: number): string | undefined | typeof FIELD_INVALID {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") return FIELD_INVALID;
+  const trimmed = value.trim();
+  if (trimmed.length > maxLen) return FIELD_INVALID;
+  return trimmed === "" ? undefined : trimmed;
+}
+
 // BUG-001 (QA report): repeat/double-click submissions of the same repo URL
 // silently created duplicate rows — no uniqueness check existed anywhere
 // (v1 had none either, git show v1-python-final:app/database.py's
@@ -468,13 +486,30 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     }>(c);
     if (body === null) return c.json({ detail: "Invalid JSON body" }, 422);
 
-    const patch: { apiKey?: string; baseUrl?: string; model?: string; maxTokens?: number } = {};
-    if (typeof body.api_key === "string" && body.api_key.trim()) patch.apiKey = body.api_key.trim();
-    if (typeof body.base_url === "string" && body.base_url.trim()) patch.baseUrl = body.base_url.trim();
-    if (typeof body.model === "string" && body.model.trim()) patch.model = body.model.trim();
-    if (typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens) && body.max_tokens > 0) {
-      patch.maxTokens = Math.floor(body.max_tokens);
+    const apiKey = optionalStringField(body.api_key, 500);
+    const baseUrl = optionalStringField(body.base_url, 500);
+    const model = optionalStringField(body.model, 200);
+    if (apiKey === FIELD_INVALID || baseUrl === FIELD_INVALID || model === FIELD_INVALID) {
+      return c.json({ detail: "api_key/base_url/model must be strings within their length limits" }, 422);
     }
+    let maxTokens: number | undefined;
+    if (body.max_tokens !== undefined) {
+      if (
+        typeof body.max_tokens !== "number" ||
+        !Number.isFinite(body.max_tokens) ||
+        body.max_tokens <= 0 ||
+        body.max_tokens > 1_000_000
+      ) {
+        return c.json({ detail: "max_tokens must be a positive number" }, 422);
+      }
+      maxTokens = Math.floor(body.max_tokens);
+    }
+
+    const patch: { apiKey?: string; baseUrl?: string; model?: string; maxTokens?: number } = {};
+    if (apiKey !== undefined) patch.apiKey = apiKey;
+    if (baseUrl !== undefined) patch.baseUrl = baseUrl;
+    if (model !== undefined) patch.model = model;
+    if (maxTokens !== undefined) patch.maxTokens = maxTokens;
 
     const saved = await deps.db.setLlmConfig(patch);
     if (saved.api_key) deps.settings.apiKey = saved.api_key;
@@ -502,10 +537,13 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     const body = await parseBody<{ fix_bot_username?: unknown }>(c);
     if (body === null) return c.json({ detail: "Invalid JSON body" }, 422);
 
-    const patch: { fixBotUsername?: string } = {};
-    if (typeof body.fix_bot_username === "string" && body.fix_bot_username.trim()) {
-      patch.fixBotUsername = body.fix_bot_username.trim();
+    const fixBotUsername = optionalStringField(body.fix_bot_username, 255);
+    if (fixBotUsername === FIELD_INVALID) {
+      return c.json({ detail: "fix_bot_username must be a string within 255 characters" }, 422);
     }
+
+    const patch: { fixBotUsername?: string } = {};
+    if (fixBotUsername !== undefined) patch.fixBotUsername = fixBotUsername;
 
     const saved = await deps.db.setIssueTrackingConfig(patch);
     if (saved.fix_bot_username) deps.settings.issueFixBotUsername = saved.fix_bot_username;

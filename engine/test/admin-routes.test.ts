@@ -811,6 +811,32 @@ describe("llm config", () => {
     const resp = await authed(app, token, "/api/admin/llm-config", { method: "POST", body: "not json" });
     expect(resp.status).toBe(422);
   });
+
+  // Codex 审查（2026-07-14，W3，已核实并修复）：一个数字/对象/数组类型的
+  // 字段以前会静默 fail 掉 typeof==="string" 检查，被当成"没传"处理，请求
+  // 仍然返回 200 {ok:true}——误导管理员以为保存成功，实际这个字段被悄悄
+  // 丢弃了。现在应该是明确的 422，且不能改动任何已保存的值。
+  it("POST with a wrong-typed field (number instead of string) → 422, nothing changed", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    await authed(app, token, "/api/admin/llm-config", {
+      method: "POST", body: JSON.stringify({ model: "original-model" }),
+    });
+    const resp = await authed(app, token, "/api/admin/llm-config", {
+      method: "POST", body: JSON.stringify({ model: 12345 }),
+    });
+    expect(resp.status).toBe(422);
+    expect(settings.model).toBe("original-model");
+  });
+
+  it("POST with max_tokens as a non-positive number → 422", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/admin/llm-config", {
+      method: "POST", body: JSON.stringify({ max_tokens: -5 }),
+    });
+    expect(resp.status).toBe(422);
+  });
 });
 
 // ==================== Issue-tracking config ====================
@@ -865,5 +891,18 @@ describe("issue-tracking config", () => {
     const app = buildTestApp();
     const resp = await authed(app, token, "/api/admin/issue-tracking-config", { method: "POST", body: "not json" });
     expect(resp.status).toBe(422);
+  });
+
+  it("POST with a wrong-typed fix_bot_username (number instead of string) → 422, nothing changed", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    await authed(app, token, "/api/admin/issue-tracking-config", {
+      method: "POST", body: JSON.stringify({ fix_bot_username: "original-bot" }),
+    });
+    const resp = await authed(app, token, "/api/admin/issue-tracking-config", {
+      method: "POST", body: JSON.stringify({ fix_bot_username: 169437 }),
+    });
+    expect(resp.status).toBe(422);
+    expect(settings.issueFixBotUsername).toBe("original-bot");
   });
 });

@@ -302,6 +302,53 @@ async function fetchAndStoreReports(
   }
 }
 
+// Codex review (2026-07-14, C1): this used to run EVERY pending report
+// (GitHub included, once fetchAndStoreReportsGithub started producing them)
+// through GitLab's own commits/{sha}/refs endpoint — for a github.com
+// issue_url that built a nonsense URL (`https://github.com/api/v4/...`),
+// which 404s, which this function reads as "commit doesn't exist" and
+// permanently writes verified=false (getUnverifiedFixReports only ever
+// re-considers verified IS NULL rows, so a wrong `false` never retries).
+// Every GitHub completion report would have been silently and permanently
+// mis-verified — the exact feature this session added would report
+// "已验证修复: 0" forever. Verified live against the real GitHub API
+// (api.github.com/repos/.../compare/{branch}...{sha}): a commit that IS
+// the branch tip returns status=identical/ahead_by=0, an ancestor commit
+// returns status=behind/ahead_by=0, and a nonexistent commit 404s — so
+// `ahead_by === 0` is the GitHub equivalent of GitLab's "branch list
+// includes this commit" check.
+async function verifyGithubCommit(
+  issueUrl: string,
+  commitSha: string,
+  token: string,
+  targetBranch: string,
+): Promise<boolean | null> {
+  let path = "";
+  try {
+    path = new URL(issueUrl).pathname.replace(/^\/+|\/+$/g, "");
+  } catch {
+    return null;
+  }
+  const [owner, repoName] = path.split("/");
+  if (!owner || !repoName) return null;
+
+  let resp: Response;
+  try {
+    resp = await fetchWithTimeout(
+      `https://api.github.com/repos/${owner}/${repoName}/compare/` +
+        `${encodeURIComponent(targetBranch)}...${encodeURIComponent(commitSha)}`,
+      { headers: githubHeaders(token) },
+      POLL_TIMEOUT_MS,
+    );
+  } catch {
+    return null; // network failure — leave verified=NULL, retried next round
+  }
+  if (resp.status === 404) return false; // commit or branch genuinely doesn't exist
+  if (resp.status !== 200) return null; // rate-limited/transient — don't guess, retry next round
+  const data = (await resp.json()) as { ahead_by?: number };
+  return data.ahead_by === 0;
+}
+
 /** Platform-side check that each reported commit is actually reachable
  * from the target branch (settings.issueFixTargetBranch) — a worker's
  * self-reported "merged" claim is never taken at face value. Runs after
@@ -315,8 +362,20 @@ export async function verifyPendingFixReports(db: DbClient, settings: Settings):
     if (!rep.issue_url) continue; // leave NULL — retried next round once fixable
     const repo = rep.repo_id !== null ? await db.getRepoAdmin(rep.repo_id) : null;
     const token = repo?.cred_token;
+    if (!token) continue;
+
+    const host = safeHostname(rep.issue_url).toLowerCase();
+    if (host === "github.com" || host === "www.github.com") {
+      const verified = await verifyGithubCommit(rep.issue_url, rep.commit_sha, token, settings.issueFixTargetBranch);
+      if (verified !== null) {
+        await db.setFixReportVerified(rep.id, verified);
+        verdicts++;
+      }
+      continue;
+    }
+
     const { error, base } = await parseIssueApiBase(rep.issue_url);
-    if (error || !token || !base) continue;
+    if (error || !base) continue;
 
     let resp: Response;
     try {
@@ -419,7 +478,14 @@ async function pollGithub(
   // the equivalent guard in pollOne's GitLab path below, an untouched open
   // issue skips the comments round-trip entirely.
   if (status === "merged" || status === "closed" || status === "reopened") {
-    await fetchAndStoreReportsGithub(owner, repoName, { id: sub.id, issue_number: sub.issue_number }, token, db, settings);
+    await fetchAndStoreReportsGithub(
+      owner,
+      repoName,
+      { id: sub.id, issue_number: sub.issue_number },
+      token,
+      db,
+      settings,
+    );
   }
 }
 
