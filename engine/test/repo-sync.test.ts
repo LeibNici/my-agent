@@ -218,6 +218,13 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
     expect(mockedExecFile).not.toHaveBeenCalled();
   });
 
+  it("拒绝 0.0.0.0（Codex 全仓库审查，2026-07-14，Warning：Linux/多数系统上 0.0.0.0 等价于 127.0.0.1，是已知的 SSRF loopback 绕过手法），且从不调用 git", async () => {
+    const result = await cloneRepo({ url: "http://0.0.0.0/x", repoId: 11, reposDir });
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/internal\/private host/);
+    expect(mockedExecFile).not.toHaveBeenCalled();
+  });
+
   it("拒绝带方括号的 IPv6 字面量 host（[::1]/[fd00::1]/[fe80::1]），且从不调用 git", async () => {
     for (const bracketed of ["[::1]", "[fd00::1]", "[fe80::1]"]) {
       const result = await cloneRepo({ url: `http://${bracketed}/x`, repoId: 10, reposDir });
@@ -232,6 +239,33 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/Invalid URL protocol/);
     expect(mockedExecFile).not.toHaveBeenCalled();
+  });
+
+  it("已 clone 过的仓库再次 sync（走 pull 分支）也会重新校验 url，不是只在最初 clone 时查一次（Codex 全仓库审查，2026-07-14，Warning）", async () => {
+    const originDir = mkdtempSync(join(tmpdir(), "repo-sync-ssrf-origin-"));
+    initOriginRepo(originDir);
+    try {
+      // 先用不校验的入口真的 clone 一份到本地——模拟"这个仓库当初用一个
+      // 合法 host clone 成功，checkout 已经在磁盘上了"这个前提。
+      const first = await syncRepoUnvalidated({ url: originDir, repoId: 20, reposDir });
+      expect(first.ok).toBe(true);
+      mockedExecFile.mockClear();
+
+      // 再用生产入口（真正过 validateUrl 的 syncRepo）对同一个 repoId 发起
+      // 一次新的 sync，但这次带一个 SSRF 应该拒绝的 url——checkout 已经
+      // 存在，会走"pull"分支而不是"clone"分支。修复前：pull 分支完全不
+      // 校验 url，直接对本地 checkout 发起真实 git pull（origin remote
+      // 还是当初 clone 时的合法地址，所以看不出问题——但如果 db 里这个仓库
+      // 的 url 字段本身已经被改成了内网地址，这里应该在发起任何 git 操作
+      // 之前就先被挡下来，而不是要等到管理员下一次显式改 url 触发 clone
+      // 分支才会被查一次）。
+      const second = await syncRepo({ url: "http://127.0.0.1/evil", repoId: 20, reposDir });
+      expect(second.ok).toBe(false);
+      expect(second.message).toMatch(/internal\/private host/);
+      expect(mockedExecFile).not.toHaveBeenCalled();
+    } finally {
+      rmSync(originDir, { recursive: true, force: true });
+    }
   });
 
   it("正常 https:// host 校验通过后走真实 clone 路径（会调用 git，失败也没关系——这里只验证没被 SSRF 挡在前面）", async () => {

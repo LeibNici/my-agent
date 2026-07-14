@@ -29,6 +29,7 @@ import {
   searchRepoIssues,
   uploadGitlabAttachment,
   uploadSessionScreenshots,
+  fetchWithTimeout,
   __internal,
 } from "../src/tools/issue-tracker-client.js";
 
@@ -926,5 +927,85 @@ describe("uploadSessionScreenshots", () => {
 
     await uploadSessionScreenshots(repo, "s1", db);
     expect(fetchMock).toHaveBeenCalledTimes(5); // 封顶在 5 张
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchWithTimeout — redirect SSRF gate (Codex full-repo review, 2026-07-14,
+// Warning): fetch's default redirect:"follow" meant a validated GitHub/
+// GitLab host could 302 a request to a disallowed internal/private address
+// at request time, with nothing re-checking the redirect target's host
+// before request headers (including auth) went out to it.
+// ---------------------------------------------------------------------------
+
+describe("fetchWithTimeout — redirect 目标重新过 SSRF 校验", () => {
+  it("重定向目标是内网地址 -> 拒绝，且从不对重定向目标发起第二次请求", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === "https://gitlab.example.invalid/api") {
+        return {
+          status: 302,
+          headers: { get: (h: string) => (h.toLowerCase() === "location" ? "http://127.0.0.1/internal" : null) },
+        } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch to ${url} — redirect target must never be followed`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      fetchWithTimeout("https://gitlab.example.invalid/api", {}, 5000)
+    ).rejects.toThrow(/refused|internal\/private host/);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // never followed to the internal target
+  });
+
+  it("重定向目标是另一个合法公网 host -> 正常跟随并返回最终响应", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === "https://gitlab.example.invalid/api") {
+        return {
+          status: 301,
+          headers: { get: (h: string) => (h.toLowerCase() === "location" ? "https://gitlab.example.invalid/api/v2" : null) },
+        } as unknown as Response;
+      }
+      if (url === "https://gitlab.example.invalid/api/v2") {
+        return { status: 200, headers: { get: () => null }, json: async () => ({ ok: true }) } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const resp = await fetchWithTimeout("https://gitlab.example.invalid/api", {}, 5000);
+    expect(resp.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("非 3xx 响应（如 500）不触发任何重定向校验逻辑，原样返回", async () => {
+    const fetchMock = vi.fn(async () => ({
+      status: 500,
+      headers: { get: () => null },
+      text: async () => "boom",
+    } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const resp = await fetchWithTimeout("https://gitlab.example.invalid/api", {}, 5000);
+    expect(resp.status).toBe(500);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("重定向链超过上限 -> 拒绝（不会无限跟随）", async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls++;
+      return {
+        status: 302,
+        headers: {
+          get: (h: string) =>
+            h.toLowerCase() === "location" ? `https://gitlab.example.invalid/hop${calls}` : null,
+        },
+      } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchWithTimeout("https://gitlab.example.invalid/api", {}, 5000)).rejects.toThrow(
+      /too many redirects/
+    );
   });
 });

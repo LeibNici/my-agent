@@ -76,8 +76,9 @@ export function getRepoLocalPath(reposDir: string, repoId: number): string {
 
 // SSRF 防护：拒绝解析到 loopback/private/link-local 地址的 host。范围表对照
 // brief 给出的清单（v1 用 Python `ipaddress.is_loopback/is_private/
-// is_link_local/is_reserved`，覆盖面更广——比如 0.0.0.0/8、multicast 等 v1
-// 的 is_reserved 也会挡，这里没有一一复刻，只挡 brief 列出的这几段）。
+// is_link_local/is_reserved`，覆盖面更广——比如 multicast 等 v1 的
+// is_reserved 也会挡，这里没有一一复刻，只挡 brief 列出的这几段，外加
+// 2026-07-14 Codex 全仓库审查补上的 0.0.0.0/8）。
 //
 // 用 node:net 的 BlockList 而不是手写 CIDR 判断：BlockList.addSubnet +
 // .check() 本来就是给这种场景设计的内置 API（Node 15+），比手撸 IPv6 的零压缩
@@ -89,6 +90,12 @@ PRIVATE_BLOCKLIST.addSubnet("172.16.0.0", 12, "ipv4");
 PRIVATE_BLOCKLIST.addSubnet("192.168.0.0", 16, "ipv4");
 PRIVATE_BLOCKLIST.addSubnet("127.0.0.0", 8, "ipv4");
 PRIVATE_BLOCKLIST.addSubnet("169.254.0.0", 16, "ipv4"); // 含云元数据地址 169.254.169.254
+// Codex full-repo review (2026-07-14, Warning): 0.0.0.0/8 ("this network")
+// was missing — on Linux and most other OSes, connecting to a literal
+// 0.0.0.0 is treated as 127.0.0.1, a well-known SSRF loopback bypass that
+// the isIP(host)==4 branch below would otherwise wave straight through
+// (no subnet in the list matched it).
+PRIVATE_BLOCKLIST.addSubnet("0.0.0.0", 8, "ipv4");
 PRIVATE_BLOCKLIST.addSubnet("::1", 128, "ipv6");
 PRIVATE_BLOCKLIST.addSubnet("fc00::", 7, "ipv6");
 PRIVATE_BLOCKLIST.addSubnet("fe80::", 10, "ipv6");
@@ -104,6 +111,19 @@ async function isDisallowedHost(host: string): Promise<boolean> {
   // 不是字面 IP —— 走 DNS 解析，对照 v1 的 socket.gethostbyname
   // （dns.lookup 用 OS 解析器，是对应物）。解析失败：让 git 自己去踩这个错，
   // 不在这里挡（对照 v1 except 分支）。
+  //
+  // Codex full-repo review (2026-07-14, Warning) 复核过这一条，考虑过改成
+  // fail closed（查不到就当作不安全）——但真的试了一遍就发现代价比看起来
+  // 大得多：(1) 这个仓库的测试套件大量依赖"用一个语法合法但真实解析不到
+  // 的域名（如 gitlab.example.com 的子域、.invalid 保留域）当作安全的公网
+  // host 占位符"这个假设——fail closed 会让这些原本用来测试"校验通过后走
+  // 真实逻辑"的用例反而先被 SSRF 网关拦下，暴露出一大片需要重写的测试面；
+  // (2) 生产上更实际的顾虑是，一次瞬时的 DNS 抖动（resolver 超时、网络短暂
+  // 抖动）会让一个本来完全合法的仓库在周期性 sync/轮询时被直接拒绝，而不是
+  // 像现在这样把这次失败交给 git 自己独立重试——对可用性是净负担，收益
+  // （防住一个需要"校验时刚好解析失败、随后 git 自己解析又刚好拿到内网地
+  // 址"这种双重巧合窗口的边缘场景）相对有限。综合下来判断这条不值得改，
+  // 保留 v1 的原始行为（fail open），不视为需要修的缺口。
   try {
     const { address, family } = await lookup(host);
     return PRIVATE_BLOCKLIST.check(address, family === 6 ? "ipv6" : "ipv4");
@@ -316,7 +336,21 @@ export type SyncRepoOptions = {
  */
 async function syncRepoImpl(
   opts: SyncRepoOptions,
-  cloneFn: (o: CloneRepoOptions) => Promise<{ ok: boolean; message: string }>
+  cloneFn: (o: CloneRepoOptions) => Promise<{ ok: boolean; message: string }>,
+  // Codex full-repo review (2026-07-14, Warning): validateUrl only ever ran
+  // once, at the ORIGINAL clone — pullRepo (the far more common path once a
+  // repo is already checked out: every periodic sync from then on) never
+  // re-validated at all. A repo's DNS could point somewhere safe at create
+  // time and somewhere private/internal by the time a routine pull fires
+  // months later, with nothing re-checking. Doesn't close true DNS-rebinding
+  // (the validated IP still isn't pinned into git's own later resolution —
+  // see NO_REDIRECT_ARGS's comment on that acknowledged, harder gap), but
+  // closes the much larger window of "never re-checked again, ever."
+  // Parameterized like cloneFn — same reason (cloneRepoCore's header):
+  // tests need to run real git against local temp dirs without also
+  // colliding with the SSRF gate that (correctly) rejects every host
+  // actually reachable in this offline sandbox.
+  validateUrlFn: (url: string) => Promise<string | null>
 ): Promise<{ ok: boolean; message: string; localPath: string }> {
   const { url, repoId, reposDir, branch, forceReclone, credUsername, credToken } = opts;
   const localPath = getRepoLocalPath(reposDir, repoId);
@@ -324,9 +358,14 @@ async function syncRepoImpl(
 
   let result: { ok: boolean; message: string };
   if (alreadyCloned && !forceReclone) {
-    result = await pullRepo({ repoId, reposDir, credUsername, credToken });
-    if (!result.ok) {
-      result = await cloneFn({ url, repoId, reposDir, branch, credUsername, credToken });
+    const validationError = await validateUrlFn(url);
+    if (validationError) {
+      result = { ok: false, message: validationError };
+    } else {
+      result = await pullRepo({ repoId, reposDir, credUsername, credToken });
+      if (!result.ok) {
+        result = await cloneFn({ url, repoId, reposDir, branch, credUsername, credToken });
+      }
     }
   } else {
     result = await cloneFn({ url, repoId, reposDir, branch, credUsername, credToken });
@@ -338,7 +377,7 @@ async function syncRepoImpl(
 export async function syncRepo(
   opts: SyncRepoOptions
 ): Promise<{ ok: boolean; message: string; localPath: string }> {
-  return syncRepoImpl(opts, cloneRepo);
+  return syncRepoImpl(opts, cloneRepo, validateUrl);
 }
 
 // 每仓库一把锁，让 periodic sync、手动 sync、create/update 触发的 sync 永远
@@ -541,14 +580,19 @@ export async function syncAndPersist(
 // validateUrl —— 这个绕行口只在测试文件里用得到，理由见 cloneRepoCore 顶部
 // 的注释。不是 Task 3 brief 列出的 6 个正式导出之一，调用方（Task 6/7 等
 // 后续任务）不应该依赖这个符号。
+// Test-only stand-in for validateUrl (never rejects) — pairs with
+// cloneRepoCore below for the exact same reason: SSRF gate correctly
+// rejects every host actually reachable in this offline sandbox.
+const ALWAYS_ALLOW_URL = async (): Promise<null> => null;
+
 export const __internal = {
   cloneRepoUnvalidated: cloneRepoCore,
-  syncRepoUnvalidated: (opts: SyncRepoOptions) => syncRepoImpl(opts, cloneRepoCore),
+  syncRepoUnvalidated: (opts: SyncRepoOptions) => syncRepoImpl(opts, cloneRepoCore, ALWAYS_ALLOW_URL),
   syncAndPersistUnvalidated: (
     db: DbClient,
     opts: SyncAndPersistOptions,
     onSyncSuccess?: (repoId: number, localPath: string) => void
-  ) => syncAndPersistImpl(db, opts, onSyncSuccess, (o) => syncRepoImpl(o, cloneRepoCore)),
+  ) => syncAndPersistImpl(db, opts, onSyncSuccess, (o) => syncRepoImpl(o, cloneRepoCore, ALWAYS_ALLOW_URL)),
   // syncAndPersistUnvalidated 在 onSyncSuccess 被省略时传的是字面 undefined
   // 给 syncAndPersistImpl（一个已经声明了形参、没有默认值的普通函数），JS
   // 不会在那一层触发 `syncAndPersist` 导出函数自己的默认参数替换——那个默认
@@ -558,7 +602,7 @@ export const __internal = {
   // 仍然接上 defaultOnSyncSuccess 的入口——否则测试只能验到自己传的 mock，
   // 验不到默认实现本身。
   defaultOnSyncSuccessUnvalidated: (db: DbClient, opts: SyncAndPersistOptions) =>
-    syncAndPersistImpl(db, opts, defaultOnSyncSuccess, (o) => syncRepoImpl(o, cloneRepoCore)),
+    syncAndPersistImpl(db, opts, defaultOnSyncSuccess, (o) => syncRepoImpl(o, cloneRepoCore, ALWAYS_ALLOW_URL)),
   // 同上，供 startServer()（src/server/main.ts）的 e2e 测试用：main.ts 启动时
   // 跑的是公开的 syncAllRepos（过 validateUrl），e2e 测试要对一个真实本地
   // origin 目录验证"启动确实同步成功了"，需要绕开 SSRF 网关的同款入口——
@@ -572,7 +616,7 @@ export const __internal = {
     onSyncSuccess?: (repoId: number, localPath: string) => void
   ) =>
     syncAllReposImpl(db, repos, reposDir, onSyncSuccess, (d, o, cb) =>
-      syncAndPersistImpl(d, o, cb, (oo) => syncRepoImpl(oo, cloneRepoCore))
+      syncAndPersistImpl(d, o, cb, (oo) => syncRepoImpl(oo, cloneRepoCore, ALWAYS_ALLOW_URL))
     ),
   // 供测试模拟"同一仓库两次重叠的索引重建"场景，验证发布阶段的
   // generation 守卫——不通过真实的 runIndexBuild（那需要真正跑完

@@ -64,9 +64,43 @@ const GITLAB_UPLOAD_TIMEOUT_MS = 60_000; // v1's timeout=60
  * just leaves a bounded (at most timeoutMs), harmless, already-unref'd
  * timer to fire later as a no-op abort() on a controller nothing is
  * listening to anymore — not a real leak. */
+// Codex full-repo review (2026-07-14, Warning): fetch's default
+// redirect:"follow" meant a validated GitHub/GitLab host (repo-sync.ts's
+// validateUrl only ever runs when the repo URL/tracker API base is first
+// computed) could 302 the request to a disallowed internal/private address
+// at request time, with nothing here re-checking the redirect target's
+// host before the request headers (including auth) go out to it — the
+// exact request-side counterpart of NO_REDIRECT_ARGS's protection on the
+// git clone/pull side of repo-sync.ts. Follows manually, re-validating
+// each hop's Location against the same SSRF gate before continuing;
+// rejects outright on the first hop that doesn't pass or a chain that
+// doesn't terminate within a small bound (a real API redirecting more than
+// a couple of times is not a case this codebase's trackers need to
+// support).
+const MAX_REDIRECTS = 3;
+
 export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const { signal } = withTimeout(timeoutMs);
-  return fetch(url, { ...init, signal });
+  let currentUrl = url;
+  for (let hop = 0; ; hop++) {
+    const { signal } = withTimeout(timeoutMs);
+    const resp = await fetch(currentUrl, { ...init, signal, redirect: "manual" });
+    if (resp.status < 300 || resp.status >= 400) {
+      return resp;
+    }
+    const location = resp.headers.get("location");
+    if (!location) {
+      return resp; // a 3xx with no Location isn't a redirect fetch can follow — hand it back as-is
+    }
+    if (hop >= MAX_REDIRECTS) {
+      throw new Error(`too many redirects fetching ${url} (stopped at ${currentUrl})`);
+    }
+    const nextUrl = new URL(location, currentUrl).toString();
+    const validationError = await validateUrl(nextUrl);
+    if (validationError) {
+      throw new Error(`redirect from ${currentUrl} to ${nextUrl} refused: ${validationError}`);
+    }
+    currentUrl = nextUrl;
+  }
 }
 
 function safeHostname(url: string): string {
