@@ -33,5 +33,16 @@ RUN npm ci --registry=https://registry.npmmirror.com
 COPY engine/ ./
 COPY web/ /app/web/
 
+# Codex full-repo review (2026-07-14, Warning): container previously ran
+# as root with no USER directive — see docker-entrypoint.sh for the full
+# rationale and how bind-mounted host paths (docker-compose.yml's
+# ./data/*) get their ownership fixed before the app ever runs as this
+# user. Reuses node:24-slim's built-in `node` user (uid/gid 1000, already
+# present in the base image) rather than creating a new one — stable
+# across rebuilds and matches what a one-time `chown -R 1000:1000 data/`
+# on the host would target.
+RUN chown -R node:node /app
+RUN chmod +x docker-entrypoint.sh
+
 EXPOSE 8000
-CMD ["npm", "start"]
+ENTRYPOINT ["./docker-entrypoint.sh"]
