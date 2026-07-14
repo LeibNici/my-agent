@@ -226,6 +226,25 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
     );
   }
 
+  // Issue-tracking fix-bot username (2026-07-14): same DB-over-.env move,
+  // prompted by the same "silent, invisible gap" shape — issue-tracker.ts's
+  // fetchAndStoreReports (the code that parses a fix bot's codex-report/v1
+  // completion comment) silently skips EVERY report, on every tracked repo,
+  // whenever this is unset; it was never in .env, so a repo's completion
+  // report sat there correctly formatted while the admin 工单 tab's
+  // 已验证修复/平均修复时长/嫌疑位置命中率 stats stayed empty with nothing
+  // in any log pointing at why.
+  const issueTrackingConfig = await db.getIssueTrackingConfig();
+  if (issueTrackingConfig?.fix_bot_username) {
+    settings.issueFixBotUsername = issueTrackingConfig.fix_bot_username;
+  }
+  if (!settings.issueFixBotUsername) {
+    console.log(
+      "提示: 未配置 issue 完成报告 bot 用户名（Admin → 工单）— " +
+        "已验证修复/平均修复时长/嫌疑位置命中率统计将持续为空，直到配置。"
+    );
+  }
+
   // Phase 4b Task 5: repo-sync.ts's default onSyncSuccess needs Settings for
   // its embedding-build phase but doesn't import the config singleton itself
   // (see configureIndexing's doc comment) — must run before the startup sync

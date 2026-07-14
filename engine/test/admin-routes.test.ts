@@ -119,6 +119,8 @@ describe("admin-only guard", () => {
     ["POST", "/api/admin/webhook-config/regenerate"],
     ["GET", "/api/admin/llm-config"],
     ["POST", "/api/admin/llm-config"],
+    ["GET", "/api/admin/issue-tracking-config"],
+    ["POST", "/api/admin/issue-tracking-config"],
   ])("%s %s → 403 {detail} for an authenticated non-admin", async (method, path) => {
     const { token } = await seedUser("user");
     const app = buildTestApp();
@@ -807,6 +809,61 @@ describe("llm config", () => {
     const { token } = await seedUser("admin");
     const app = buildTestApp();
     const resp = await authed(app, token, "/api/admin/llm-config", { method: "POST", body: "not json" });
+    expect(resp.status).toBe(422);
+  });
+});
+
+// ==================== Issue-tracking config ====================
+// 2026-07-14: a real repo's fix bot had already posted a correctly-
+// formatted codex-report/v1 completion comment, but issueFixBotUsername
+// was never configured anywhere — issue-tracker.ts's report parsing
+// silently skips every report when it's unset. These routes are the
+// admin-facing fix.
+
+describe("issue-tracking config", () => {
+  it("GET returns null when unconfigured, and the real value once set — not a secret, safe to echo", async () => {
+    settings.issueFixBotUsername = "";
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp1 = await authed(app, token, "/api/admin/issue-tracking-config");
+    expect(await resp1.json()).toEqual({ fix_bot_username: null });
+
+    settings.issueFixBotUsername = "169437";
+    const resp2 = await authed(app, token, "/api/admin/issue-tracking-config");
+    expect(await resp2.json()).toEqual({ fix_bot_username: "169437" });
+  });
+
+  it("POST saves fix_bot_username, persists to DB, and updates the SAME process's in-memory settings immediately", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/admin/issue-tracking-config", {
+      method: "POST",
+      body: JSON.stringify({ fix_bot_username: "169437" }),
+    });
+    expect(resp.status).toBe(200);
+    expect(await resp.json()).toEqual({ ok: true, fix_bot_username: "169437" });
+    expect(settings.issueFixBotUsername).toBe("169437");
+
+    const stored = await client.getIssueTrackingConfig();
+    expect(stored!.fix_bot_username).toBe("169437");
+  });
+
+  it("POST with a blank fix_bot_username keeps the previously-saved value", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    await authed(app, token, "/api/admin/issue-tracking-config", {
+      method: "POST", body: JSON.stringify({ fix_bot_username: "original-bot" }),
+    });
+    await authed(app, token, "/api/admin/issue-tracking-config", {
+      method: "POST", body: JSON.stringify({ fix_bot_username: "" }),
+    });
+    expect(settings.issueFixBotUsername).toBe("original-bot");
+  });
+
+  it("POST with invalid JSON → 422", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/admin/issue-tracking-config", { method: "POST", body: "not json" });
     expect(resp.status).toBe(422);
   });
 });

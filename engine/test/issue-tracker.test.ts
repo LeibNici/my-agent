@@ -52,6 +52,13 @@ function readSubmissionRaw(dbPath: string, id: number): any {
   return row;
 }
 
+function readFixReportsRaw(dbPath: string, submissionId: number): any[] {
+  const db = new Database(dbPath);
+  const rows = db.prepare("SELECT * FROM issue_fix_reports WHERE submission_id = ? ORDER BY note_id").all(submissionId);
+  db.close();
+  return rows;
+}
+
 function readFixReportRaw(dbPath: string, id: number): any {
   const db = new Database(dbPath);
   const row = db.prepare("SELECT * FROM issue_fix_reports WHERE id = ?").get(id);
@@ -502,6 +509,108 @@ describe("pollTrackedIssues", () => {
     expect(raw.reopen_count).toBe(1);
     expect(raw.track_status).toBe("reopened"); // deriveStatus: reopenCount > 0 优先于 labels 判断
     expect(raw.remote_state).toBe("opened");
+  });
+
+  // 生产 QA 复测（2026-07-14）：一个真实 GitLab 仓库的修复 bot 已经在留
+  // codex-report/v1 完成报告，但 fetchAndStoreReports 从功能上线起就只接
+  // 在 GitLab 轮询路径里——GitHub 从来没有等价实现，Admin 工单页的已验证
+  // 修复/平均修复时长/嫌疑位置命中率对所有 GitHub 仓库永远是空的。这条测
+  // 试证明新增的 fetchAndStoreReportsGithub 真的被接进 pollGithub：issue
+  // 关闭后（status===closed）应该额外请求 Comments API，解析出匹配
+  // issueFixBotUsername 的评论里的标记，落库到 issue_fix_reports。
+  it("GitHub issue 关闭且有 bot 完成报告评论 -> codex-report/v1 标记被解析并落库（fetchAndStoreReportsGithub，此前从未实现）", async () => {
+    const settings = makeSettings({ APP_ISSUE_FIX_BOT_USERNAME: "botuser" });
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://github.com/acme/widgets.git",
+      credToken: "repo-own-github-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 42,
+      issueUrl: "https://github.com/acme/widgets/issues/42",
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/timeline")) {
+        return { status: 200, json: async () => [] } as unknown as Response;
+      }
+      if (url.includes("/comments")) {
+        return {
+          status: 200,
+          json: async () => [
+            {
+              id: 999,
+              body:
+                '✅ 修复完成并已合入\n<!-- codex-report/v1 {"worker_id":"w1","commit_sha":"abc123","files":["src/a.ts"]} -->',
+              created_at: "2026-07-14T10:00:00Z",
+              user: { login: "botuser" },
+            },
+            {
+              id: 1000,
+              body: "无关评论，没有标记",
+              created_at: "2026-07-14T10:01:00Z",
+              user: { login: "someone-else" },
+            },
+          ],
+        } as unknown as Response;
+      }
+      return {
+        status: 200,
+        json: async () => ({ state: "closed", labels: [], closed_at: "2026-07-14T10:00:00Z" }),
+      } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollTrackedIssues(client, settings);
+
+    const commentsCall = fetchMock.mock.calls.find(([u]) => String(u).includes("/comments"));
+    expect(commentsCall).toBeTruthy();
+    expect(commentsCall![0]).toBe("https://api.github.com/repos/acme/widgets/issues/42/comments?per_page=100&page=1");
+
+    const reports = readFixReportsRaw(dbPath, subId);
+    expect(reports.length).toBe(1); // 无标记的第二条评论没有产生行
+    expect(reports[0].commit_sha).toBe("abc123");
+    expect(reports[0].worker_id).toBe("w1");
+    expect(JSON.parse(reports[0].files_json)).toEqual(["src/a.ts"]);
+  });
+
+  it("GitHub issue 关闭但没配置 issueFixBotUsername -> 完全不请求 comments 端点（跟 GitLab 一样的信任门槛，不是默认信任所有人）", async () => {
+    const settings = makeSettings(); // issueFixBotUsername 留空
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://github.com/acme/widgets.git",
+      credToken: "repo-own-github-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 42,
+      issueUrl: "https://github.com/acme/widgets/issues/42",
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/timeline")) return { status: 200, json: async () => [] } as unknown as Response;
+      return {
+        status: 200,
+        json: async () => ({ state: "closed", labels: [], closed_at: "2026-07-14T10:00:00Z" }),
+      } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollTrackedIssues(client, settings);
+
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/comments"))).toBe(false);
+    expect(readFixReportsRaw(dbPath, subId).length).toBe(0);
   });
 
   it("issue_url 是 github.com 但主机与仓库当前 url 不一致 -> 护栏拦截，不发请求（GitHub 现在和 GitLab 走同一条主机匹配规则）", async () => {

@@ -616,6 +616,35 @@ async function pollIssueTracking(btn) {
     }
 }
 
+// ===== Issue-tracking config (fix-bot username) =====
+// 2026-07-14: 一个真实仓库的修复 bot 已经在留完成报告，但 issueFixBotUsername
+// 一直没配置——issue-tracker.ts 的 fetchAndStoreReports 会静默跳过所有报告，
+// 已验证修复/平均修复时长/嫌疑位置命中率永远是空的，日志里也看不出原因。
+// 不是密钥（tracker 用户名，非敏感），跟 webhook secret 一样直接回显。
+async function loadIssueTrackingConfig() {
+    const resp = await fetch("/api/admin/issue-tracking-config", { headers: authHeaders() });
+    const data = await resp.json();
+    document.getElementById("issue-fix-bot-username").value = data.fix_bot_username || "";
+    document.getElementById("issue-tracking-config-status").innerHTML = data.fix_bot_username
+        ? `<span style="color:var(--moss)">✓ 已配置</span>`
+        : `<span style="color:var(--rust)">✗ 未配置 — 完成报告统计将持续为空</span>`;
+}
+
+async function saveIssueTrackingConfig(btn) {
+    const fixBotUsername = document.getElementById("issue-fix-bot-username").value.trim();
+    btn.disabled = true;
+    try {
+        const { ok, data } = await apiRequest("/api/admin/issue-tracking-config", {
+            method: "POST", body: JSON.stringify({ fix_bot_username: fixBotUsername }),
+        });
+        if (!ok) return showMsg(data.detail || "保存失败", false);
+        showMsg("配置已保存，下次轮询/立即同步生效");
+        await loadIssueTrackingConfig();
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 // ===== Semantic search recall log =====
 // score coloring is shared between the summary cards and the recent-queries
 // table: null (no hits at all) reads the same as a genuinely low score,
@@ -803,6 +832,7 @@ if (isAuthorizedAdmin) {
     loadRepos();
     loadPerms();
     loadIssueTracking();
+    loadIssueTrackingConfig();
     loadWebhookConfig();
     loadLlmConfig();
     loadUsage();

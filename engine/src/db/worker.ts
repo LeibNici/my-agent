@@ -40,6 +40,15 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.setLlmConfig(patch) });
         break;
       }
+      case "getIssueTrackingConfig": {
+        reply({ id, ok: true, result: storage.getIssueTrackingConfig() });
+        break;
+      }
+      case "setIssueTrackingConfig": {
+        const [patch] = args as [Parameters<typeof storage.setIssueTrackingConfig>[0]];
+        reply({ id, ok: true, result: storage.setIssueTrackingConfig(patch) });
+        break;
+      }
       case "addMessage": {
         const [sessionId, role, content] = args as [string, string, string | unknown[]];
         reply({ id, ok: true, result: storage.addMessage(sessionId, role, content) });

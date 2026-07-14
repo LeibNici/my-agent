@@ -488,11 +488,22 @@ export type LlmConfigPatch = {
   maxTokens?: number;
 };
 
+export type IssueTrackingConfigRow = {
+  fix_bot_username: string | null;
+  updated_at: string;
+};
+
+export type IssueTrackingConfigPatch = {
+  fixBotUsername?: string;
+};
+
 export type Storage = {
   getOrCreateAppSecret(name: string): string;
   regenerateAppSecret(name: string): string;
   getLlmConfig(): LlmConfigRow | null;
   setLlmConfig(patch: LlmConfigPatch): LlmConfigRow;
+  getIssueTrackingConfig(): IssueTrackingConfigRow | null;
+  setIssueTrackingConfig(patch: IssueTrackingConfigPatch): IssueTrackingConfigRow;
   addMessage(sessionId: string, role: string, content: string | unknown[]): number;
   getMessages(sessionId: string): StoredMessageRow[];
   getMessagesForTurn(sessionId: string): StoredMessageRow[];
@@ -791,6 +802,27 @@ export function openStorage(dbPath: string): Storage {
           "ON CONFLICT(id) DO UPDATE SET api_key = excluded.api_key, base_url = excluded.base_url, " +
           "model = excluded.model, max_tokens = excluded.max_tokens, updated_at = excluded.updated_at"
       ).run(merged.api_key, merged.base_url, merged.model, merged.max_tokens, merged.updated_at);
+      return merged;
+    },
+
+    getIssueTrackingConfig(): IssueTrackingConfigRow | null {
+      const row = db
+        .prepare("SELECT fix_bot_username, updated_at FROM issue_tracking_config WHERE id = 1")
+        .get() as IssueTrackingConfigRow | undefined;
+      return row ?? null;
+    },
+
+    setIssueTrackingConfig(patch: IssueTrackingConfigPatch): IssueTrackingConfigRow {
+      const now = pyLocalIsoNow();
+      const existing = storage.getIssueTrackingConfig();
+      const merged: IssueTrackingConfigRow = {
+        fix_bot_username: patch.fixBotUsername ?? existing?.fix_bot_username ?? null,
+        updated_at: now,
+      };
+      db.prepare(
+        "INSERT INTO issue_tracking_config (id, fix_bot_username, updated_at) VALUES (1, ?, ?) " +
+          "ON CONFLICT(id) DO UPDATE SET fix_bot_username = excluded.fix_bot_username, updated_at = excluded.updated_at"
+      ).run(merged.fix_bot_username, merged.updated_at);
       return merged;
     },
 

@@ -181,6 +181,64 @@ async function fetchGithubTimelineReopens(
   return reopens;
 }
 
+// 生产 QA 复测（2026-07-14）：fetchAndStoreReports（下方）从功能上线起就
+// 只接在 GitLab 轮询路径里——GitHub issue 即使真的收到了 bot 格式正确的
+// codex-report/v1 完成报告，也从来没有被抓取过，Admin 工单页的已验证修复/
+// 平均修复时长/嫌疑位置命中率统计对所有 GitHub 仓库永远是空的。GitHub
+// REST 用 Issue Comments API（/issues/{n}/comments）而不是 GitLab 的
+// notes 端点，作者字段是 comment.user.login 而不是 note.author.username，
+// 其余逻辑（REPORT_RE 解析、按 settings.issueFixBotUsername 判定信任、
+// upsertFixReport 落库）与 GitLab 版本完全一致，镜像写一份而不是抽公共
+// 函数——两边端点形状和字段名不同，跟本文件里 fetchGithubLabels/
+// fetchGitlabLabels（issue-tracker-client.ts）已经确立的写法一致。
+async function fetchAndStoreReportsGithub(
+  owner: string,
+  repoName: string,
+  sub: { id: number; issue_number: number },
+  token: string,
+  db: DbClient,
+  settings: Settings,
+): Promise<void> {
+  if (!settings.issueFixBotUsername) return;
+  for (let page = 1; page <= NOTES_MAX_PAGES; page++) {
+    const resp = await fetchWithTimeout(
+      `https://api.github.com/repos/${owner}/${repoName}/issues/${sub.issue_number}/comments?per_page=100&page=${page}`,
+      { headers: githubHeaders(token) },
+      POLL_TIMEOUT_MS,
+    );
+    if (resp.status !== 200) return;
+    const comments = (await resp.json()) as Array<{
+      id: number;
+      body?: string;
+      created_at?: string;
+      user?: { login?: string };
+    }>;
+    for (const comment of comments) {
+      const m = REPORT_RE.exec(comment.body ?? "");
+      if (!m) continue;
+      if (comment.user?.login !== settings.issueFixBotUsername) continue;
+      let payload: unknown;
+      try {
+        payload = JSON.parse(m[1]);
+      } catch {
+        continue;
+      }
+      if (!isPlainObject(payload)) continue;
+      const filesRaw = payload.files;
+      const files = Array.isArray(filesRaw) ? filesRaw.map((f) => String(f)) : [];
+      await db.upsertFixReport({
+        submissionId: sub.id,
+        noteId: comment.id,
+        workerId: truthyToString(payload.worker_id),
+        commitSha: truthyToString(payload.commit_sha),
+        files,
+        reportedAt: comment.created_at || null,
+      });
+    }
+    if (comments.length < 100) return;
+  }
+}
+
 /** Pulls the issue's comments and persists every codex-report/v1 marker.
  * Keyed by note_id (upsertFixReport's ON CONFLICT), so re-polling is
  * idempotent and a re-fix after reopen adds a second report instead of
@@ -299,6 +357,7 @@ async function pollGithub(
   sub: TrackableSubmissionRow,
   credToken: string | null,
   db: DbClient,
+  settings: Settings,
   generation: number,
 ): Promise<void> {
   const token = credToken;
@@ -341,11 +400,12 @@ async function pollGithub(
   );
 
   const reopenCount = await fetchGithubTimelineReopens(owner, repoName, sub.issue_number, token);
+  const status = deriveStatus(remoteState, labels, reopenCount);
 
   await db.updateIssueTracking(
     sub.id,
     {
-      trackStatus: deriveStatus(remoteState, labels, reopenCount),
+      trackStatus: status,
       remoteState,
       remoteLabels: JSON.stringify(labels),
       reopenCount,
@@ -354,6 +414,13 @@ async function pollGithub(
     },
     generation,
   );
+
+  // Completion reports only exist once fix activity has happened — mirrors
+  // the equivalent guard in pollOne's GitLab path below, an untouched open
+  // issue skips the comments round-trip entirely.
+  if (status === "merged" || status === "closed" || status === "reopened") {
+    await fetchAndStoreReportsGithub(owner, repoName, { id: sub.id, issue_number: sub.issue_number }, token, db, settings);
+  }
 }
 
 export async function pollOne(
@@ -400,7 +467,7 @@ export async function pollOne(
   }
 
   if (issueHost === "github.com" || issueHost === "www.github.com") {
-    await pollGithub(sub, repo.cred_token, db, generation);
+    await pollGithub(sub, repo.cred_token, db, settings, generation);
     return;
   }
 

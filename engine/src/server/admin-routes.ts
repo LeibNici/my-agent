@@ -484,4 +484,32 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
 
     return c.json({ ok: true, configured: Boolean(deps.settings.apiKey) });
   });
+
+  // ==================== Issue-tracking config ====================
+  // 2026-07-14: issue-tracker.ts's fetchAndStoreReports silently skips
+  // EVERY repo's completion-report parsing whenever issueFixBotUsername is
+  // unset — see main.ts's post-load comment for the incident this surfaced
+  // as (a real, correctly-formatted fix report sitting on a real issue,
+  // with the admin 工单 tab's stats staying empty and nothing logged to
+  // explain why). Not a credential (a tracker username, not a secret) —
+  // unlike llm-config's api_key, this is safe to echo back on GET.
+
+  app.get("/api/admin/issue-tracking-config", async (c) =>
+    c.json({ fix_bot_username: deps.settings.issueFixBotUsername || null })
+  );
+
+  app.post("/api/admin/issue-tracking-config", async (c) => {
+    const body = await parseBody<{ fix_bot_username?: unknown }>(c);
+    if (body === null) return c.json({ detail: "Invalid JSON body" }, 422);
+
+    const patch: { fixBotUsername?: string } = {};
+    if (typeof body.fix_bot_username === "string" && body.fix_bot_username.trim()) {
+      patch.fixBotUsername = body.fix_bot_username.trim();
+    }
+
+    const saved = await deps.db.setIssueTrackingConfig(patch);
+    if (saved.fix_bot_username) deps.settings.issueFixBotUsername = saved.fix_bot_username;
+
+    return c.json({ ok: true, fix_bot_username: deps.settings.issueFixBotUsername || null });
+  });
 }

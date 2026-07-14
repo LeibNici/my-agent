@@ -233,6 +233,17 @@
                     <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="pollIssueTracking(this)">立即同步</button>
                     <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="loadIssueTracking()">刷新</button>
                 </div>
+                <div class="card">
+                    <h3>完成报告配置 <span id="issue-tracking-config-status" style="font-weight:normal;font-size:12px;margin-left:8px;"></span></h3>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:140px;color:var(--faint);font-size:12.5px;">修复 Bot 用户名</span>
+                        <input id="issue-fix-bot-username" placeholder="例如 169437" style="flex:1;min-width:220px;font-family:var(--font-mono);font-size:12.5px;">
+                        <button class="btn btn-sm btn-primary" onclick="saveIssueTrackingConfig(this)">保存</button>
+                    </div>
+                    <div style="font-size:12px;color:var(--faint);margin-top:4px;">
+                        只信任这个用户名发的"完成修复"评论（GitHub/GitLab 通用）——没配置时，下面已验证修复/平均修复时长/嫌疑位置命中率会一直是空的，不是没有数据，是完成报告被跳过了。
+                    </div>
+                </div>
                 <div class="stat-grid" id="issues-summary-cards"></div>
                 <div class="card">
                     <h3>提报工单追踪 <span style="font-weight:normal;font-size:12px;color:var(--mute);margin-left:8px">状态链：已提报 → 已领取 → 已合入 → 已关闭 / 被打回</span></h3>

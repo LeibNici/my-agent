@@ -294,6 +294,23 @@ export function initSchema(dbPath: string): void {
     )
   `);
 
+  // Admin-editable issue-tracking config (2026-07-14) — same DB-over-.env
+  // reasoning as llm_config above, prompted by the same incident: an admin
+  // added a real repo (GitLab-hosted) whose fix-bot had already posted a
+  // correctly-formatted codex-report/v1 completion comment, but
+  // issue-tracker.ts's fetchAndStoreReports silently skips EVERY report
+  // (any tracker, not just this repo) whenever issueFixBotUsername is
+  // empty — and it was never set in .env, so the admin 工单 tab's
+  // 已验证修复/平均修复时长/嫌疑位置命中率 stats stayed empty with no
+  // indication why. Singleton row, same shape as llm_config.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS issue_tracking_config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      fix_bot_username TEXT,
+      updated_at TEXT NOT NULL
+    )
+  `);
+
   // Create indexes
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)"
