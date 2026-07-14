@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { execFile as execFileCb, execFileSync } from "node:child_process";
+import { spawn as spawnCb, execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,14 +56,17 @@ const mockedWriteEmbeddingIndex = vi.mocked(embedStore.writeEmbeddingIndex);
 // （挡什么、放什么）在下面"SSRF 防护"块里用公开的 cloneRepo 单独黑盒测。
 const { cloneRepoUnvalidated, syncRepoUnvalidated, syncAndPersistUnvalidated } = __internal;
 
-// 用真实 execFile 包一层 spy：SSRF 测试断言它"从不被调用"，其余测试不覆盖
+// 用真实 spawn 包一层 spy：SSRF 测试断言它"从不被调用"，其余测试不覆盖
 // mockImplementation，所以照常穿透到真的 git 子进程 —— 不需要网络 mock，
-// 用本地临时目录当"远程" clone 源即可覆盖 happy path。
+// 用本地临时目录当"远程" clone 源即可覆盖 happy path。runGit（src/repo-
+// sync.ts）从 execFile 换成了 spawn（2026-07-14 QA 复测：execFile 不会把
+// `detached: true` 真正转发给底层 spawn，孤儿 git-remote-http(s) 进程杀不
+// 掉——见该文件 runGit 的注释），mock 目标跟着换。
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, execFile: vi.fn(actual.execFile) };
+  return { ...actual, spawn: vi.fn(actual.spawn) };
 });
-const mockedExecFile = vi.mocked(execFileCb);
+const mockedSpawn = vi.mocked(spawnCb);
 
 function initOriginRepo(dir: string): void {
   mkdirSync(dir, { recursive: true });
@@ -181,7 +185,7 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
 
   beforeEach(() => {
     reposDir = mkdtempSync(join(tmpdir(), "repo-sync-ssrf-"));
-    mockedExecFile.mockClear();
+    mockedSpawn.mockClear();
   });
 
   afterEach(() => {
@@ -192,21 +196,21 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
     const result = await cloneRepo({ url: "http://127.0.0.1/x", repoId: 1, reposDir });
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/internal\/private host/);
-    expect(mockedExecFile).not.toHaveBeenCalled();
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 
   it("拒绝 169.254.169.254（云元数据地址），且从不调用 git", async () => {
     const result = await cloneRepo({ url: "http://169.254.169.254/", repoId: 2, reposDir });
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/internal\/private host/);
-    expect(mockedExecFile).not.toHaveBeenCalled();
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 
   it("拒绝 localhost（DNS 解析到 loopback），且从不调用 git", async () => {
     const result = await cloneRepo({ url: "http://localhost/x", repoId: 3, reposDir });
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/internal\/private host/);
-    expect(mockedExecFile).not.toHaveBeenCalled();
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 
   it("拒绝私网段 10.x/172.16-31.x/192.168.x/169.254.x", async () => {
@@ -215,14 +219,14 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
       expect(result.ok).toBe(false);
       expect(result.message).toMatch(/internal\/private host/);
     }
-    expect(mockedExecFile).not.toHaveBeenCalled();
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 
   it("拒绝 0.0.0.0（Codex 全仓库审查，2026-07-14，Warning：Linux/多数系统上 0.0.0.0 等价于 127.0.0.1，是已知的 SSRF loopback 绕过手法），且从不调用 git", async () => {
     const result = await cloneRepo({ url: "http://0.0.0.0/x", repoId: 11, reposDir });
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/internal\/private host/);
-    expect(mockedExecFile).not.toHaveBeenCalled();
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 
   it("拒绝带方括号的 IPv6 字面量 host（[::1]/[fd00::1]/[fe80::1]），且从不调用 git", async () => {
@@ -231,14 +235,14 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
       expect(result.ok).toBe(false);
       expect(result.message).toMatch(/internal\/private host/);
     }
-    expect(mockedExecFile).not.toHaveBeenCalled();
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 
   it("拒绝 ftp:// 协议，且从不调用 git", async () => {
     const result = await cloneRepo({ url: "ftp://example.com/x", repoId: 4, reposDir });
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/Invalid URL protocol/);
-    expect(mockedExecFile).not.toHaveBeenCalled();
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 
   it("已 clone 过的仓库再次 sync（走 pull 分支）也会重新校验 url，不是只在最初 clone 时查一次（Codex 全仓库审查，2026-07-14，Warning）", async () => {
@@ -249,7 +253,7 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
       // 合法 host clone 成功，checkout 已经在磁盘上了"这个前提。
       const first = await syncRepoUnvalidated({ url: originDir, repoId: 20, reposDir });
       expect(first.ok).toBe(true);
-      mockedExecFile.mockClear();
+      mockedSpawn.mockClear();
 
       // 再用生产入口（真正过 validateUrl 的 syncRepo）对同一个 repoId 发起
       // 一次新的 sync，但这次带一个 SSRF 应该拒绝的 url——checkout 已经
@@ -262,7 +266,7 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
       const second = await syncRepo({ url: "http://127.0.0.1/evil", repoId: 20, reposDir });
       expect(second.ok).toBe(false);
       expect(second.message).toMatch(/internal\/private host/);
-      expect(mockedExecFile).not.toHaveBeenCalled();
+      expect(mockedSpawn).not.toHaveBeenCalled();
     } finally {
       rmSync(originDir, { recursive: true, force: true });
     }
@@ -276,7 +280,7 @@ describe("SSRF 防护 —— _validate_url 等价逻辑", () => {
       // 用一个不可达但 DNS 语法合法的 host（.invalid 保留域，不会解析到私网段）
     });
     // 会真的尝试连接并失败（网络不可达/DNS 失败），但关键是它必须调用了 git —— 说明校验放行了
-    expect(mockedExecFile).toHaveBeenCalled();
+    expect(mockedSpawn).toHaveBeenCalled();
     expect(result.ok).toBe(false); // 连接注定失败，但失败原因不是 SSRF 拦截
     expect(result.message).not.toMatch(/Invalid URL protocol/);
     expect(result.message).not.toMatch(/internal\/private host/);
@@ -290,7 +294,7 @@ describe("cloneRepo —— 真实本地仓库", () => {
     reposDir = mkdtempSync(join(tmpdir(), "repo-sync-repos-"));
     originDir = mkdtempSync(join(tmpdir(), "repo-sync-origin-"));
     initOriginRepo(originDir);
-    mockedExecFile.mockClear();
+    mockedSpawn.mockClear();
   });
 
   afterEach(() => {
@@ -485,28 +489,49 @@ describe("syncAndPersist", () => {
   it("同一 repoId 的两个并发调用被序列化，而不是并发 rmtree 出竞态", async () => {
     // 光凭 resolve 顺序（谁先 .then 到）证明不了真的序列化——两个调用即使
     // 内部并发跑 git，也可能凑巧按发起顺序 resolve。这里用真实的人为延迟给
-    // 每一次 execFile 调用套一层：在真的跑 git 之前先等 DELAY_MS，同时记录
+    // 每一次 spawn 调用套一层：在真的跑 git 之前先等 DELAY_MS，同时记录
     // 每次调用的起止时间戳。如果 withRepoLock 没有真的序列化（比如两个
     // clone 并发抢同一个 tmpPath），两次 git 调用的时间窗口会重叠；如果真的
     // 序列化了，后一次的开始时间必然不早于前一次的结束时间——DELAY_MS 远大于
     // Date.now() 的毫秒级抖动，所以这个断言不会因为时钟精度而 flaky。
+    //
+    // spawn（不像 execFile）没有回调——同步返回一个 ChildProcess，之后靠
+    // 事件报告进展。要在"真的跑 git 之前"insert 一段延迟，同时还要让
+    // runGit 那边立刻拿到一个能同步 .on(...) 挂监听器的对象，这里用一个
+    // 假的 EventEmitter 先顶上（同步返回，满足 spawn 的调用约定），
+    // DELAY_MS 之后才真正调用底层 spawn，再把真实子进程的事件转发到这个假
+    // emitter 上——转发的时机差就是被测量的那段延迟。
     const DELAY_MS = 60;
-    const passthroughExecFile = mockedExecFile.getMockImplementation()!;
+    const passthroughSpawn = mockedSpawn.getMockImplementation()!;
     const invocations: { start: number; end: number }[] = [];
 
-    mockedExecFile.mockImplementation(((...args: unknown[]) => {
+    mockedSpawn.mockImplementation(((...args: unknown[]) => {
       const start = Date.now();
       const rec = { start, end: start };
       invocations.push(rec);
-      const cb = args[args.length - 1] as (...cbArgs: unknown[]) => void;
-      const rest = args.slice(0, -1);
+
+      const fake = new EventEmitter() as EventEmitter & {
+        pid?: number;
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+      };
+      fake.stdout = new EventEmitter();
+      fake.stderr = new EventEmitter();
+
       setTimeout(() => {
-        (passthroughExecFile as (...a: unknown[]) => void)(...rest, (...cbArgs: unknown[]) => {
+        const real = (passthroughSpawn as (...a: unknown[]) => ReturnType<typeof spawnCb>)(...args);
+        fake.pid = real.pid;
+        real.stdout?.on("data", (chunk) => fake.stdout.emit("data", chunk));
+        real.stderr?.on("data", (chunk) => fake.stderr.emit("data", chunk));
+        real.on("error", (err) => fake.emit("error", err));
+        real.on("close", (code) => {
           rec.end = Date.now();
-          cb(...cbArgs);
+          fake.emit("close", code);
         });
       }, DELAY_MS);
-    }) as typeof execFileCb);
+
+      return fake;
+    }) as typeof spawnCb);
 
     let r1: { ok: boolean; message: string }, r2: { ok: boolean; message: string };
     try {
@@ -515,7 +540,7 @@ describe("syncAndPersist", () => {
         syncAndPersistUnvalidated(client, { repoId, url: originDir, reposDir }),
       ]);
     } finally {
-      mockedExecFile.mockImplementation(passthroughExecFile as typeof execFileCb);
+      mockedSpawn.mockImplementation(passthroughSpawn as typeof spawnCb);
     }
 
     expect(r1.ok).toBe(true);

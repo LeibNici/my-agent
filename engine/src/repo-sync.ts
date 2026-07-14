@@ -4,7 +4,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { BlockList, isIP } from "node:net";
 import { lookup } from "node:dns/promises";
 import type { DbClient } from "./db/client.js";
@@ -164,36 +164,86 @@ type GitResult = { code: number; stdout: string; stderr: string };
  * 跑一条 git 命令，带超时，返回 (code, stdout, stderr)。
  *
  * 对照 v1 的 `_run_git`：v1 用 asyncio.wait_for 包 proc.communicate()，超时/
- * 调用方 cancel 都会 kill 子进程再收尸。Node 这边用 execFile 自带的 `timeout`
- * 选项做超时 kill（内部就是到点发 SIGTERM），效果等价，不用自己再管一层
- * timer+kill。调用方 cancel-then-kill 那条路径（v1 的 asyncio.CancelledError
- * 分支）没有照搬——按 brief 的说法，这条路径没有测试覆盖要求，Node 里没有
- * "await 点被外部取消" 这种和 asyncio 对等的原语，强行加一个
- * AbortSignal 参数只是没人调用的摆设，先不加，见 report。
+ * 调用方 cancel 都会 kill 子进程再收尸。调用方 cancel-then-kill 那条路径
+ * （v1 的 asyncio.CancelledError 分支）没有照搬——按 brief 的说法，这条路径
+ * 没有测试覆盖要求，Node 里没有"await 点被外部取消"这种和 asyncio 对等的
+ * 原语，强行加一个 AbortSignal 参数只是没人调用的摆设，先不加，见 report。
+ *
+ * 生产 QA 复测（2026-07-14）：新仓库 sync 卡死排查时，直接复现了一个真实的
+ * 孤儿进程泄漏——execFile 自带的 `timeout` 选项到点只对它跟踪的那一个直接
+ * 子进程（git 本身）发 killSignal；https:// clone 时 git 会再 fork 一个真正
+ * 干网络 I/O 的独立子进程 `git-remote-http(s)`（它是 git 的子进程，也就是
+ * Node 的孙进程）。SIGTERM/SIGKILL 发给 git 本身不会波及这个孙进程——它会
+ * 被重新挂到 init 下面继续跑，持有着它自己的 socket，永远不会退出，直到
+ * 远端主动断开或进程组被整体清理。实测验证：一次真实的超时 kill 之后，
+ * `git-remote-http` 在 6 秒后依然存活。
+ *
+ * 换成 spawn 而不是 execFile——实测确认 execFile 并不会把 `detached: true`
+ * 正确转发给底层 spawn（子进程的 PGID 仍然等于父进程的 PGID，而不是自己
+ * 的 PID，说明它没有真的成为一个独立进程组的组长），`process.kill(-pid,
+ * ...)` 打不到目标进程组，孤儿进程照样活着。直接用 spawn 才能让 `detached:
+ * true` 真正生效（子进程 PGID === 子进程自己的 PID，验证过），超时时
+ * `process.kill(-child.pid, "SIGKILL")` 才能真的连它 fork 出的孙进程一起
+ * 收掉，而不是只杀直接子进程。
  */
 function runGit(args: string[], cwd?: string): Promise<GitResult> {
   return new Promise((resolve) => {
-    execFile(
-      "git",
-      args,
-      { cwd, timeout: GIT_TIMEOUT_MS, maxBuffer: 200 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (!err) {
-          resolve({ code: 0, stdout: stdout ?? "", stderr: stderr ?? "" });
-          return;
-        }
-        if (err.killed) {
-          resolve({
-            code: 1,
-            stdout: "",
-            stderr: `git command timed out after ${GIT_TIMEOUT_MS / 1000}s`,
-          });
-          return;
-        }
-        const code = typeof err.code === "number" ? err.code : 1;
-        resolve({ code, stdout: stdout ?? "", stderr: stderr ?? "" });
+    const MAX_BUFFER = 200 * 1024 * 1024;
+    let settled = false;
+    let timedOut = false;
+    let overflowed = false;
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+
+    const child = spawn("git", args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+
+    const finish = (result: GitResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_BUFFER) overflowed = true;
+      else stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > MAX_BUFFER) overflowed = true;
+      else stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", (err) => {
+      finish({ code: 1, stdout: "", stderr: err.message });
+    });
+
+    child.on("close", (code) => {
+      if (timedOut) {
+        finish({ code: 1, stdout: "", stderr: `git command timed out after ${GIT_TIMEOUT_MS / 1000}s` });
+        return;
       }
-    );
+      if (overflowed) {
+        finish({ code: 1, stdout: "", stderr: "git command output exceeded the 200MB buffer limit" });
+        return;
+      }
+      finish({ code: code ?? 1, stdout, stderr });
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // ESRCH etc — already gone (race with normal completion), nothing to clean up.
+        }
+      }
+    }, GIT_TIMEOUT_MS);
+    timer.unref?.();
   });
 }
 
