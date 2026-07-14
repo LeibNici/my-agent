@@ -137,9 +137,22 @@ export function initSchema(dbPath: string): void {
       track_error TEXT,
       status_changed_at TEXT,
       claim_expires_at INTEGER,
+      poll_generation INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
     )
   `);
+  // Codex full-repo review (2026-07-14, Warning): the cron poller, the
+  // webhook receiver, and an on-demand post-action recheck can all call
+  // pollOne for the SAME submission around the same time — whichever
+  // network round-trip happens to FINISH LAST used to win unconditionally,
+  // even if it started EARLIEST and thus reflects the OLDEST remote state
+  // (e.g. a slow cron poll that started before a webhook-driven close event
+  // could finish afterward and silently overwrite "closed" back to "open").
+  // beginPoll (storage.ts) hands out a monotonically increasing ticket per
+  // poll attempt; updateIssueTracking only commits if no NEWER attempt has
+  // started since — see issue-tracker.ts's pollOne for where this is used.
+  ensureColumn(db, "issue_submissions", "poll_generation", "poll_generation INTEGER NOT NULL DEFAULT 0");
+
   // Codex full-repo review (2026-07-14, Warning): a claimDraftSubmission
   // row (issue-tracker.ts's idempotency claim, added 2026-07-14) whose
   // owning request crashed or timed out AFTER claiming but BEFORE

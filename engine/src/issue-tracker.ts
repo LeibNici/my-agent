@@ -214,10 +214,15 @@ export function deriveStatus(remoteState: string, labels: string[], reopenCount:
   return "submitted";
 }
 
-async function pollGithub(sub: TrackableSubmissionRow, credToken: string | null, db: DbClient): Promise<void> {
+async function pollGithub(
+  sub: TrackableSubmissionRow,
+  credToken: string | null,
+  db: DbClient,
+  generation: number,
+): Promise<void> {
   const token = credToken;
   if (!token) {
-    await db.updateIssueTracking(sub.id, { trackError: "仓库未配置凭证，无法调用 GitHub API" });
+    await db.updateIssueTracking(sub.id, { trackError: "仓库未配置凭证，无法调用 GitHub API" }, generation);
     return;
   }
   const issueUrl = sub.issue_url ?? "";
@@ -229,7 +234,7 @@ async function pollGithub(sub: TrackableSubmissionRow, credToken: string | null,
   }
   const parts = path.split("/"); // owner/repo/issues/123
   if (parts.length < 4 || parts[2] !== "issues") {
-    await db.updateIssueTracking(sub.id, { trackError: `无法解析 GitHub issue URL: ${issueUrl}` });
+    await db.updateIssueTracking(sub.id, { trackError: `无法解析 GitHub issue URL: ${issueUrl}` }, generation);
     return;
   }
   const [owner, repoName] = parts;
@@ -240,7 +245,7 @@ async function pollGithub(sub: TrackableSubmissionRow, credToken: string | null,
     POLL_TIMEOUT_MS,
   );
   if (resp.status !== 200) {
-    await db.updateIssueTracking(sub.id, { trackError: `GitHub API ${resp.status}` });
+    await db.updateIssueTracking(sub.id, { trackError: `GitHub API ${resp.status}` }, generation);
     return;
   }
 
@@ -254,13 +259,17 @@ async function pollGithub(sub: TrackableSubmissionRow, credToken: string | null,
     typeof l === "object" && l !== null ? String(l.name) : String(l),
   );
 
-  await db.updateIssueTracking(sub.id, {
-    trackStatus: deriveStatus(remoteState, labels, 0),
-    remoteState,
-    remoteLabels: JSON.stringify(labels),
-    closedAt: data.closed_at || undefined,
-    clearError: true,
-  });
+  await db.updateIssueTracking(
+    sub.id,
+    {
+      trackStatus: deriveStatus(remoteState, labels, 0),
+      remoteState,
+      remoteLabels: JSON.stringify(labels),
+      closedAt: data.closed_at || undefined,
+      clearError: true,
+    },
+    generation,
+  );
 }
 
 export async function pollOne(
@@ -268,9 +277,18 @@ export async function pollOne(
   reposById: Map<number, FullRepoRow>,
   db: DbClient,
 ): Promise<void> {
+  // Codex full-repo review (2026-07-14, Warning): claimed BEFORE any
+  // network round-trip — the cron poller, the webhook receiver, and an
+  // on-demand post-action recheck can all call pollOne for the same
+  // submission around the same time, and whichever finishes LAST used to
+  // win unconditionally even if it started EARLIEST (and thus reflects the
+  // OLDEST remote state). Every updateIssueTracking call below carries
+  // this ticket; see storage.ts's beginPoll/updateIssueTracking.
+  const generation = await db.beginPoll(sub.id);
+
   const repo = sub.repo_id !== null ? reposById.get(sub.repo_id) : undefined;
   if (!repo) {
-    await db.updateIssueTracking(sub.id, { trackError: "关联仓库已被删除，无法追踪" });
+    await db.updateIssueTracking(sub.id, { trackError: "关联仓库已被删除，无法追踪" }, generation);
     return;
   }
 
@@ -285,26 +303,28 @@ export async function pollOne(
   // Applies to GitHub too, now that it authenticates with the repo's own
   // cred_token instead of a separate global token.
   if (issueHost !== repoHost) {
-    await db.updateIssueTracking(sub.id, {
-      trackError: `issue 所在主机(${issueHost})与仓库当前主机(${repoHost})不一致，凭证不外发，暂停追踪`,
-    });
+    await db.updateIssueTracking(
+      sub.id,
+      { trackError: `issue 所在主机(${issueHost})与仓库当前主机(${repoHost})不一致，凭证不外发，暂停追踪` },
+      generation,
+    );
     return;
   }
 
   if (issueHost === "github.com" || issueHost === "www.github.com") {
-    await pollGithub(sub, repo.cred_token, db);
+    await pollGithub(sub, repo.cred_token, db, generation);
     return;
   }
 
   const token = repo.cred_token;
   if (!token) {
-    await db.updateIssueTracking(sub.id, { trackError: "仓库未配置凭证，无法调用 GitLab API" });
+    await db.updateIssueTracking(sub.id, { trackError: "仓库未配置凭证，无法调用 GitLab API" }, generation);
     return;
   }
 
   const { error, base } = await parseIssueApiBase(issueUrl);
   if (error || !base) {
-    await db.updateIssueTracking(sub.id, { trackError: error ?? "unknown GitLab API base error" });
+    await db.updateIssueTracking(sub.id, { trackError: error ?? "unknown GitLab API base error" }, generation);
     return;
   }
 
@@ -314,11 +334,11 @@ export async function pollOne(
     POLL_TIMEOUT_MS,
   );
   if (resp.status === 404) {
-    await db.updateIssueTracking(sub.id, { trackError: "issue 在 GitLab 上已不存在（404）" });
+    await db.updateIssueTracking(sub.id, { trackError: "issue 在 GitLab 上已不存在（404）" }, generation);
     return;
   }
   if (resp.status !== 200) {
-    await db.updateIssueTracking(sub.id, { trackError: `GitLab API ${resp.status}` });
+    await db.updateIssueTracking(sub.id, { trackError: `GitLab API ${resp.status}` }, generation);
     return;
   }
 
@@ -336,14 +356,18 @@ export async function pollOne(
     await fetchAndStoreReports(base, { id: sub.id, issue_number: sub.issue_number }, token, db);
   }
 
-  await db.updateIssueTracking(sub.id, {
-    trackStatus: status,
-    remoteState,
-    remoteLabels: JSON.stringify(labels),
-    reopenCount,
-    closedAt,
-    clearError: true,
-  });
+  await db.updateIssueTracking(
+    sub.id,
+    {
+      trackStatus: status,
+      remoteState,
+      remoteLabels: JSON.stringify(labels),
+      reopenCount,
+      closedAt,
+      clearError: true,
+    },
+    generation,
+  );
 }
 
 /** On-demand recheck of exactly ONE submission — called right after the
@@ -381,7 +405,12 @@ export async function pollTrackedIssues(db: DbClient, settings: Settings): Promi
     } catch (e) {
       const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
       try {
-        await db.updateIssueTracking(sub.id, { trackError: label });
+        // A fresh ticket, not whatever pollOne claimed internally before
+        // throwing — recording "this attempt failed" is itself the newest
+        // event for this submission, so it should win over anything an
+        // even-more-recent concurrent poll might still be mid-flight on.
+        const generation = await db.beginPoll(sub.id);
+        await db.updateIssueTracking(sub.id, { trackError: label }, generation);
       } catch {
         // best-effort — a failure recording the failure is not fatal
       }

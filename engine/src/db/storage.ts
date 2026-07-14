@@ -514,7 +514,8 @@ export type Storage = {
   getSubmissionForTracking(id: number): TrackableSubmissionRow | null;
   getSubmissionByIssue(repoId: number | null, issueNumber: number): TrackableSubmissionRow | null;
   getTrackableSubmissions(): TrackableSubmissionRow[];
-  updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields): void;
+  beginPoll(submissionId: number): number;
+  updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields, generation: number): void;
   upsertFixReport(fields: UpsertFixReportFields): number;
   getUnverifiedFixReports(): UnverifiedFixReportRow[];
   setFixReportVerified(reportId: number, verified: boolean): void;
@@ -1385,12 +1386,33 @@ export function openStorage(dbPath: string): Storage {
       return rows as TrackableSubmissionRow[];
     },
 
+    // Codex full-repo review (2026-07-14, Warning): cron poll, webhook
+    // receiver, and on-demand recheck can all race to update the SAME
+    // submission — beginPoll hands out a monotonically increasing ticket
+    // per attempt (pollOne calls this BEFORE any network round-trip), and
+    // this write only commits if no NEWER attempt has started in the
+    // meantime, regardless of which one finishes first. Self-healing: if
+    // the newest attempt crashes without ever writing, the row's
+    // poll_generation just stays wherever it left off, and the NEXT poll
+    // attempt (of any kind) claims a fresh, higher ticket for itself.
+    beginPoll(submissionId: number): number {
+      db.prepare("UPDATE issue_submissions SET poll_generation = poll_generation + 1 WHERE id = ?").run(
+        submissionId
+      );
+      const row = db.prepare("SELECT poll_generation FROM issue_submissions WHERE id = ?").get(submissionId) as
+        | { poll_generation: number }
+        | undefined;
+      return row?.poll_generation ?? 0;
+    },
+
     // v1's update_issue_tracking (database.py:732) — only touches fields
     // actually passed; status_changed_at is stamped via a CASE expression
     // in the SAME UPDATE as track_status so a poll that re-observes the
     // same status can't race between "check old status" and "write new
-    // status" as two separate statements would.
-    updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields): void {
+    // status" as two separate statements would. `generation` (Codex
+    // full-repo review, 2026-07-14, Warning) must match the row's CURRENT
+    // poll_generation for this write to take — see beginPoll above.
+    updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields, generation: number): void {
       const now = pyLocalIsoNow();
       const setClauses: string[] = ["last_checked_at = ?"];
       const values: unknown[] = [now];
@@ -1426,8 +1448,10 @@ export function openStorage(dbPath: string): Storage {
         values.push(fields.trackError);
       }
 
-      values.push(submissionId);
-      db.prepare(`UPDATE issue_submissions SET ${setClauses.join(", ")} WHERE id = ?`).run(...values);
+      values.push(submissionId, generation);
+      db.prepare(`UPDATE issue_submissions SET ${setClauses.join(", ")} WHERE id = ? AND poll_generation = ?`).run(
+        ...values
+      );
     },
 
     // v1's upsert_fix_report (database.py:765) — on a re-poll of a known

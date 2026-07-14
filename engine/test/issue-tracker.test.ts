@@ -412,7 +412,7 @@ describe("pollTrackedIssues", () => {
       issueUrl: "https://gitlab.example.com/group/proj/-/issues/7",
     });
     // 预先埋一个失败信息，证明成功轮询后会被清空。
-    await client.updateIssueTracking(subId, { trackError: "previous failure" });
+    await client.updateIssueTracking(subId, { trackError: "previous failure" }, await client.beginPoll(subId));
 
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes("/resource_state_events")) {

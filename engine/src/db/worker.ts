@@ -243,12 +243,18 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.getTrackableSubmissions() });
         break;
       }
+      case "beginPoll": {
+        const [submissionId] = args as [number];
+        reply({ id, ok: true, result: storage.beginPoll(submissionId) });
+        break;
+      }
       case "updateIssueTracking": {
-        const [submissionId, fields] = args as [
+        const [submissionId, fields, generation] = args as [
           number,
           Parameters<typeof storage.updateIssueTracking>[1],
+          number,
         ];
-        storage.updateIssueTracking(submissionId, fields);
+        storage.updateIssueTracking(submissionId, fields, generation);
         reply({ id, ok: true, result: undefined });
         break;
       }

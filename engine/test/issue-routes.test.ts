@@ -1067,7 +1067,7 @@ describe("GET /api/issues/mine / unread-count / POST mine/seen", () => {
     // updateIssueTracking only stamps status_changed_at when the new status
     // DIFFERS from the current one (schema default is 'submitted') — so this
     // must pick a different value to actually move the needle.
-    await client.updateIssueTracking(submissionId, { trackStatus: "closed" });
+    await client.updateIssueTracking(submissionId, { trackStatus: "closed" }, await client.beginPoll(submissionId));
 
     const app = buildTestApp();
     const countA1 = await authed(app, a.token, "/api/issues/mine/unread-count");

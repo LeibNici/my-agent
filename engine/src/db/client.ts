@@ -86,7 +86,8 @@ export type DbClient = {
   getSubmissionForTracking(id: number): Promise<TrackableSubmissionRow | null>;
   getSubmissionByIssue(repoId: number | null, issueNumber: number): Promise<TrackableSubmissionRow | null>;
   getTrackableSubmissions(): Promise<TrackableSubmissionRow[]>;
-  updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields): Promise<void>;
+  beginPoll(submissionId: number): Promise<number>;
+  updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields, generation: number): Promise<void>;
   upsertFixReport(fields: UpsertFixReportFields): Promise<number>;
   getUnverifiedFixReports(): Promise<UnverifiedFixReportRow[]>;
   setFixReportVerified(reportId: number, verified: boolean): Promise<void>;
@@ -251,8 +252,9 @@ export function createDbClient(dbPath: string): DbClient {
     getSubmissionByIssue: (repoId, issueNumber) =>
       call<TrackableSubmissionRow | null>("getSubmissionByIssue", [repoId, issueNumber]),
     getTrackableSubmissions: () => call<TrackableSubmissionRow[]>("getTrackableSubmissions", []),
-    updateIssueTracking: (submissionId, fields) =>
-      call<void>("updateIssueTracking", [submissionId, fields]),
+    beginPoll: (submissionId) => call<number>("beginPoll", [submissionId]),
+    updateIssueTracking: (submissionId, fields, generation) =>
+      call<void>("updateIssueTracking", [submissionId, fields, generation]),
     upsertFixReport: (fields) => call<number>("upsertFixReport", [fields]),
     getUnverifiedFixReports: () => call<UnverifiedFixReportRow[]>("getUnverifiedFixReports", []),
     setFixReportVerified: (reportId, verified) =>
