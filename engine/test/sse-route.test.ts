@@ -835,6 +835,76 @@ describe("auth middleware — 401 shape matches v1 FastAPI's {detail: ...}", () 
   });
 });
 
+// Codex full-repo review (2026-07-14, Critical #1): must_change_password
+// used to be surfaced ONLY in the login response for the frontend to react
+// to — the blanket /api/* middleware never checked it, so a JWT for an
+// account still on the well-known default password (admin/admin123) had
+// full API access, including /api/admin/*, with the frontend's gate being
+// the only thing standing between a bootstrap admin and the whole app.
+describe("auth middleware — must_change_password 后端强制拦截（Codex 全仓审查 Critical #1）", () => {
+  it("must_change_password:true 时访问任意其他 /api/* 路由 → 403，不到达真正的路由处理器", async () => {
+    const hash = await hashPassword("admin123");
+    const id = await client.createUser("gated-admin", hash, "admin", true);
+    const token = createToken({ id, username: "gated-admin", role: "admin" }, settings);
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+
+    const resp = await authedRequest(app, token, "/api/sessions");
+    expect(resp.status).toBe(403);
+    expect(await resp.json()).toEqual({ detail: "Password change required before accessing this resource" });
+  });
+
+  it("must_change_password:true 时 /api/admin/* 同样被拦截（不是只挡普通路由）", async () => {
+    const hash = await hashPassword("admin123");
+    const id = await client.createUser("gated-admin2", hash, "admin", true);
+    const token = createToken({ id, username: "gated-admin2", role: "admin" }, settings);
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+
+    const resp = await authedRequest(app, token, "/api/admin/users");
+    expect(resp.status).toBe(403);
+  });
+
+  it("must_change_password:true 时 /api/auth/me 和 /api/auth/change-password 仍然可达（否则用户没法真的改密码）", async () => {
+    const hash = await hashPassword("admin123");
+    const id = await client.createUser("gated-admin3", hash, "admin", true);
+    const token = createToken({ id, username: "gated-admin3", role: "admin" }, settings);
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+
+    const meResp = await authedRequest(app, token, "/api/auth/me");
+    expect(meResp.status).toBe(200);
+
+    const changeResp = await authedRequest(app, token, "/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: "admin123", new_password: "a-new-strong-pw" }),
+    });
+    expect(changeResp.status).toBe(200);
+  });
+
+  it("改密之后 must_change_password 清零 → 之前被拦截的路由恢复可用", async () => {
+    const hash = await hashPassword("admin123");
+    const id = await client.createUser("gated-admin4", hash, "admin", true);
+    const token = createToken({ id, username: "gated-admin4", role: "admin" }, settings);
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+
+    const blocked = await authedRequest(app, token, "/api/sessions");
+    expect(blocked.status).toBe(403);
+
+    await authedRequest(app, token, "/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: "admin123", new_password: "a-new-strong-pw" }),
+    });
+
+    const allowedNow = await authedRequest(app, token, "/api/sessions");
+    expect(allowedNow.status).toBe(200);
+  });
+
+  it("must_change_password:false 的普通用户不受影响", async () => {
+    const { token } = await seedUser("user", "ungated");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/sessions");
+    expect(resp.status).toBe(200);
+  });
+});
+
 // ==================== GET /api/config, /api/skills ====================
 
 describe("GET /api/config", () => {
@@ -911,6 +981,51 @@ describe("GET /api/repos", () => {
     const repos = await resp.json();
     expect(repos.length).toBe(1);
     expect(repos[0]).toMatchObject({ name: "wms", access_level: null });
+  });
+
+  // Codex full-repo review (2026-07-14, Critical #3): an admin can paste a
+  // credential straight into the url field instead of using the dedicated
+  // cred_username/cred_token columns — admin-routes.ts's adminRepoView
+  // already masked that case, but this route never did, so ANY authenticated
+  // user with read access (not just admins) could see the raw credential.
+  it("url 里嵌了凭证（https://user:token@host/repo）→ 非 admin 视图里凭证被剥离", async () => {
+    const { id: uid, token } = await seedUser("user", "ivy");
+    const db = new Database(dbPath);
+    const repoId = Number(
+      db
+        .prepare("INSERT INTO repositories (name, url, description, branch, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run("priv", "https://someuser:ghp_secrettoken@github.com/org/priv.git", "", "main", "x").lastInsertRowid
+    );
+    db.prepare("INSERT INTO permissions (user_id, repo_id, access_level, created_at) VALUES (?, ?, ?, ?)").run(
+      uid,
+      repoId,
+      "read",
+      "x"
+    );
+    db.close();
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/repos");
+    const repos = await resp.json();
+    expect(repos[0].url).toBe("https://github.com/org/priv.git");
+    expect(repos[0].url).not.toContain("ghp_secrettoken");
+  });
+
+  it("url 里嵌了凭证 → admin 视图（listRepos 路径）里凭证同样被剥离", async () => {
+    const { token } = await seedUser("admin", "root4");
+    const db = new Database(dbPath);
+    db.prepare("INSERT INTO repositories (name, url, description, branch, created_at) VALUES (?, ?, ?, ?, ?)").run(
+      "priv2",
+      "https://someuser:ghp_secrettoken2@github.com/org/priv2.git",
+      "",
+      "main",
+      "x"
+    );
+    db.close();
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/repos");
+    const repos = await resp.json();
+    expect(repos[0].url).toBe("https://github.com/org/priv2.git");
+    expect(repos[0].url).not.toContain("ghp_secrettoken2");
   });
 });
 

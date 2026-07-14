@@ -1,0 +1,20 @@
+# Codex full-repo review (2026-07-14, Critical #2): this file used to live
+# at engine/.dockerignore, but docker-compose.yml's build context is the
+# REPO ROOT (`context: .`), and Docker only honors a .dockerignore sitting
+# at the context root — the one in engine/ was silently never applied.
+# COPY engine/ ./ was therefore sweeping in engine/.env (real
+# ANTHROPIC_API_KEY etc. on a real deploy checkout), any local
+# engine/node_modules, and test files, baking them into an image layer with
+# no filtering at all. Patterns below are relative to this file's location
+# (the context root), matching what engine/Dockerfile actually COPYs.
+engine/node_modules
+engine/.env
+engine/test
+engine/**/*.test.ts
+web/node_modules
+.git
+.env
+*.db
+.jwt_secret
+data/
+.ccg/

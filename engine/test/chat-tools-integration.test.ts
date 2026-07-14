@@ -155,6 +155,13 @@ describe("chat route — per-turn ToolContext wiring (Task 8, closes Phase 4a)",
         ANTHROPIC_BASE_URL: mock.url,
         ANTHROPIC_API_KEY: "sk-mock-offline-not-a-real-key",
         ANTHROPIC_MODEL: "mock",
+        // A default-password bootstrap admin now gets must_change_password
+        // server-side enforced on every OTHER /api/* route too (Codex
+        // full-repo review, 2026-07-14, Critical #1) — this test isn't
+        // exercising that gate, it's proving repo-permission resolution
+        // reaches file_reader, so give the bootstrap admin an
+        // operator-supplied password the same way production would.
+        APP_ADMIN_PASSWORD: "chat-tools-integration-admin-pw",
       },
     });
     const base = `http://127.0.0.1:${started.port}`;

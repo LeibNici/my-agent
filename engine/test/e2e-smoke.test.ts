@@ -140,6 +140,19 @@ describe("e2e smoke — real server + real runTurn engine against an offline moc
     const token = loginBody.token;
     expect(typeof token).toBe("string");
 
+    // must_change_password now blocks every OTHER /api/* route server-side
+    // (Codex full-repo review, 2026-07-14, Critical #1 — this used to be a
+    // frontend-only gate) — clear it the real way (not by seeding a
+    // different user) so the rest of this e2e flow exercises actual
+    // functionality instead of being blocked by the very gate this test
+    // isn't about.
+    const changePwResp = await fetch(`${base}/api/auth/change-password`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ current_password: "admin123", new_password: "a-new-strong-pw" }),
+    });
+    expect(changePwResp.status).toBe(200);
+
     // ---- POST /api/chat — real runTurn, real SSE, over real HTTP ----
     const chatResp = await fetch(`${base}/api/chat`, {
       method: "POST",

@@ -22,6 +22,7 @@ import type { DbClient } from "../db/client.js";
 import type { Settings } from "../config.js";
 import type { RunTurnFn } from "../engine/turn.js";
 import { createToken, decodeToken, verifyPassword, hashPassword, AuthError } from "../auth.js";
+import { maskUrlCredentials } from "../repo-sync.js";
 import { listTools } from "../tools/registry.js";
 // Side-effecting registrations (Task 8 closes Phase 4a): each of these
 // files calls registerTool() at import time — calculator (Phase 3's one
@@ -179,6 +180,20 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     if (!user || !user.is_active) {
       return c.json({ detail: "Not authenticated" }, 401);
     }
+    // Codex full-repo review (2026-07-14, Critical #1): must_change_password
+    // used to be enforced ONLY by the frontend (it reads the flag off the
+    // login response and blocks navigation) — the backend never checked it,
+    // so a valid JWT for an account still on the well-known default
+    // password (auth.ts's ensureAdminUser) had full API access regardless,
+    // including /api/admin/*. Enforced here instead: every route except the
+    // two needed to actually clear the flag is blocked until it's cleared.
+    if (
+      user.must_change_password &&
+      c.req.path !== "/api/auth/me" &&
+      c.req.path !== "/api/auth/change-password"
+    ) {
+      return c.json({ detail: "Password change required before accessing this resource" }, 403);
+    }
     c.set("user", { id: user.id, username: user.username, role: user.role });
     await next();
   });
@@ -273,7 +288,14 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
   app.get("/api/repos", async (c) => {
     const user = c.get("user");
     const rows = user.role === "admin" ? await deps.db.listRepos() : await deps.db.listReposForUser(user.id);
-    return c.json(rows);
+    // Codex full-repo review (2026-07-14, Critical #3): maskUrlCredentials'
+    // own doc comment says it's meant to be shared between the admin and
+    // non-admin repo views (an admin can paste credentials straight into the
+    // url field instead of using cred_username/cred_token — admin-routes.ts's
+    // adminRepoView already masks it), but this route never actually called
+    // it — any authenticated user with read access to a repo could see a
+    // credential-embedded URL verbatim, not just admins.
+    return c.json(rows.map((r) => ({ ...r, url: maskUrlCredentials(r.url) })));
   });
 
   // ==================== Sessions ====================
