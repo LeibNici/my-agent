@@ -80,6 +80,18 @@ async function seedRepo(overrides: { url?: string; credToken?: string | null } =
   });
 }
 
+// Codex full-repo review (2026-07-14, Warning): verifyDraftRepoId now fails
+// CLOSED when draftToolUseId isn't found anywhere in the session's own
+// message history (previously failed open) — any test driving
+// /api/issues/submit or /api/issues/action with a draft_tool_use_id must
+// seed a matching tool_result block first, the same way a real draft card
+// would have actually landed in that session's history.
+async function seedDraftToolResult(sessionId: string, toolUseId: string, repoId: number): Promise<void> {
+  await client.addMessage(sessionId, "user", [
+    { type: "tool_result", tool_use_id: toolUseId, content: JSON.stringify({ repo_id: repoId }), is_error: false },
+  ]);
+}
+
 // ==================== Routed fetch mock (GitLab API surface) ====================
 
 type MockRoute = {
@@ -314,6 +326,37 @@ describe("POST /api/issues/submit", () => {
     expect((await resp.json()).detail).toContain("提交的仓库与草稿时确认的仓库不一致");
   });
 
+  // Codex full-repo review (2026-07-14, Warning): verifyDraftRepoId used to
+  // fail OPEN when draft_tool_use_id wasn't found anywhere in the session's
+  // own message history — a request bearing a draft_tool_use_id that was
+  // never actually issued in THIS session (guessed, reused from elsewhere,
+  // or belonging to a different session/user entirely) sailed through with
+  // no error. The claim mechanism's uniqueness is keyed on draft_tool_use_id
+  // alone, so a resulting conflict could hand back another session's
+  // already-filed issue number/URL to a caller who was never shown that
+  // draft at all.
+  it("draft_tool_use_id 在这个 session 的消息历史里完全找不到 -> 400（fail-closed，不再 fail-open）", async () => {
+    const { id: userId, token } = await seedUser("user", "draft-not-found");
+    const repoId = await seedRepo();
+    await client.grantPermission(userId, repoId, "write");
+    const sessionId = await client.createSession("New Chat", userId);
+    // Deliberately NOT seeding any tool_result for this id — simulates a
+    // guessed/reused/foreign draft_tool_use_id.
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/issues/submit", {
+      method: "POST",
+      body: JSON.stringify({
+        repo_id: repoId,
+        title: "t",
+        body: "b",
+        session_id: sessionId,
+        draft_tool_use_id: "tu_never_issued_in_this_session",
+      }),
+    });
+    expect(resp.status).toBe(400);
+    expect((await resp.json()).detail).toContain("Draft not found in this session");
+  });
+
   it("successful submit (with session_id): {ok, issue_number, issue_url}; recorded row; session stays OPEN (QA-reported: used to force-resolve here)", async () => {
     const { id: userId, token } = await seedUser("admin", "submit-admin");
     const repoId = await seedRepo();
@@ -361,6 +404,7 @@ describe("POST /api/issues/submit", () => {
     const { id: userId, token } = await seedUser("admin", "submit-idem");
     const repoId = await seedRepo();
     const sessionId = await client.createSession("New Chat", userId);
+    await seedDraftToolResult(sessionId, "tu_dup_1", repoId);
     const fetchMock = stubFetch([
       LABELS_ROUTE,
       issuesCreateRoute(201, { iid: 61, web_url: "https://gitlab.example.com/group/proj/-/issues/61", title: "Bug title" }),
@@ -415,6 +459,7 @@ describe("POST /api/issues/submit", () => {
     const { id: userId, token } = await seedUser("admin", "submit-concurrent");
     const repoId = await seedRepo();
     const sessionId = await client.createSession("New Chat", userId);
+    await seedDraftToolResult(sessionId, "tu_concurrent_1", repoId);
     const fetchMock = stubFetch([
       LABELS_ROUTE,
       issuesCreateRoute(201, { iid: 62, web_url: "https://gitlab.example.com/group/proj/-/issues/62", title: "Bug title" }),
@@ -843,6 +888,7 @@ describe("POST /api/issues/action", () => {
     const { id: userId, token } = await seedUser("admin", "action-concurrent");
     const repoId = await seedRepo();
     const sessionId = await client.createSession("New Chat", userId);
+    await seedDraftToolResult(sessionId, "tu_action_concurrent_1", repoId);
     const fetchMock = stubFetch([issueNoteRoute(201), issueGetRoute(200, { iid: 5, web_url: "https://gitlab.example.com/group/proj/-/issues/5", title: "T" })]);
     const app = buildTestApp();
     const body = {

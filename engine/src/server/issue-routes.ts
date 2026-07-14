@@ -162,7 +162,22 @@ async function verifyDraftRepoId(
       return null;
     }
   }
-  return null;
+  // Codex full-repo review (2026-07-14, Warning): this used to fail OPEN
+  // when draftToolUseId wasn't found anywhere in the session's own message
+  // history — a request bearing a genuinely-issued-in-a-DIFFERENT-session
+  // (or different user's) draft_tool_use_id string would sail through this
+  // check with no error, and the claim mechanism's uniqueness is keyed on
+  // draft_tool_use_id alone (not scoped to session/user), so a resulting
+  // conflict could return another session's already_submitted issue
+  // number/URL back to a caller who was never actually shown that draft.
+  // Every LEGITIMATELY-issued draft_tool_use_id is always recorded in this
+  // exact session's own history right when draft_issue/manage_issue
+  // produced it — a request whose id genuinely isn't there has no
+  // business claiming anything under it.
+  return c.json(
+    { detail: "Draft not found in this session — please resubmit from the confirmation card." },
+    400,
+  );
 }
 
 export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
