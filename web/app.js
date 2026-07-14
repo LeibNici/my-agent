@@ -416,6 +416,22 @@ async function openSession(sessionId) {
     const resp = await authFetch(`/api/sessions/${sessionId}`);
     const data = await resp.json();
 
+    // Codex full-repo review (2026-07-14, Warning): two quick sidebar
+    // clicks (session A, then session B before A's GET resolves) used to
+    // race — whichever fetch resolved LAST always won and overwrote the
+    // message pane, regardless of which session the user actually ended
+    // up on (loadSessions() highlights based on currentSessionId, which by
+    // then reflects the user's real last click — B). Each openSession call
+    // sets currentSessionId synchronously before its own await, so by the
+    // time this fetch resolves, currentSessionId already reflects whatever
+    // the user clicked MOST recently; if it no longer matches the id this
+    // particular call was fetching, a newer call has taken over and this
+    // stale response must not touch the DOM. Same guard incidentally
+    // covers deleteSession racing an in-flight openSession for the
+    // session being deleted (it resets currentSessionId to null on
+    // delete, which this check also catches).
+    if (sessionId !== currentSessionId) return;
+
     const messagesDiv = document.getElementById("messages");
     messagesDiv.innerHTML = "";
 
