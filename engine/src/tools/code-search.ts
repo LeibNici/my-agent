@@ -225,6 +225,16 @@ const CodeSearchParams = Type.Object({
 
 const DEFAULT_FILE_PATTERN = "*";
 const DEFAULT_MAX_RESULTS = 20;
+// Codex full-repo review (2026-07-14, Warning): max_results had no upper
+// bound (matching v1's own `max_results: int = 20` parameter, which was
+// equally unbounded) — a large caller-supplied value defeats the
+// once-a-repo-hits-the-cap early-abort below, so every allowed repo gets
+// searched to completion instead of just enough of them, and the final
+// `results.slice(0, maxResults)` can return a multi-megabyte match list
+// back to the LLM. Each per-repo search is still independently bounded by
+// SEARCH_TIMEOUT_MS and a 50MB subprocess buffer either way — this ceiling
+// bounds the aggregate across repos and what actually gets returned.
+const MAX_RESULTS_CEILING = 200;
 
 type SearchRuntime = { rgBin: string | null; timeoutMs: number };
 
@@ -241,7 +251,7 @@ async function runCodeSearch(
 ): Promise<string> {
   const keyword = input.keyword;
   const filePattern = input.file_pattern ?? DEFAULT_FILE_PATTERN;
-  const maxResults = input.max_results ?? DEFAULT_MAX_RESULTS;
+  const maxResults = Math.min(input.max_results ?? DEFAULT_MAX_RESULTS, MAX_RESULTS_CEILING);
 
   const allowedPaths = getAllowedPaths(ctx);
   if (allowedPaths.length === 0) {

@@ -203,6 +203,19 @@ describe("code_search (grep fallback, real subprocess)", () => {
     const result = await runCodeSearch({ keyword: "needle" }, makeCtx([missing, root]), runtime);
     expect(result).toContain("needle here");
   });
+
+  it("Codex full-repo review (2026-07-14, Warning): a caller-supplied max_results far above the ceiling is clamped, not honored verbatim — the body never exceeds the ceiling even when the raw match count does", async () => {
+    const lines = Array.from({ length: 500 }, (_, i) => `needle line ${i}`).join("\n") + "\n";
+    fs.writeFileSync(path.join(root, "many.txt"), lines);
+    const result = await runCodeSearch(
+      { keyword: "needle", max_results: 999_999_999 },
+      makeCtx([root]),
+      runtime,
+    );
+    expect(result.startsWith("Found 500 matches:\n")).toBe(true);
+    const bodyLines = result.split("\n").slice(1);
+    expect(bodyLines.length).toBe(200); // MAX_RESULTS_CEILING, not the raw match count
+  });
 });
 
 // ---------------------------------------------------------------------------

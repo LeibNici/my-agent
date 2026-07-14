@@ -24,6 +24,16 @@ export type Chunk = { path: string; start: number; end: number; name: string; te
 
 const CHUNK_KINDS = new Set(["function", "method", "class", "interface", "enum"]);
 const MAX_CHUNK_LINES = 120;
+// Codex full-repo review (2026-07-14, Warning): collectChunks had no
+// repo-wide ceiling — every per-file chunk (bounded per-chunk by
+// MAX_CHUNK_LINES/MAX_CHUNK_CHARS) and every MyBatis mapper XML window got
+// appended with no total cap, so an unusually large repo could hand
+// embedAndSaveIndex a chunk array whose embedding-API cost/time is
+// unbounded. Truncating here (after the scan, so ordering/behavior for
+// normal-sized repos is unchanged) bounds what actually gets embedded;
+// v1 (semantic_index.py's _collect_chunks) had the same absence of a cap,
+// so this is a new safety net, not a behavior regression to match.
+const MAX_TOTAL_CHUNKS = 20_000;
 const MIN_CHUNK_LINES = 3;
 const MAX_CHUNK_CHARS = 6000; // keep well under the embedding model's input cap
 const XML_WINDOW_LINES = 80;
@@ -231,7 +241,11 @@ function scanMapperXml(repoPath: string, dir: string, out: Chunk[]): void {
 // _collect_chunks port
 // ---------------------------------------------------------------------------
 
-export function collectChunks(repoPath: string): Chunk[] {
+// maxTotalChunks: test-only override (defaults to MAX_TOTAL_CHUNKS) so the
+// truncation guard can be exercised against a small, fast fixture instead
+// of a repo actually large enough to hit the real 20k cap — same
+// test-injection shape as symbol-index.ts's buildIndexWithBin.
+export function collectChunks(repoPath: string, maxTotalChunks: number = MAX_TOTAL_CHUNKS): Chunk[] {
   const tags = loadTags(repoPath);
   if (tags === null) return [];
 
@@ -261,6 +275,13 @@ export function collectChunks(repoPath: string): Chunk[] {
   }
 
   scanMapperXml(repoPath, repoPath, chunks);
+
+  if (chunks.length > maxTotalChunks) {
+    console.warn(
+      `collectChunks(${repoPath}): ${chunks.length} chunks exceeds the ${maxTotalChunks} cap, truncating — embedding index will be incomplete for this repo`,
+    );
+    return chunks.slice(0, maxTotalChunks);
+  }
   return chunks;
 }
 

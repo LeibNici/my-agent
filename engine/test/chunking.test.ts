@@ -209,6 +209,40 @@ describe("collectChunks — symlinked XML is skipped, never opened", () => {
 });
 
 // ---------------------------------------------------------------------------
+// collectChunks — total-chunk ceiling (Codex full-repo review, 2026-07-14,
+// Warning: an unusually large repo could hand embedAndSaveIndex an
+// unbounded chunk array, with unbounded downstream embedding-API cost/time)
+// ---------------------------------------------------------------------------
+describe("collectChunks — total-chunk ceiling", () => {
+  it("truncates to the cap when the real scan produces more chunks than the (test-overridden, small) ceiling allows", async () => {
+    const mapperDir = path.join(repo, "resources", "mapper");
+    fs.mkdirSync(mapperDir, { recursive: true });
+    // 5 files x 1 window each (well under the 80-line window size) = 5 chunks.
+    for (let i = 0; i < 5; i++) {
+      fs.writeFileSync(path.join(mapperDir, `M${i}.xml`), `<!-- file ${i} -->\n`);
+    }
+    await buildIndex(repo);
+
+    const uncapped = collectChunks(repo);
+    expect(uncapped.length).toBe(5);
+
+    const capped = collectChunks(repo, 3);
+    expect(capped).toHaveLength(3);
+    expect(capped).toEqual(uncapped.slice(0, 3));
+  });
+
+  it("does not truncate when chunk count is at or under the cap", async () => {
+    const mapperDir = path.join(repo, "resources", "mapper");
+    fs.mkdirSync(mapperDir, { recursive: true });
+    fs.writeFileSync(path.join(mapperDir, "M.xml"), "<!-- only file -->\n");
+    await buildIndex(repo);
+
+    const chunks = collectChunks(repo, 1);
+    expect(chunks).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // chunkHash
 // ---------------------------------------------------------------------------
 describe("chunkHash", () => {
