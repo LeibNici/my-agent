@@ -60,6 +60,25 @@ async function seedUser(role: "user" | "admin" = "user", username = "alice"): Pr
   return { id, token };
 }
 
+// Codex full-repo review (2026-07-14, production QA): repo create/manual
+// sync are now fire-and-forget (see admin-routes.ts's own comment on why —
+// a route blocking on up to 120s of git meant a slow/degraded network path
+// was indistinguishable from a genuine hang) — the HTTP response no longer
+// carries the sync outcome, so tests that care about the eventual result
+// need to poll the DB row until repo-sync.ts's transient "syncing" status
+// clears. Also needed so afterEach's client.close() never races an
+// in-flight background sync (which would otherwise log a stray "db client
+// is closed" error from the fire-and-forget promise's own .catch).
+async function waitForSyncSettled(repoId: number, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    const row = await client.getRepoAdmin(repoId);
+    if (row && row.last_sync_status !== "syncing") return;
+    if (Date.now() - start > timeoutMs) throw new Error(`waitForSyncSettled(${repoId}) timed out`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 // Every test in this file needs a REAL sync path (no network, no SSRF gate)
 // so create/update/sync routes can be exercised end to end — this is the
 // one deps override every buildTestApp() call needs, per admin-routes.ts's
@@ -258,7 +277,7 @@ describe("users CRUD", () => {
 // ==================== Repositories ====================
 
 describe("repos", () => {
-  it("POST creates + synchronously syncs (real git clone against a temp bare repo)", async () => {
+  it("POST creates immediately (fire-and-forget sync), row transitions syncing -> ok once the background clone actually finishes", async () => {
     const { token } = await seedUser("admin");
     const originDir = mkdtempSync(join(tmpdir(), "admin-routes-origin-"));
     initOriginRepo(originDir);
@@ -270,9 +289,14 @@ describe("repos", () => {
       });
       expect(resp.status).toBe(200);
       const body = await resp.json();
-      expect(body).toMatchObject({ name: "r1", url: originDir, branch: null, synced: true });
-      expect(typeof body.sync_message).toBe("string");
+      // Codex full-repo review (2026-07-14, production QA): the response no
+      // longer carries synced/sync_message — the background sync hasn't
+      // necessarily finished (or even started) by the time this resolves.
+      expect(body).toMatchObject({ name: "r1", url: originDir, branch: null });
+      expect(body.synced).toBeUndefined();
+      expect(body.sync_message).toBeUndefined();
 
+      await waitForSyncSettled(body.id);
       const row = await client.getRepoAdmin(body.id);
       expect(row!.last_sync_status).toBe("ok");
       expect(existsSync(join(row!.local_path!, ".git"))).toBe(true);
@@ -293,6 +317,7 @@ describe("repos", () => {
       body: JSON.stringify({ name: "r1", url }),
     });
     expect(first.status).toBe(200);
+    const firstBody = await first.json();
 
     const second = await authed(app, token, "/api/admin/repos", {
       method: "POST",
@@ -303,6 +328,7 @@ describe("repos", () => {
 
     const all = await client.listRepos();
     expect(all.filter((r) => r.url === url)).toHaveLength(1);
+    await waitForSyncSettled(firstBody.id);
   });
 
   it("POST 同一仓库但 URL 只差末尾斜杠 → 仍判定重复 → 409", async () => {
@@ -314,26 +340,31 @@ describe("repos", () => {
       body: JSON.stringify({ name: "r1", url }),
     });
     expect(first.status).toBe(200);
+    const firstBody = await first.json();
 
     const second = await authed(app, token, "/api/admin/repos", {
       method: "POST",
       body: JSON.stringify({ name: "r1-slash", url: `${url}/` }),
     });
     expect(second.status).toBe(409);
+    await waitForSyncSettled(firstBody.id);
   });
 
   it("POST 真正不同的 URL → 正常创建，不受重复检查影响", async () => {
     const { token } = await seedUser("admin");
     const app = buildTestApp();
-    await authed(app, token, "/api/admin/repos", {
+    const first = await authed(app, token, "/api/admin/repos", {
       method: "POST",
       body: JSON.stringify({ name: "r1", url: join(reposDir, "dup-test-repo3a") }),
     });
+    const firstBody = await first.json();
     const second = await authed(app, token, "/api/admin/repos", {
       method: "POST",
       body: JSON.stringify({ name: "r2", url: join(reposDir, "dup-test-repo3b") }),
     });
     expect(second.status).toBe(200);
+    const secondBody = await second.json();
+    await Promise.all([waitForSyncSettled(firstBody.id), waitForSyncSettled(secondBody.id)]);
   });
 
   it("GET list applies _admin_repo_view: has_token bool, no cred_token, masked url", async () => {
@@ -517,7 +548,7 @@ describe("repos", () => {
     expect(await resp.json()).toEqual({ ok: true });
   });
 
-  it("POST /:id/sync manually re-syncs (real git)", async () => {
+  it("POST /:id/sync 立即返回（fire-and-forget），row 之后异步变成 ok（real git）", async () => {
     const { token } = await seedUser("admin");
     const originDir = mkdtempSync(join(tmpdir(), "admin-routes-origin3-"));
     initOriginRepo(originDir);
@@ -529,6 +560,7 @@ describe("repos", () => {
       const body = await resp.json();
       expect(body.ok).toBe(true);
       expect(typeof body.message).toBe("string");
+      await waitForSyncSettled(repoId);
       const row = await client.getRepoAdmin(repoId);
       expect(row!.last_sync_status).toBe("ok");
     } finally {

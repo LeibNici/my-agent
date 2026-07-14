@@ -489,6 +489,19 @@ async function syncAndPersistImpl(
 ): Promise<{ ok: boolean; message: string }> {
   const { repoId, url, reposDir, branch, forceReclone, credUsername, credToken } = opts;
 
+  // 生产 QA 复测（2026-07-14）：新仓库同步实际是在正常工作（120s 超时是设计
+  // 值，不是卡死），但 admin 创建/手动同步这两个路由过去是同步 await 整个
+  // clone/pull 过程才返回响应——在网络较差（比如从这台生产主机连
+  // github.com）时用户能等上接近 2 分钟，期间界面上的按钮除了"禁用"什么
+  // 信息都没有，和真的卡死没法区分。现在改成 fire-and-forget：路由层
+  // (admin-routes.ts) 立刻返回，真正的 clone/pull 在后台跑；这里在真正进
+  // 入锁排队之前先把这一行标成 "syncing"，让轮询中的前端立刻就能看到"确实
+  // 在同步"而不是长时间停在"未同步"或者上一次的旧状态。故意放在
+  // withRepoLock 之外——即使这次调用要在锁队列里排在另一次同步后面，管理
+  // 员也应该马上看到"已经在排队/进行中"，而不是等真正轮到自己开始跑 git
+  // 才第一次有反馈。
+  await db.updateRepo(repoId, { lastSyncStatus: "syncing" });
+
   return withRepoLock(repoId, async () => {
     const result = await syncFn({
       url,

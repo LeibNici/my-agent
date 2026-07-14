@@ -465,6 +465,56 @@ describe("syncAndPersist", () => {
     expect(row!.last_sync_sha).toBe(realSha);
   });
 
+  // 生产 QA 复测（2026-07-14）：admin-routes.ts 的 create/manual-sync 路由
+  // 从"await 整个 clone/pull 再返回"改成了 fire-and-forget——前端靠轮询
+  // GET /api/admin/repos/:id 观察这一行何时从 "syncing" 变成 "ok"/"error"
+  // 才知道结果。这条测试直接验证 syncAndPersistImpl 真的在慢操作跑完之前
+  // 就已经把状态写成了 "syncing"，而不是等到最后一次性写 "ok"——用和上面
+  // "同一 repoId 的两个并发调用被序列化"那条同样的 spawn 延迟注入手法，
+  // 保证真正的 git 调用有一段可观察的窗口。
+  it("同步进行中，DB 行的 last_sync_status 是 \"syncing\"（不是长时间停在旧状态或空值），真正跑完之后才变成 ok", async () => {
+    const passthroughSpawn = mockedSpawn.getMockImplementation()!;
+    const DELAY_MS = 200;
+    mockedSpawn.mockImplementation(((...args: unknown[]) => {
+      const fake = new EventEmitter() as EventEmitter & {
+        pid?: number;
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+      };
+      fake.stdout = new EventEmitter();
+      fake.stderr = new EventEmitter();
+      setTimeout(() => {
+        const real = (passthroughSpawn as (...a: unknown[]) => ReturnType<typeof spawnCb>)(...args);
+        fake.pid = real.pid;
+        real.stdout?.on("data", (chunk) => fake.stdout.emit("data", chunk));
+        real.stderr?.on("data", (chunk) => fake.stderr.emit("data", chunk));
+        real.on("error", (err) => fake.emit("error", err));
+        real.on("close", (code) => fake.emit("close", code));
+      }, DELAY_MS);
+      return fake;
+    }) as typeof spawnCb);
+
+    let syncPromise: Promise<{ ok: boolean; message: string }>;
+    try {
+      syncPromise = syncAndPersistUnvalidated(client, { repoId, url: originDir, reposDir });
+      // Well inside the DELAY_MS window every real spawn call in this sync
+      // is now padded with — the row must already show "syncing" by now,
+      // since that write happens before withRepoLock even queues the
+      // (still-delayed) real git work.
+      await new Promise((r) => setTimeout(r, 50));
+      const midFlight = await client.getRepoAdmin(repoId);
+      expect(midFlight!.last_sync_status).toBe("syncing");
+
+      const result = await syncPromise;
+      expect(result.ok).toBe(true);
+    } finally {
+      mockedSpawn.mockImplementation(passthroughSpawn as typeof spawnCb);
+    }
+
+    const settled = await client.getRepoAdmin(repoId);
+    expect(settled!.last_sync_status).toBe("ok");
+  });
+
   it("失败时 last_sync_status=error，不写 local_path", async () => {
     const badUrl = "http://127.0.0.1/nope"; // SSRF 拒绝，必然失败
     const result = await syncAndPersist(client, { repoId, url: badUrl, reposDir });

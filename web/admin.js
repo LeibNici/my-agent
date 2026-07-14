@@ -132,6 +132,14 @@ let editingRepoId = null;
 // hover; index lag ("git synced but symbol index still building") gets its
 // own hint since a green sync doesn't mean code search is fresh yet.
 function syncStatusCell(r) {
+    // 生产 QA 复测（2026-07-14）：create/manual-sync 路由改成了 fire-and-
+    // forget（见 admin-routes.ts 的同一条注释）——同步进行中这一行的
+    // last_sync_status 会是 "syncing"，必须在"是否有过 last_sync_at"这个
+    // 判断之前先检查，否则一个从未同步过的新仓库在它自己的第一次同步过程
+    // 中会先被上面那条"未同步"分支截住，界面上完全看不出后台其实正在跑。
+    if (r.last_sync_status === 'syncing') {
+        return '<span style="color:var(--amber)">⏳ 同步中…</span>';
+    }
     if (!r.last_sync_at) return '<span style="color:var(--faint)">未同步</span>';
     const t = esc(String(r.last_sync_at).slice(5, 16).replace('T', ' '));
     const sync = r.last_sync_status === 'ok'
@@ -142,6 +150,39 @@ function syncStatusCell(r) {
         : '';
     const idxMap = { ready: '', building: ' <span style="color:var(--amber)" title="符号索引重建中">索引构建中</span>', failed: ' <span style="color:var(--rust)" title="ctags 索引构建失败，符号搜索可能过期">索引失败</span>' };
     return sync + sha + (idxMap[r.index_status] ?? '');
+}
+
+// 生产 QA 复测（2026-07-14）：create/manual-sync 路由不再等 clone/pull 跑完
+// 才返回（见 admin-routes.ts 同一条注释——从这台生产主机连 github.com 之类
+// 的路径可能明显更慢，同步 await 到 120s 超时期间界面上只有一个禁用按钮，
+// 和真的卡死没法区分）。这个函数替代原来"直接读 POST 响应里的
+// synced/sync_message"的做法：定期重新拉一次仓库列表，直到目标仓库的
+// last_sync_status 不再是 "syncing"，再给一条最终结果的提示。maxWaitMs 留
+// 了比 120s git 超时更宽的余量（后面可能还有 embedding 索引构建），到点了
+// 还没完成也不当错误处理——只是提示"仍在进行"，不是失败。
+async function pollRepoSyncStatus(repoId, maxWaitMs = 150000, intervalMs = 2000) {
+    const start = Date.now();
+    for (;;) {
+        let r;
+        try {
+            const resp = await fetch(`/api/admin/repos/${repoId}`, { headers: authHeaders() });
+            if (!resp.ok) return; // repo 在轮询期间被删除，或权限问题——安静退出
+            r = await resp.json();
+        } catch {
+            return; // 网络错误——安静退出，不让轮询本身变成一个新的报错来源
+        }
+        loadRepos();
+        if (r.last_sync_status !== 'syncing') {
+            if (r.last_sync_status === 'ok') showMsg(`仓库 ${r.name} 同步成功：${r.last_sync_message || ''}`);
+            else if (r.last_sync_status === 'error') showMsg(`仓库 ${r.name} 同步失败：${r.last_sync_message || ''}`, false);
+            return;
+        }
+        if (Date.now() - start > maxWaitMs) {
+            showMsg(`仓库 ${r.name} 仍在同步中，请稍后刷新查看结果`, false);
+            return;
+        }
+        await new Promise(res => setTimeout(res, intervalMs));
+    }
 }
 
 async function loadRepos() {
@@ -207,7 +248,10 @@ async function createRepo(btn) {
             }),
         });
         if (!ok) return showMsg(data.detail || "创建失败", false);
-        showMsg(`仓库 ${name} 添加成功`);
+        // 生产 QA 复测（2026-07-14）：POST 的响应不再带 synced/sync_message——
+        // 同步已经在后台异步跑了，这里立刻提示"已创建，同步中"并开始轮询，
+        // 不再等整个 clone 跑完才让按钮解禁/给出最终提示。
+        showMsg(`仓库 ${name} 已创建，正在同步…`);
         document.getElementById("new-repo-name").value = "";
         document.getElementById("new-repo-url").value = "";
         document.getElementById("new-repo-branch").value = "";
@@ -215,6 +259,7 @@ async function createRepo(btn) {
         document.getElementById("new-repo-cred-token").value = "";
         document.getElementById("new-repo-desc").value = "";
         loadRepos();
+        pollRepoSyncStatus(data.id);
     } finally {
         btn.disabled = false;
     }
@@ -279,9 +324,12 @@ async function syncRepo(id, btn) {
     btn.disabled = true;
     try {
         const { ok, data } = await apiRequest(`/api/admin/repos/${id}/sync`, { method: "POST" });
-        if (!ok || !data.ok) return showMsg(data.detail || data.message || "同步失败", false);
-        showMsg(`同步成功：${data.message}`);
+        if (!ok || !data.ok) return showMsg(data.detail || data.message || "同步启动失败", false);
+        // 生产 QA 复测（2026-07-14）：/sync 现在也是 fire-and-forget，响应
+        // 只表示"已开始"，不是最终结果——轮询拿真正的成功/失败。
+        showMsg("同步已开始…");
         loadRepos();
+        pollRepoSyncStatus(id);
     } catch (err) {
         showMsg(`网络错误: ${err.message}`, false);
     } finally {

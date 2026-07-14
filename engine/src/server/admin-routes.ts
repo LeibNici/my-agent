@@ -211,16 +211,25 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
       credToken,
     });
 
-    // Clone the repo now (blocking) — matches v1's synchronous
-    // `await sync_and_persist`: the create-repo response reports whether
-    // the clone actually worked rather than "queued, check back later".
-    const result = await sync(deps.db, {
+    // 生产 QA 复测（2026-07-14）：这里过去是 `await sync(...)` 再返回——
+    // 从这台生产主机连 github.com 之类的网络路径可能明显更慢，git 的超时
+    // 是 120s，用户盯着一个禁用按钮等接近 2 分钟、期间没有任何反馈，和真的
+    // 卡死没法区分。改成 fire-and-forget：响应立刻带着 repo id 返回，真正
+    // 的 clone 在后台跑；deps.db.updateRepo(...syncing...) 已经在
+    // syncAndPersistImpl 进入锁排队之前把这一行标成 "syncing"，前端轮询
+    // GET /api/admin/repos/:id 看这个字段何时变成 "ok"/"error" 就知道结果。
+    // .catch 只是兜底——sync() 本身已经把每种失败都落进了 DB 行的
+    // last_sync_status/last_sync_message，理论上不会真的走到这里，但一次
+    // 意料之外的抛错不该变成未处理的 promise rejection。
+    void sync(deps.db, {
       repoId: id,
       url: body.url,
       reposDir: deps.settings.reposDir,
       branch,
       credUsername,
       credToken,
+    }).catch((err) => {
+      console.error(`repo ${id} background sync threw unexpectedly:`, err);
     });
 
     return c.json({
@@ -228,8 +237,6 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
       name: body.name,
       url: body.url,
       branch,
-      synced: result.ok,
-      sync_message: result.message,
     });
   });
 
@@ -340,15 +347,19 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     const repo = Number.isFinite(repoId) ? await deps.db.getRepoAdmin(repoId) : null;
     if (!repo) return c.json({ detail: "Repo not found" }, 404);
 
-    const result = await sync(deps.db, {
+    // 同上（POST /api/admin/repos 的同一条注释）：fire-and-forget，让手动
+    // 同步按钮也不再要求前端阻塞等最长 120s 的响应。
+    void sync(deps.db, {
       repoId,
       url: repo.url,
       reposDir: deps.settings.reposDir,
       branch: repo.branch,
       credUsername: repo.cred_username,
       credToken: repo.cred_token,
+    }).catch((err) => {
+      console.error(`repo ${repoId} background sync threw unexpectedly:`, err);
     });
-    return c.json({ ok: result.ok, message: result.message });
+    return c.json({ ok: true, message: "同步已开始" });
   });
 
   // ==================== Permissions ====================
