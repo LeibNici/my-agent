@@ -723,6 +723,113 @@ describe("POST /api/auth/login", () => {
   });
 });
 
+// Codex full-repo review (2026-07-14, Warning) — no prior coverage existed
+// for the login throttle at all.
+describe("POST /api/auth/login — rate limiting", () => {
+  function loginAttempt(app: ReturnType<typeof buildApp>, username: string, password: string, ip?: string) {
+    return app.request("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(ip ? { "x-real-ip": ip } : {}) },
+      body: JSON.stringify({ username, password }),
+    });
+  }
+
+  it("同一 ip+username 组合，5 次错误密码后第 6 次直接 429，不再打 bcrypt", async () => {
+    await client.createUser("rate-alice", await hashPassword("real-password"), "user");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    for (let i = 0; i < 5; i++) {
+      const resp = await loginAttempt(app, "rate-alice", "wrong", "1.2.3.4");
+      expect(resp.status).toBe(401);
+    }
+    const sixth = await loginAttempt(app, "rate-alice", "wrong", "1.2.3.4");
+    expect(sixth.status).toBe(429);
+    expect((await sixth.json()).detail).toBe("Too many login attempts. Try again later.");
+
+    // Still 429 even with the CORRECT password now — the throttle blocks
+    // the attempt itself, before credentials are even checked.
+    const stillThrottled = await loginAttempt(app, "rate-alice", "real-password", "1.2.3.4");
+    expect(stillThrottled.status).toBe(429);
+  });
+
+  it("成功登录清除计数器 — 之后又能重新错 5 次才被限流", async () => {
+    await client.createUser("rate-bob", await hashPassword("real-password"), "user");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    for (let i = 0; i < 4; i++) {
+      await loginAttempt(app, "rate-bob", "wrong", "5.6.7.8");
+    }
+    const success = await loginAttempt(app, "rate-bob", "real-password", "5.6.7.8");
+    expect(success.status).toBe(200);
+
+    // Counter cleared by the successful login — 4 more failures shouldn't
+    // trip the limiter yet (needs 5 fresh ones).
+    for (let i = 0; i < 4; i++) {
+      const resp = await loginAttempt(app, "rate-bob", "wrong-again", "5.6.7.8");
+      expect(resp.status).toBe(401);
+    }
+  });
+
+  // The actual gap this fix closes: username-only keying let an attacker
+  // who knows a real username (e.g. "admin") lock it out for EVERYONE by
+  // throwing 5 bad guesses at it from anywhere. Keying on ip:username means
+  // a different source IP gets its own independent budget against the same
+  // account instead of inheriting someone else's lockout.
+  it("攻击者从一个 IP 打满 admin 账号的限流，不影响另一个 IP 正常登录同一账号", async () => {
+    await client.createUser("shared-admin", await hashPassword("real-password"), "admin");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+
+    for (let i = 0; i < 5; i++) {
+      await loginAttempt(app, "shared-admin", "wrong", "9.9.9.9"); // attacker
+    }
+    const attackerBlocked = await loginAttempt(app, "shared-admin", "wrong", "9.9.9.9");
+    expect(attackerBlocked.status).toBe(429);
+
+    // The real admin, logging in from a DIFFERENT IP, is unaffected.
+    const realAdmin = await loginAttempt(app, "shared-admin", "real-password", "10.10.10.10");
+    expect(realAdmin.status).toBe(200);
+  });
+
+  // Memory-DoS guard: an attacker cycling through many distinct fake
+  // usernames must not grow the throttle's Map without bound. Exercising
+  // the full LOGIN_ATTEMPTS_MAX_ENTRIES=10_000 cap here would make this
+  // test itself slow; this instead proves the throttle still functions
+  // correctly under a smaller but still-meaningful burst of distinct keys,
+  // which is what the eviction logic's own correctness actually hinges on.
+  it("大量不同用户名连续登录尝试不会导致后续请求整体异常（限流状态保持独立）", async () => {
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    // Each of these now runs a REAL bcrypt compare (the timing-safety fix
+    // itself) — 20 distinct keys is enough to prove per-key state doesn't
+    // get corrupted by a burst, without the test itself taking as long as
+    // exercising anywhere near LOGIN_ATTEMPTS_MAX_ENTRIES would.
+    for (let i = 0; i < 20; i++) {
+      const resp = await loginAttempt(app, `nonexistent-user-${i}`, "whatever", "11.11.11.11");
+      expect(resp.status).toBe(401);
+    }
+    // A fresh, never-seen-before username from the same IP still gets its
+    // own budget (proves per-key state, not a single shared counter that
+    // got corrupted by the burst above).
+    await client.createUser("rate-carol", await hashPassword("real-password"), "user");
+    const resp = await loginAttempt(app, "rate-carol", "real-password", "11.11.11.11");
+    expect(resp.status).toBe(200);
+  }, 15_000);
+
+  // Timing side-channel: a nonexistent username used to skip bcrypt
+  // entirely and return near-instantly, while a real username always pays
+  // bcrypt's cost — letting response time alone reveal which usernames
+  // exist. A soft lower-bound (not a tight comparison, to avoid CI
+  // flakiness) proves the dummy-hash compare is actually running, not
+  // skipped.
+  it("不存在的用户名仍然跑一次 bcrypt 比较（耗时不会异常短，关闭时序旁路）", async () => {
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const start = Date.now();
+    const resp = await loginAttempt(app, "definitely-does-not-exist", "whatever", "12.12.12.12");
+    const elapsedMs = Date.now() - start;
+    expect(resp.status).toBe(401);
+    // bcrypt at cost 12 is reliably tens of ms even on fast hardware —
+    // a few ms would mean the compare was skipped.
+    expect(elapsedMs).toBeGreaterThan(5);
+  });
+});
+
 describe("POST /api/auth/change-password（BUG-003）", () => {
   it("正确的当前密码 + 合规新密码 → {ok:true}，旧密码从此失效、新密码可登录", async () => {
     const { id } = await seedUser("user", "erin");

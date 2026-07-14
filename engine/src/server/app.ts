@@ -10,6 +10,7 @@
 // passed in, never reached for as module-level state, so main.ts (Task 6)
 // is the only place that assembles the real thing.
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -105,26 +106,56 @@ const GIT_SHA = readGitSha();
 // values live in sse.ts (where they're actually enforced); re-exported
 // here since GET /api/config is a plain route, not chat/turn orchestration.
 
-// v1 app/main.py:164-178 — in-memory login throttle, ported verbatim:
-// per-process only (won't coordinate across replicas), but meaningfully
-// raises the cost of a scripted attack against a known username. Every
-// login call counts as an attempt (even before credentials are checked);
-// a successful login clears the counter for that username.
+// v1 app/main.py:164-178 — in-memory login throttle, originally ported
+// verbatim keyed on username alone. Codex full-repo review (2026-07-14,
+// Warning) flagged three real gaps in that shape:
+//  1. Unbounded Map keyed by arbitrary attacker-supplied usernames — an
+//     attacker cycling through many fake usernames grows this Map forever
+//     (memory DoS). Fixed with a hard cap + eviction of the oldest entries.
+//  2. Username-only keying let anyone who just knows a real username (e.g.
+//     "admin") lock that account out for the legitimate owner from ANY
+//     other IP, just by throwing 5 bad guesses at it. Fixed by keying on
+//     ip:username instead — this only throttles that same attacker's own
+//     IP against that username, not the account globally. nginx always
+//     sets X-Real-IP (deploy/nginx-codeaxis.conf) and the backend port is
+//     now loopback-only (Critical #5, same review), so a direct client
+//     can't spoof this header — it's nginx's own $remote_addr.
+//  3. A nonexistent username skipped the (slow) bcrypt comparison
+//     entirely, creating a timing side channel that reveals which
+//     usernames are real. Fixed in the login route below with a
+//     constant-shape dummy-hash compare.
 const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 300_000;
-const loginAttempts = new Map<string, number[]>();
+const LOGIN_ATTEMPTS_MAX_ENTRIES = 10_000;
+const loginAttempts = new Map<string, number[]>(); // insertion order == iteration order; re-inserting a touched key moves it to the end, giving simple LRU-ish eviction
 
-function checkLoginRateLimit(username: string): boolean {
+function clientIp(c: Context<Env>): string {
+  return c.req.header("x-real-ip") || "unknown";
+}
+
+function checkLoginRateLimit(key: string): boolean {
   const now = Date.now();
-  const attempts = (loginAttempts.get(username) ?? []).filter((t) => now - t < LOGIN_WINDOW_MS);
+  const attempts = (loginAttempts.get(key) ?? []).filter((t) => now - t < LOGIN_WINDOW_MS);
   if (attempts.length >= LOGIN_MAX_ATTEMPTS) {
-    loginAttempts.set(username, attempts);
+    loginAttempts.set(key, attempts);
     return false;
   }
   attempts.push(now);
-  loginAttempts.set(username, attempts);
+  loginAttempts.delete(key); // re-insert below so this key becomes most-recently-used for eviction ordering
+  loginAttempts.set(key, attempts);
+  if (loginAttempts.size > LOGIN_ATTEMPTS_MAX_ENTRIES) {
+    const oldest = loginAttempts.keys().next();
+    if (!oldest.done) loginAttempts.delete(oldest.value);
+  }
   return true;
 }
+
+// A fixed, valid-format bcrypt hash of a password nobody has — run through
+// verifyPassword for a nonexistent username so that path takes roughly the
+// same time as a real user's (slow) bcrypt compare, closing the timing
+// side-channel. This value encodes nothing secret; bcrypt hashes are
+// self-contained and safe to hardcode.
+const TIMING_SAFE_DUMMY_HASH = "$2b$12$z8ffHwIouNw/GvU7Cak6wejN0zHY06svwLSmr4eOgdphzELfABXii";
 
 export function buildApp(deps: BuildAppDeps): Hono<Env> {
   const app = new Hono<Env>();
@@ -215,17 +246,27 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     if (typeof body.username !== "string" || typeof body.password !== "string") {
       return c.json({ detail: "username and password are required" }, 422);
     }
-    if (!checkLoginRateLimit(body.username)) {
+    const rateLimitKey = `${clientIp(c)}:${body.username}`;
+    if (!checkLoginRateLimit(rateLimitKey)) {
       return c.json({ detail: "Too many login attempts. Try again later." }, 429);
     }
     const user = await deps.db.getUserByUsername(body.username);
-    if (!user || !(await verifyPassword(body.password, user.password_hash))) {
+    if (!user) {
+      // Timing-safe: still run a bcrypt compare (against a fixed dummy
+      // hash, never a real one) so this branch takes roughly as long as
+      // the real-user branch below — otherwise a nonexistent username
+      // returns near-instantly while a real one waits on bcrypt, letting
+      // response time alone reveal which usernames exist.
+      await verifyPassword(body.password, TIMING_SAFE_DUMMY_HASH);
+      return c.json({ detail: "Invalid credentials" }, 401);
+    }
+    if (!(await verifyPassword(body.password, user.password_hash))) {
       return c.json({ detail: "Invalid credentials" }, 401);
     }
     if (!user.is_active) {
       return c.json({ detail: "Account disabled" }, 403);
     }
-    loginAttempts.delete(body.username);
+    loginAttempts.delete(rateLimitKey);
     const token = createToken(
       { id: user.id, username: user.username, role: user.role, tokenVersion: user.token_version },
       deps.settings
