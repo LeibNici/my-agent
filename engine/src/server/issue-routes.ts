@@ -16,6 +16,7 @@
 import type { Hono, Context } from "hono";
 import { createHash } from "node:crypto";
 import type { DbClient } from "../db/client.js";
+import type { Settings } from "../config.js";
 import type { Env } from "./app.js";
 import { userOwnsSession, type CurrentUser } from "./sse.js";
 import {
@@ -31,7 +32,7 @@ import { truncateChars } from "../tools/chunking.js";
 import type { FullRepoRow } from "../db/storage.js";
 import { pollSubmissionById } from "../issue-tracker.js";
 
-export type IssueRoutesDeps = { db: DbClient };
+export type IssueRoutesDeps = { db: DbClient; settings: Settings };
 
 async function parseBody<T = Record<string, unknown>>(c: Context<Env>): Promise<T | null> {
   try {
@@ -359,7 +360,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
       // Best-effort, doesn't block the response — reflects the just-filed
       // issue's real tracker state (e.g. auto-labels a bot applied) without
       // waiting for the next 10-minute background poll.
-      await bestEffortRecheck(pollSubmissionById(deps.db, submissionId));
+      await bestEffortRecheck(pollSubmissionById(deps.db, submissionId, deps.settings));
     }
 
     return c.json({ ok: true, issue_number: result.number, issue_url: result.url });
@@ -472,7 +473,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
       // never itself filed, so a matching row isn't guaranteed.
       const matching = await deps.db.getSubmissionByIssue(body.repo_id, body.issue_number);
       if (matching) {
-        await bestEffortRecheck(pollSubmissionById(deps.db, matching.id));
+        await bestEffortRecheck(pollSubmissionById(deps.db, matching.id, deps.settings));
       }
     }
 

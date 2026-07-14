@@ -72,9 +72,14 @@ async function findRepoIdByUrl(db: DbClient, candidateUrl: string): Promise<numb
 // there's no matching row (an issue CodeAxis was never told about) or no
 // matching repo (a webhook for a repo this instance doesn't track) —
 // neither is an error.
-async function recheckIfTracked(db: DbClient, repoId: number, issueNumber: number): Promise<void> {
+async function recheckIfTracked(
+  db: DbClient,
+  repoId: number,
+  issueNumber: number,
+  settings: Settings,
+): Promise<void> {
   const submission = await db.getSubmissionByIssue(repoId, issueNumber);
-  if (submission) await pollSubmissionById(db, submission.id);
+  if (submission) await pollSubmissionById(db, submission.id, settings);
 }
 
 export function mountWebhookRoutes(app: Hono<Env>, deps: WebhookRoutesDeps): void {
@@ -100,7 +105,7 @@ export function mountWebhookRoutes(app: Hono<Env>, deps: WebhookRoutesDeps): voi
         const issue = payload.issue;
         if (isPlainObject(repository) && isPlainObject(issue) && typeof repository.full_name === "string" && typeof issue.number === "number") {
           const repoId = await findRepoIdByUrl(deps.db, `https://github.com/${repository.full_name}`);
-          if (repoId !== null) await recheckIfTracked(deps.db, repoId, issue.number);
+          if (repoId !== null) await recheckIfTracked(deps.db, repoId, issue.number, deps.settings);
         }
       }
     } catch {
@@ -138,7 +143,7 @@ export function mountWebhookRoutes(app: Hono<Env>, deps: WebhookRoutesDeps): voi
         }
         if (issueIid !== null) {
           const repoId = await findRepoIdByUrl(deps.db, project.web_url);
-          if (repoId !== null) await recheckIfTracked(deps.db, repoId, issueIid);
+          if (repoId !== null) await recheckIfTracked(deps.db, repoId, issueIid, deps.settings);
         }
       }
     } catch {

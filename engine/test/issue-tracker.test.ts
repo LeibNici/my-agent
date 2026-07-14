@@ -395,7 +395,7 @@ describe("pollTrackedIssues", () => {
   });
 
   it("GitLab 成功路径：issue GET + resource_state_events + notes（含 codex-report/v1 标记）-> 落库 derived status/remote_state/labels/reopen_count/closed_at，清空 track_error；fix report 经 getUnverifiedFixReports 可读到", async () => {
-    const settings = makeSettings();
+    const settings = makeSettings({ APP_ISSUE_FIX_BOT_USERNAME: "codex-fleet-bot" });
     const repoId = await client.createRepo({
       name: "proj",
       url: "https://gitlab.example.com/group/proj.git",
@@ -433,6 +433,7 @@ describe("pollTrackedIssues", () => {
               body:
                 'fixed it. <!-- codex-report/v1 {"worker_id":"w1","commit_sha":"abcd1234","files":["wms/scan/ScanService.java"]} --> thanks',
               created_at: "2026-07-10T09:00:00.000Z",
+              author: { username: "codex-fleet-bot" },
             },
           ],
         } as unknown as Response;
@@ -481,6 +482,81 @@ describe("pollTrackedIssues", () => {
     expect(mine!.commit_sha).toBe("abcd1234");
     expect(mine!.issue_url).toBe("https://gitlab.example.com/group/proj/-/issues/7");
     expect(mine!.repo_id).toBe(repoId);
+  });
+
+  // Codex full-repo review (2026-07-14, Warning): codex-report/v1 used to be
+  // trusted from ANY commenter — a forged completion report citing a real
+  // (but unrelated) commit could fake a "your issue was fixed" badge or
+  // inflate the admin hit-rate metric. Both cases below reuse the exact
+  // fixture shape above, only varying the note's author / settings.
+  it("codex-report/v1 标记来自非 settings.issueFixBotUsername 的评论者（任何能在该 issue 下评论的人伪造的）-> 被忽略，不落库", async () => {
+    const settings = makeSettings({ APP_ISSUE_FIX_BOT_USERNAME: "codex-fleet-bot" });
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://gitlab.example.com/group/proj.git",
+      credToken: "gitlab-secret-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: 1, title: "t", body: "b", labels: [],
+      issueNumber: 7, issueUrl: "https://gitlab.example.com/group/proj/-/issues/7",
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/resource_state_events")) return { status: 200, json: async () => [] } as unknown as Response;
+      if (url.includes("/notes")) {
+        return {
+          status: 200,
+          json: async () => [
+            {
+              id: 999,
+              body: 'fake fix. <!-- codex-report/v1 {"worker_id":"attacker","commit_sha":"realbutunrelated","files":["src/Auth.java"]} --> done',
+              created_at: "2026-07-10T09:00:00.000Z",
+              author: { username: "random-public-commenter" }, // NOT the fleet's account
+            },
+          ],
+        } as unknown as Response;
+      }
+      if (/\/issues\/7(\?|$)/.test(url)) {
+        return { status: 200, json: async () => ({ state: "closed", labels: [], closed_at: "2026-07-10T08:00:00.000Z" }) } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch url in test: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollSubmissionById(client, subId, settings);
+
+    const unverified = await client.getUnverifiedFixReports();
+    expect(unverified.find((r) => r.submission_id === subId)).toBeUndefined();
+  });
+
+  it("settings.issueFixBotUsername 未配置（空串）-> fail closed：即使评论确实来自某个 author，也一律不信任、不发 /notes 请求", async () => {
+    const settings = makeSettings(); // no APP_ISSUE_FIX_BOT_USERNAME override -> ""
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://gitlab.example.com/group/proj.git",
+      credToken: "gitlab-secret-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1", repoId, userId: 1, title: "t", body: "b", labels: [],
+      issueNumber: 7, issueUrl: "https://gitlab.example.com/group/proj/-/issues/7",
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/resource_state_events")) return { status: 200, json: async () => [] } as unknown as Response;
+      if (url.includes("/notes")) {
+        throw new Error("must not fetch /notes when issueFixBotUsername is unconfigured");
+      }
+      if (/\/issues\/7(\?|$)/.test(url)) {
+        return { status: 200, json: async () => ({ state: "closed", labels: [], closed_at: "2026-07-10T08:00:00.000Z" }) } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch url in test: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollSubmissionById(client, subId, settings);
+
+    const unverified = await client.getUnverifiedFixReports();
+    expect(unverified.find((r) => r.submission_id === subId)).toBeUndefined();
   });
 
   it("一行轮询失败不会中断整轮：第一条 fetch 失败仍记录 track_error，第二条照常成功更新；返回的计数覆盖两条", async () => {
@@ -591,7 +667,7 @@ describe("pollSubmissionById", () => {
     })) as unknown as typeof fetch;
     vi.stubGlobal("fetch", fetchMock);
 
-    await pollSubmissionById(client, subId);
+    await pollSubmissionById(client, subId, makeSettings());
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const raw = readSubmissionRaw(dbPath, subId);
@@ -627,7 +703,7 @@ describe("pollSubmissionById", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await pollSubmissionById(client, subId);
+    await pollSubmissionById(client, subId, makeSettings());
 
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_status).toBe("submitted");
@@ -639,7 +715,7 @@ describe("pollSubmissionById", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(pollSubmissionById(client, 999999)).resolves.toBeUndefined();
+    await expect(pollSubmissionById(client, 999999, makeSettings())).resolves.toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -657,7 +733,7 @@ describe("pollSubmissionById", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    await pollSubmissionById(client, subId);
+    await pollSubmissionById(client, subId, makeSettings());
 
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_error).toBe("关联仓库已被删除，无法追踪");

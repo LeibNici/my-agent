@@ -24,6 +24,17 @@ export interface Settings {
   repoSyncIntervalMinutes: number;
   issueTrackIntervalMinutes: number;
   issueFixTargetBranch: string;
+  // Codex full-repo review (2026-07-14, Warning): the codex-report/v1
+  // completion marker (worker_id/commit_sha/files) used to be trusted from
+  // ANY issue comment, regardless of author — on a public/shared tracker,
+  // any commenter could forge a "fix verified" badge. The fleet's
+  // codex-issue tool (deploy/codex-issue) always posts as one fixed GitLab
+  // account (whichever owns GITLAB_TOKEN); comparing the note author
+  // against this configured username is how fetchAndStoreReports now
+  // verifies the marker actually came from the fleet. Empty by default —
+  // fetchAndStoreReports fails closed (trusts nothing) until configured,
+  // rather than silently trusting everyone.
+  issueFixBotUsername: string;
   corsOrigins: string;
   // Populated from loadOrCreateGithubWebhookSecret/loadOrCreateGitlabWebhookSecret
   // in main.ts (same pattern as jwtSecret) — not read from .env.
@@ -172,6 +183,7 @@ export function loadSettings(env?: Record<string, string | undefined>): Settings
       10
     ),
     issueFixTargetBranch: getEnvStr("APP_ISSUE_FIX_TARGET_BRANCH", "test"),
+    issueFixBotUsername: getEnvStr("APP_ISSUE_FIX_BOT_USERNAME", ""),
     corsOrigins: getEnvStr(
       "APP_CORS_ORIGINS",
       "http://localhost:8000,http://127.0.0.1:8000"

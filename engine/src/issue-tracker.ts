@@ -123,13 +123,27 @@ async function fetchGitlabStateEvents(
 /** Pulls the issue's comments and persists every codex-report/v1 marker.
  * Keyed by note_id (upsertFixReport's ON CONFLICT), so re-polling is
  * idempotent and a re-fix after reopen adds a second report instead of
- * overwriting the first. */
+ * overwriting the first.
+ *
+ * Codex full-repo review (2026-07-14, Warning): this used to trust the
+ * marker from ANY note regardless of who posted it — on a shared/public
+ * GitLab issue, any commenter could plant a fake completion report citing
+ * a real, already-merged commit (verifyPendingFixReports only checks the
+ * commit is reachable from the target branch, not that it actually relates
+ * to this issue) and forge a "your issue was fixed" badge, or inflate the
+ * admin hit-rate metric with a fabricated `files` list. Only a note whose
+ * author matches settings.issueFixBotUsername (the fleet's own fixed
+ * GitLab account — see deploy/codex-issue's module docstring) is now
+ * trusted; with no username configured, every marker is skipped rather
+ * than trusting everyone by default. */
 async function fetchAndStoreReports(
   apiBase: string,
   sub: { id: number; issue_number: number },
   token: string,
   db: DbClient,
+  settings: Settings,
 ): Promise<void> {
+  if (!settings.issueFixBotUsername) return;
   for (let page = 1; page <= NOTES_MAX_PAGES; page++) {
     const resp = await fetchWithTimeout(
       `${apiBase}/issues/${sub.issue_number}/notes?per_page=100&page=${page}`,
@@ -137,10 +151,16 @@ async function fetchAndStoreReports(
       POLL_TIMEOUT_MS,
     );
     if (resp.status !== 200) return;
-    const notes = (await resp.json()) as Array<{ id: number; body?: string; created_at?: string }>;
+    const notes = (await resp.json()) as Array<{
+      id: number;
+      body?: string;
+      created_at?: string;
+      author?: { username?: string };
+    }>;
     for (const note of notes) {
       const m = REPORT_RE.exec(note.body ?? "");
       if (!m) continue;
+      if (note.author?.username !== settings.issueFixBotUsername) continue;
       let payload: unknown;
       try {
         payload = JSON.parse(m[1]);
@@ -276,6 +296,7 @@ export async function pollOne(
   sub: TrackableSubmissionRow,
   reposById: Map<number, FullRepoRow>,
   db: DbClient,
+  settings: Settings,
 ): Promise<void> {
   // Codex full-repo review (2026-07-14, Warning): claimed BEFORE any
   // network round-trip — the cron poller, the webhook receiver, and an
@@ -353,7 +374,7 @@ export async function pollOne(
   // Completion reports only exist once fix activity has happened — an
   // untouched open issue skips the notes round-trip entirely.
   if (status === "merged" || status === "closed" || status === "reopened") {
-    await fetchAndStoreReports(base, { id: sub.id, issue_number: sub.issue_number }, token, db);
+    await fetchAndStoreReports(base, { id: sub.id, issue_number: sub.issue_number }, token, db, settings);
   }
 
   await db.updateIssueTracking(
@@ -378,7 +399,11 @@ export async function pollOne(
  * verbatim — no separate recheck implementation to keep in sync. A no-op
  * (not an error) if the submission has no issue_number/issue_url yet, or
  * the row/repo has since been deleted. */
-export async function pollSubmissionById(db: DbClient, submissionId: number): Promise<void> {
+export async function pollSubmissionById(
+  db: DbClient,
+  submissionId: number,
+  settings: Settings,
+): Promise<void> {
   const sub = await db.getSubmissionForTracking(submissionId);
   if (!sub) return;
   const reposById = new Map<number, FullRepoRow>();
@@ -386,7 +411,7 @@ export async function pollSubmissionById(db: DbClient, submissionId: number): Pr
     const repo = await db.getRepoAdmin(sub.repo_id);
     if (repo) reposById.set(repo.id, repo);
   }
-  await pollOne(sub, reposById, db);
+  await pollOne(sub, reposById, db, settings);
 }
 
 /** One reconciliation round over every due submission. Returns how many
@@ -401,7 +426,7 @@ export async function pollTrackedIssues(db: DbClient, settings: Settings): Promi
 
   for (const sub of subs) {
     try {
-      await pollOne(sub, reposById, db);
+      await pollOne(sub, reposById, db, settings);
     } catch (e) {
       const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
       try {
