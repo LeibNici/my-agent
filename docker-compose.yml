@@ -5,7 +5,14 @@ services:
       dockerfile: engine/Dockerfile
     restart: unless-stopped
     ports:
-      - "18082:8000"
+      # Codex full-repo review (2026-07-14, Critical #5): unqualified
+      # "18082:8000" binds Docker's port mapping to ALL interfaces, so the
+      # plaintext backend was directly reachable from the public network,
+      # bypassing nginx's TLS termination entirely — passwords/JWTs could be
+      # sent in cleartext straight to :18082. nginx (deploy/nginx-codeaxis.conf)
+      # already only ever proxies to 127.0.0.1:18082, so scoping the bind to
+      # loopback changes nothing about how nginx reaches it.
+      - "127.0.0.1:18082:8000"
     environment:
       APP_REPOS_DIR: /data/repos
       # DB timestamps are "local-naive" (py-compat.ts's pyLocalIsoNow — a

@@ -544,7 +544,7 @@ async function loadIssueTracking() {
             <td>${esc((s.submitted_at || "").replace("T", " ").slice(0, 16))}</td>
             <td>${esc(s.username || "-")}</td>
             <td>${esc(s.repo_name || "-")}</td>
-            <td><a href="${esc(s.issue_url || '#')}" target="_blank" rel="noopener" title="${esc(s.title)}">#${s.issue_number} ${esc(s.title.length > 30 ? s.title.slice(0, 30) + "…" : s.title)}</a></td>
+            <td><a href="${esc(safeUrl(s.issue_url || '#'))}" target="_blank" rel="noopener" title="${esc(s.title)}">#${esc(s.issue_number)} ${esc(s.title.length > 30 ? s.title.slice(0, 30) + "…" : s.title)}</a></td>
             <td>
                 <span class="badge" style="background:transparent;border:1px solid ${st.color};color:${st.color};">${st.label}</span>
                 ${reportBadge}

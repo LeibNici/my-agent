@@ -52,6 +52,23 @@ function escapeHtml(str) {
         .replace(/'/g, "&#39;");
 }
 
+// Codex full-repo review (2026-07-14, Critical #4): escapeHtml alone
+// neutralizes HTML injection but does NOT stop a "javascript:" (or other
+// non-http(s)) URL from executing on click — every issue_url/web_url
+// rendered as an <a href> comes straight from the tracker's (GitHub/GitLab)
+// JSON response, which is only TypeScript-asserted, never runtime-validated
+// (issue-tracker-client.ts). A compromised/malicious/SSRF-redirected tracker
+// endpoint could return a javascript: URL. Only http:/https: pass through;
+// anything else falls back to "#".
+function safeUrl(url) {
+    try {
+        const parsed = new URL(String(url ?? ""), location.origin);
+        return parsed.protocol === "http:" || parsed.protocol === "https:" ? String(url) : "#";
+    } catch {
+        return "#";
+    }
+}
+
 // ===== Theme toggle =====
 // The actual light/dark values live in style.css (:root vs. :root[data-theme]).
 // This just owns the explicit user choice: null = "follow system" (the inline

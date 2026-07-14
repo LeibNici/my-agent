@@ -182,10 +182,10 @@ async function openMyIssues() {
             return `
             <div class="mi-item" data-status="${status}" data-fresh="${!!s.fresh}">
                 <div class="mi-item-row">
-                    <span class="mi-item-id">${s.fresh ? `<span class="sr-only">有新进展：</span>` : ""}#${s.issue_number}</span>
+                    <span class="mi-item-id">${s.fresh ? `<span class="sr-only">有新进展：</span>` : ""}#${escapeHtml(s.issue_number)}</span>
                     <span class="mi-item-status">${st.label}</span>
                 </div>
-                <a class="mi-item-title" href="${escapeHtml(s.issue_url || "#")}" target="_blank" rel="noopener">${escapeHtml(s.title)}</a>
+                <a class="mi-item-title" href="${escapeHtml(safeUrl(s.issue_url || "#"))}" target="_blank" rel="noopener">${escapeHtml(s.title)}</a>
                 <div class="mi-item-meta">
                     ${escapeHtml(s.repo_name || "")} · ${escapeHtml((s.submitted_at || "").slice(0, 16).replace("T", " "))}
                     ${s.reopen_count ? ` · <span class="mi-reopen-count">被打回 ×${s.reopen_count}</span>` : ""}
@@ -1166,7 +1166,7 @@ function resolveIssueCardRepo(card, draft, outcome) {
 function renderIssueStatusLink(statusEl, label, url, number, color = "var(--success)") {
     statusEl.textContent = `${label} `;
     const link = document.createElement("a");
-    link.href = url || "#";
+    link.href = safeUrl(url || "#");
     link.target = "_blank";
     link.rel = "noopener noreferrer";
     link.textContent = `#${number}`;
@@ -1279,7 +1279,7 @@ function renderLinkedIssuesBanner(submissions) {
         const st = MI_STATUS[s.track_status] || MI_STATUS.submitted;
         row.innerHTML =
             `<span class="linked-issue-dot" style="background:${st.color}"></span>` +
-            `<a href="${escapeHtml(s.issue_url || '#')}" target="_blank" rel="noopener">#${s.issue_number}</a>` +
+            `<a href="${escapeHtml(safeUrl(s.issue_url || '#'))}" target="_blank" rel="noopener">#${escapeHtml(s.issue_number)}</a>` +
             `<span class="linked-issue-status" style="color:${st.color}">${escapeHtml(st.label)}</span>`;
         div.appendChild(row);
     });
@@ -1519,7 +1519,7 @@ async function checkIssueDuplicates(card, repoId, title) {
         issues.slice(0, 5).forEach(i => {
             const row = document.createElement("a");
             row.className = "issue-dupe";
-            row.href = i.url;
+            row.href = safeUrl(i.url);
             row.target = "_blank";
             row.rel = "noopener noreferrer";
             row.textContent = `#${i.number} ${i.title}`;
