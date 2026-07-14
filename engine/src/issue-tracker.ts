@@ -624,10 +624,21 @@ export async function pollTrackedIssues(db: DbClient, settings: Settings): Promi
   const reposById = new Map<number, FullRepoRow>();
   for (const r of await db.listReposFull()) reposById.set(r.id, r);
 
+  // Codex review (2026-07-14, Warning): the return value here is an
+  // *attempted* count, not a success count — every failure is swallowed
+  // into that submission's track_error and the loop moves on by design (see
+  // the doc comment above). That's correct for "never abort the round", but
+  // it meant a round where every single submission failed still logged as
+  // "N submissions checked" below, indistinguishable from a healthy run.
+  // Tracked separately here (not via the return value, to avoid changing
+  // pollTrackedIssues's signature/the callers and tests keyed on a plain
+  // count) so a bad round is visible without inflating a "healthy" log line.
+  let failed = 0;
   for (const sub of subs) {
     try {
       await pollOne(sub, reposById, db, settings);
     } catch (e) {
+      failed++;
       const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
       try {
         // A fresh ticket, not whatever pollOne claimed internally before
@@ -640,6 +651,9 @@ export async function pollTrackedIssues(db: DbClient, settings: Settings): Promi
         // best-effort — a failure recording the failure is not fatal
       }
     }
+  }
+  if (failed > 0) {
+    console.log(`  ⚠️  issue tracking poll: ${failed}/${subs.length} submission(s) failed this round`);
   }
 
   try {
@@ -676,8 +690,14 @@ export function periodicTrackingLoop(
 
   const tick = async () => {
     if (stopped) return;
+    // Heartbeat, not just the failure path below — this tick previously had
+    // zero log output on success, so a wedged poll loop (e.g. a stuck db
+    // call before DB_CALL_TIMEOUT_MS existed, client.ts) looked identical to
+    // "nothing due to poll" in the logs. A gap in this line is now the signal.
+    const startedAt = Date.now();
     try {
-      await pollTrackedIssues(db, settings);
+      const count = await pollTrackedIssues(db, settings);
+      console.log(`  🔁 issue tracking poll: ${count} submission(s) attempted in ${Date.now() - startedAt}ms`);
     } catch (e) {
       const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
       console.log(`  ❌ issue tracking poll failed: ${label}`);

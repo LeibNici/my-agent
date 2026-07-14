@@ -126,7 +126,25 @@ type Response =
   | { id: number; ok: true; result: unknown }
   | { id: number; ok: false; error: string };
 
-type Pending = { resolve: (value: unknown) => void; reject: (reason: unknown) => void };
+type Pending = {
+  resolve: (value: unknown) => void;
+  reject: (reason: unknown) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+// A stuck worker call used to hang its caller forever — no timeout anywhere
+// in this RPC layer. That silently wedged the issue-tracker poll loop in
+// production (2026-07-14): periodicTrackingLoop's tick awaits
+// pollTrackedIssues before scheduling the next one, so one never-resolving
+// db call froze polling for every tracked issue with nothing in the logs.
+// 30s mirrors this codebase's GITHUB/GITLAB_MUTATE_TIMEOUT_MS tier — a real
+// DB call is milliseconds, so this only ever fires on a genuine stall. What
+// exactly stalled the worker thread that long is still unconfirmed — schema.ts
+// sets `busy_timeout = 5000`, so plain lock contention should surface as
+// SQLITE_BUSY well under 30s, not hang past it. Left uninstrumented for now
+// (queue-wait vs. in-worker execution time aren't split anywhere); if this
+// fires again, that split is the next thing to add, not a guess here.
+const DB_CALL_TIMEOUT_MS = 30_000;
 
 /**
  * 建一个跑在 worker_threads 里的 sqlite storage 客户端：同步的 better-sqlite3 调用
@@ -160,6 +178,7 @@ export function createDbClient(dbPath: string): DbClient {
     const p = pending.get(id);
     if (!p) return;
     pending.delete(id);
+    clearTimeout(p.timer);
     if (pending.size === 0) worker.unref();
     fn(p);
   }
@@ -170,6 +189,7 @@ export function createDbClient(dbPath: string): DbClient {
 
   function drainPending(err: Error): void {
     for (const p of pending.values()) {
+      clearTimeout(p.timer);
       p.reject(err);
     }
     pending.clear();
@@ -189,6 +209,31 @@ export function createDbClient(dbPath: string): DbClient {
     drainPending(fatalError ?? new Error("db worker exited before responding"));
   });
 
+  // Codex review (2026-07-14, Critical): a bare per-call timeout only frees
+  // the ONE caller waiting on it — a genuinely wedged worker thread is still
+  // wedged, so every other call already queued (or issued next) pays its own
+  // full DB_CALL_TIMEOUT_MS before failing too, degrading a stuck worker into
+  // O(pending calls × timeout) instead of failing fast. And close() awaiting
+  // the worker's "exit" with no bound of its own could still hang forever
+  // past a timed-out close RPC.
+  //
+  // First timeout poisons the client instead: fatalError is set (so every
+  // future call — from this poll loop or any other request in flight —
+  // rejects immediately instead of queuing behind a dead worker) and the
+  // worker is force-terminated, which reliably fires "exit" and unblocks
+  // close()'s wait. Deliberately not auto-respawning a replacement worker
+  // here — restarting a live SQLite connection mid-request risks its own
+  // correctness issues (in-flight WAL state, a caller mid-retry against the
+  // old instance); a poisoned client should surface loudly (500s, failed
+  // polls) and let the process supervisor restart the whole process, the
+  // same recovery path `worker.on("error")` above already relies on.
+  function poisonAfterTimeout(reason: Error): void {
+    if (fatalError) return; // already poisoned by this path, "error", or "exit"
+    fatalError = reason;
+    drainPending(reason);
+    worker.terminate().catch(() => {}); // exit handler drains again — harmless no-op once pending is empty
+  }
+
   // send() 是真正投递到 worker 的底层通道；call() 在其上加 closed 拦截。
   // close() 自己的 RPC 必须走 send() 而不是 call()，因为发出它时 closePromise 已置位。
   function send<T>(method: string, args: unknown[]): Promise<T> {
@@ -201,8 +246,27 @@ export function createDbClient(dbPath: string): DbClient {
     const id = nextId++;
     return new Promise<T>((resolve, reject) => {
       if (pending.size === 0) worker.ref();
-      pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
-      worker.postMessage({ id, method, args });
+      // Late response after this fires is dropped silently by settle()'s
+      // `if (!p) return` — same "already gone from `pending`" shape as the
+      // exit-drain case above, not a new failure mode.
+      const timer = setTimeout(() => {
+        const err = new Error(`db worker call "${method}" timed out after ${DB_CALL_TIMEOUT_MS}ms`);
+        settle(id, (p) => p.reject(err));
+        poisonAfterTimeout(err);
+      }, DB_CALL_TIMEOUT_MS);
+      timer.unref?.();
+      pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
+      // Codex review (2026-07-14, Warning): a synchronously-thrown
+      // postMessage (e.g. an unclonable value in `args`) used to leave the
+      // pending entry, its timer, and the worker ref alive for the full
+      // DB_CALL_TIMEOUT_MS even though the failure is already known — settle
+      // immediately instead of waiting out the clock for a call that never
+      // actually went out.
+      try {
+        worker.postMessage({ id, method, args });
+      } catch (err) {
+        settle(id, (p) => p.reject(err instanceof Error ? err : new Error(String(err))));
+      }
     });
   }
 

@@ -539,12 +539,17 @@ async function loadUsage() {
 }
 
 // ===== Issue progress tracking =====
+// color/dim pairs follow the moss/amber/rust/wire status vocabulary
+// (.impeccable.md) — claimed previously used --ink-800 (a chrome neutral,
+// not a status color), which rendered as a near-invisible badge in both
+// themes since ink-800 is tuned to blend into the panel background, not
+// to stand out as text/border (admin-page UI legibility, 2026-07-14).
 const TRACK_STATUS = {
-    submitted: { label: "已提报", color: "var(--mute)" },
-    claimed:   { label: "修复中", color: "var(--ink-800)" },
-    merged:    { label: "已合入", color: "var(--moss)" },
-    closed:    { label: "已关闭", color: "var(--moss)" },
-    reopened:  { label: "被打回", color: "var(--rust)" },
+    submitted: { label: "已提报", color: "var(--mute)",  dim: "var(--ink-800)" },
+    claimed:   { label: "修复中", color: "var(--amber)", dim: "var(--amber-dim)" },
+    merged:    { label: "已合入", color: "var(--moss)",  dim: "var(--moss-dim)" },
+    closed:    { label: "已关闭", color: "var(--moss)",  dim: "var(--moss-dim)" },
+    reopened:  { label: "被打回", color: "var(--rust)",  dim: "var(--rust-dim)" },
 };
 
 async function loadIssueTracking() {
@@ -582,10 +587,12 @@ async function loadIssueTracking() {
         const codexLabels = (s.remote_labels || []).filter(l => l.startsWith("codex:"));
         const reports = s.fix_reports || [];
         const verified = reports.filter(r => r.verified === 1);
+        const reportChipColor = verified.length ? 'var(--moss)' : 'var(--mute)';
+        const reportChipDim = verified.length ? 'var(--moss-dim)' : 'var(--ink-800)';
         const reportBadge = reports.length
             ? `<span title="${esc(reports.map(r =>
                   `${r.verified === 1 ? '✓已验证' : r.verified === 0 ? '✗验证失败' : '待验证'} ${(r.commit_sha || '').slice(0, 10)} (${(r.files || []).length} 文件)`
-              ).join('\n'))}" style="font-family:var(--font-mono);font-size:11px;color:${verified.length ? 'var(--moss)' : 'var(--mute)'};cursor:help;margin-left:4px;">${verified.length ? '✓' : '…'}${reports.length > 1 ? '×' + reports.length : ''}</span>`
+              ).join('\n'))}" style="font-family:var(--font-mono);font-size:11px;line-height:1.4;padding:1px 7px;border-radius:9px;background:${reportChipDim};color:${reportChipColor};cursor:help;">${verified.length ? '✓' : '…'}${reports.length > 1 ? '×' + reports.length : ''}</span>`
             : "";
         return `
         <tr>
@@ -594,10 +601,12 @@ async function loadIssueTracking() {
             <td>${esc(s.repo_name || "-")}</td>
             <td><a href="${esc(safeUrl(s.issue_url || '#'))}" target="_blank" rel="noopener" title="${esc(s.title)}">#${esc(s.issue_number)} ${esc(s.title.length > 30 ? s.title.slice(0, 30) + "…" : s.title)}</a></td>
             <td>
-                <span class="badge" style="background:transparent;border:1px solid ${st.color};color:${st.color};">${st.label}</span>
-                ${reportBadge}
-                ${s.track_error ? `<span title="${esc(s.track_error)}" style="color:var(--rust);cursor:help;margin-left:4px;">⚠</span>` : ""}
-                ${codexLabels.length ? `<span style="font-family:var(--font-mono);font-size:11px;color:var(--faint);margin-left:4px;" title="${esc(codexLabels.join(', '))}">${codexLabels.length}🏷</span>` : ""}
+                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                    <span class="badge" style="padding:1px 7px;border-radius:9px;background:${st.dim};border:1px solid ${st.color};color:${st.color};">${st.label}</span>
+                    ${reportBadge}
+                    ${s.track_error ? `<span title="${esc(s.track_error)}" style="color:var(--rust);cursor:help;">⚠</span>` : ""}
+                    ${codexLabels.length ? `<span style="font-family:var(--font-mono);font-size:11px;line-height:1.4;padding:1px 7px;border-radius:9px;background:var(--ink-800);color:var(--mute);" title="${esc(codexLabels.join(', '))}">${codexLabels.length}🏷</span>` : ""}
+                </div>
             </td>
             <td style="color:${s.reopen_count ? 'var(--rust)' : 'var(--faint)'}">${s.reopen_count || 0}</td>
             <td style="color:var(--faint)">${s.last_checked_at ? esc(s.last_checked_at.replace("T", " ").slice(5, 16)) : "未检查"}</td>
