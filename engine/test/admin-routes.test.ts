@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { makeSeededDb } from "./db-fixture.js";
 import { createDbClient, type DbClient } from "../src/db/client.js";
 import { loadSettings, type Settings } from "../src/config.js";
-import { createToken } from "../src/auth.js";
+import { createToken, hashPassword } from "../src/auth.js";
 import { buildApp, type BuildAppDeps } from "../src/server/app.js";
 import type { RunTurnFn } from "../src/engine/turn.js";
 import { __internal } from "../src/repo-sync.js";
@@ -178,6 +178,32 @@ describe("users CRUD", () => {
     const row = await client.getUserById(targetId);
     expect(row!.password_hash).not.toBe("oldhash");
     expect(row!.is_active).toBe(0);
+  });
+
+  // Codex full-repo review (2026-07-14, Warning): updateUserPassword (the
+  // same storage method both the self-service change-password route and
+  // this admin reset route call) now bumps token_version — an admin
+  // resetting a compromised user's password must actually kick out
+  // whatever session the attacker was using, not just change what password
+  // would be needed for a NEW login.
+  it("PATCH password reset revokes the TARGET user's existing token (not the admin's)", async () => {
+    const { token: adminToken } = await seedUser("admin");
+    const targetId = await client.createUser("bob", await hashPassword("bobs-old-password"), "user");
+    const targetOldToken = createToken({ id: targetId, username: "bob", role: "user" }, settings);
+    const app = buildTestApp();
+
+    const resp = await authed(app, adminToken, `/api/admin/users/${targetId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ password: "bobs-new-password-123" }),
+    });
+    expect(resp.status).toBe(200);
+
+    const targetStillWorks = await authed(app, targetOldToken, "/api/auth/me");
+    expect(targetStillWorks.status).toBe(401);
+
+    // The admin's OWN token (a different user row, never touched) is unaffected.
+    const adminStillWorks = await authed(app, adminToken, "/api/admin/users");
+    expect(adminStillWorks.status).toBe(200);
   });
 
   it("PATCH with valid password + invalid is_active → 422, password left untouched (validate before write)", async () => {

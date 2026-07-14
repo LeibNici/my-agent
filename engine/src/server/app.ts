@@ -165,10 +165,9 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     if (!header || !header.startsWith("Bearer ")) {
       return c.json({ detail: "Not authenticated" }, 401);
     }
-    let userId: number;
+    let decoded: ReturnType<typeof decodeToken>;
     try {
-      const decoded = decodeToken(header.slice("Bearer ".length), deps.settings);
-      userId = decoded.user_id;
+      decoded = decodeToken(header.slice("Bearer ".length), deps.settings);
     } catch (err) {
       // v1's decode_token: expired vs. anything-else-invalid both collapse
       // to 401 at the HTTP layer (only the `detail` text differs) — AuthError
@@ -176,9 +175,17 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
       const message = err instanceof AuthError ? err.message : "Invalid token";
       return c.json({ detail: message }, 401);
     }
-    const user = await deps.db.getUserById(userId);
+    const user = await deps.db.getUserById(decoded.user_id);
     if (!user || !user.is_active) {
       return c.json({ detail: "Not authenticated" }, 401);
+    }
+    // Codex full-repo review (2026-07-14, Warning): a password change/reset
+    // used to only stop the CURRENT password from working — the JWT itself
+    // stayed valid regardless (auth.ts's createToken/decodeToken). Any
+    // mismatch means this token was issued before the most recent password
+    // change, so it must not still work.
+    if (decoded.token_version !== user.token_version) {
+      return c.json({ detail: "Token invalidated by a password change — please log in again" }, 401);
     }
     // Codex full-repo review (2026-07-14, Critical #1): must_change_password
     // used to be enforced ONLY by the frontend (it reads the flag off the
@@ -219,7 +226,10 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
       return c.json({ detail: "Account disabled" }, 403);
     }
     loginAttempts.delete(body.username);
-    const token = createToken({ id: user.id, username: user.username, role: user.role }, deps.settings);
+    const token = createToken(
+      { id: user.id, username: user.username, role: user.role, tokenVersion: user.token_version },
+      deps.settings
+    );
     return c.json({
       token,
       // BUG-003: surfaces the bootstrap-admin-with-default-password flag
@@ -263,7 +273,18 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     }
     const newHash = await hashPassword(body.new_password);
     await deps.db.updateUserPassword(user.id, newHash);
-    return c.json({ ok: true });
+    // updateUserPassword just bumped token_version (Codex full-repo review,
+    // 2026-07-14, Warning) so every OTHER already-issued token for this
+    // user stops working immediately — but that includes the very token
+    // this request just authenticated with. Issue a fresh one carrying the
+    // new version so the client that just changed its own password isn't
+    // logged out by the same action, while every other device/session is.
+    const updated = await deps.db.getUserById(user.id);
+    const token = createToken(
+      { id: user.id, username: user.username, role: user.role, tokenVersion: updated?.token_version },
+      deps.settings
+    );
+    return c.json({ ok: true, token });
   });
 
   // ==================== Config / skills ====================

@@ -63,6 +63,20 @@ function loadOrCreateSecretFile(repoRoot: string, filename: string): string {
       "code" in err &&
       err.code === "EEXIST"
     ) {
+      // Codex full-repo review (2026-07-14, Warning): a pre-existing file's
+      // permissions were never corrected (only set at creation time), and a
+      // symlink at this path was silently followed for both read and
+      // write — an attacker with write access to this directory before the
+      // app ever started could redirect where the "secret" actually lives.
+      // Refuse anything that isn't a real regular file, and re-assert 0600
+      // on every load, not just the first one.
+      const lst = fs.lstatSync(secretFile);
+      if (!lst.isFile()) {
+        throw new Error(
+          `${secretFile} exists but is not a regular file — refusing to read/write a secret through it`
+        );
+      }
+      fs.chmodSync(secretFile, 0o600);
       // File already exists; the winner wrote it, we re-read and return
       const existingSecret = fs.readFileSync(secretFile, "utf-8").trim();
       if (existingSecret) {

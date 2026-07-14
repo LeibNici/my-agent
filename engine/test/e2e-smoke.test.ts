@@ -137,7 +137,7 @@ describe("e2e smoke — real server + real runTurn engine against an offline moc
       role: "admin",
       must_change_password: true,
     });
-    const token = loginBody.token;
+    let token = loginBody.token;
     expect(typeof token).toBe("string");
 
     // must_change_password now blocks every OTHER /api/* route server-side
@@ -152,6 +152,11 @@ describe("e2e smoke — real server + real runTurn engine against an offline moc
       body: JSON.stringify({ current_password: "admin123", new_password: "a-new-strong-pw" }),
     });
     expect(changePwResp.status).toBe(200);
+    // token_version bumped (Codex full-repo review, 2026-07-14, Warning) —
+    // the pre-change token is now stale by design; pick up the
+    // freshly-issued replacement for the rest of this flow, same as a real
+    // client (login.html) must.
+    token = (await changePwResp.json()).token;
 
     // ---- POST /api/chat — real runTurn, real SSE, over real HTTP ----
     const chatResp = await fetch(`${base}/api/chat`, {

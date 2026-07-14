@@ -34,6 +34,10 @@ export type UserRow = {
   // login route surfaces this so the frontend can block on a mandatory
   // change before letting the user past the login screen.
   must_change_password: number;
+  // Bumped by updateUserPassword on every password change/reset — a JWT's
+  // own token_version claim must match this or the auth middleware treats
+  // it as stale (Codex full-repo review, 2026-07-14, Warning).
+  token_version: number;
 };
 
 export type SessionRow = {
@@ -819,12 +823,16 @@ export function openStorage(dbPath: string): Storage {
     // Clears must_change_password unconditionally alongside the password
     // itself (BUG-003) — whoever changed it (the user via self-service, or
     // an admin resetting it for them), the force-flag no longer applies to
-    // the password that's now live.
+    // the password that's now live. Also bumps token_version (Codex
+    // full-repo review, 2026-07-14, Warning) so every JWT issued before
+    // this change stops passing the auth middleware's version check
+    // immediately, instead of staying valid until it naturally expires —
+    // whether that's a legitimate self-service change or an admin
+    // responding to a suspected compromise.
     updateUserPassword(userId: number, passwordHash: string): void {
-      db.prepare("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?").run(
-        passwordHash,
-        userId
-      );
+      db.prepare(
+        "UPDATE users SET password_hash = ?, must_change_password = 0, token_version = token_version + 1 WHERE id = ?"
+      ).run(passwordHash, userId);
     },
 
     setUserActive(userId: number, active: boolean): void {

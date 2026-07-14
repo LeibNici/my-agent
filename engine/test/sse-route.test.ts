@@ -49,6 +49,17 @@ async function seedUser(role: "user" | "admin" = "user", username = "alice"): Pr
   return { id, token };
 }
 
+// A token whose tokenVersion actually matches this user's CURRENT DB row —
+// needed whenever a test calls updateUserPassword (which bumps
+// token_version) as setup AFTER seedUser already minted a token, since that
+// token is now stale by the auth middleware's own definition (Codex
+// full-repo review, 2026-07-14, Warning).
+async function freshToken(id: number, username: string, role: string): Promise<string> {
+  const user = await client.getUserById(id);
+  if (!user) throw new Error(`freshToken: no such user id=${id}`);
+  return createToken({ id, username, role, tokenVersion: user.token_version }, settings);
+}
+
 function authedRequest(app: ReturnType<typeof buildApp>, token: string, path: string, init: RequestInit = {}) {
   return app.request(path, {
     ...init,
@@ -714,15 +725,22 @@ describe("POST /api/auth/login", () => {
 
 describe("POST /api/auth/change-password（BUG-003）", () => {
   it("正确的当前密码 + 合规新密码 → {ok:true}，旧密码从此失效、新密码可登录", async () => {
-    const { id, token } = await seedUser("user", "erin");
+    const { id } = await seedUser("user", "erin");
+    // updateUserPassword now bumps token_version (Codex full-repo review,
+    // 2026-07-14, Warning) — this call is test SETUP (establishing the
+    // "current" password before the real change-password request under
+    // test), so the token used below must be minted AFTER it, carrying the
+    // version it just bumped to. Otherwise this looks identical to a stale
+    // token replay and 401s before the route under test ever runs.
     await client.updateUserPassword(id, await hashPassword("old-password-1"));
+    const token = await freshToken(id, "erin", "user");
     const app = buildApp({ db: client, settings, engine: stubEngine([]) });
     const resp = await authedRequest(app, token, "/api/auth/change-password", {
       method: "POST",
       body: JSON.stringify({ current_password: "old-password-1", new_password: "new-password-2" }),
     });
     expect(resp.status).toBe(200);
-    expect(await resp.json()).toEqual({ ok: true });
+    expect(await resp.json()).toMatchObject({ ok: true, token: expect.any(String) });
 
     const oldLogin = await app.request("/api/auth/login", {
       method: "POST",
@@ -760,8 +778,12 @@ describe("POST /api/auth/change-password（BUG-003）", () => {
   });
 
   it("当前密码错误 → 401，密码不变", async () => {
-    const { id, token } = await seedUser("user", "frank");
+    const { id } = await seedUser("user", "frank");
     await client.updateUserPassword(id, await hashPassword("real-password-1"));
+    // Must be minted AFTER the setup call above, or this 401s on the stale
+    // token_version instead of the wrong-password check this test is
+    // actually about (Codex full-repo review, 2026-07-14, Warning).
+    const token = await freshToken(id, "frank", "user");
     const app = buildApp({ db: client, settings, engine: stubEngine([]) });
     const resp = await authedRequest(app, token, "/api/auth/change-password", {
       method: "POST",
@@ -778,8 +800,9 @@ describe("POST /api/auth/change-password（BUG-003）", () => {
   });
 
   it("新密码短于 8 位 → 422，密码不变", async () => {
-    const { id, token } = await seedUser("user", "grace");
+    const { id } = await seedUser("user", "grace");
     await client.updateUserPassword(id, await hashPassword("real-password-1"));
+    const token = await freshToken(id, "grace", "user");
     const app = buildApp({ db: client, settings, engine: stubEngine([]) });
     const resp = await authedRequest(app, token, "/api/auth/change-password", {
       method: "POST",
@@ -806,6 +829,46 @@ describe("POST /api/auth/change-password（BUG-003）", () => {
       body: JSON.stringify({ current_password: "x", new_password: "new-password-2" }),
     });
     expect(resp.status).toBe(401);
+  });
+
+  // Codex full-repo review (2026-07-14, Warning): the actual behavior this
+  // whole token_version mechanism exists for — a token issued BEFORE a
+  // password change must stop working immediately after, not linger valid
+  // until it naturally expires (up to tokenExpireHours later). Every other
+  // test in this describe block was updated to mint a FRESH token after any
+  // setup-time updateUserPassword call specifically to avoid tripping this
+  // same check — this test is the one place it should actually fire.
+  it("改密之后，改密前签发的旧 token 立即失效（不等自然过期）", async () => {
+    const { id, token: oldToken } = await seedUser("user", "judy");
+    await client.updateUserPassword(id, await hashPassword("judys-first-password"));
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+
+    // oldToken is already stale relative to the updateUserPassword bump
+    // above — mint the one a real client would actually be holding at the
+    // moment it calls change-password (i.e., matching the CURRENT version).
+    const currentToken = await freshToken(id, "judy", "user");
+    const changeResp = await authedRequest(app, currentToken, "/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: "judys-first-password", new_password: "judys-second-password" }),
+    });
+    expect(changeResp.status).toBe(200);
+
+    // The token used for the ACTUAL change-password call is also now
+    // stale (that call bumped token_version again) — the real regression
+    // check is that reusing it (or the even-older oldToken) both 401.
+    const staleAfterChange = await authedRequest(app, currentToken, "/api/sessions");
+    expect(staleAfterChange.status).toBe(401);
+    expect(await staleAfterChange.json()).toEqual({
+      detail: "Token invalidated by a password change — please log in again",
+    });
+
+    const evenStaler = await authedRequest(app, oldToken, "/api/sessions");
+    expect(evenStaler.status).toBe(401);
+
+    // Only the freshly-issued token from the change-password response works.
+    const { token: newToken } = await changeResp.json();
+    const withNewToken = await authedRequest(app, newToken, "/api/sessions");
+    expect(withNewToken.status).toBe(200);
   });
 });
 
@@ -888,12 +951,17 @@ describe("auth middleware — must_change_password 后端强制拦截（Codex �
     const blocked = await authedRequest(app, token, "/api/sessions");
     expect(blocked.status).toBe(403);
 
-    await authedRequest(app, token, "/api/auth/change-password", {
+    const changeResp = await authedRequest(app, token, "/api/auth/change-password", {
       method: "POST",
       body: JSON.stringify({ current_password: "admin123", new_password: "a-new-strong-pw" }),
     });
+    // token_version bumped (Codex full-repo review, 2026-07-14, Warning) —
+    // the OLD token is now stale by design, same as a real client
+    // (login.html) must pick up the freshly-issued replacement rather than
+    // keep using the one that just got invalidated by its own request.
+    const { token: newToken } = await changeResp.json();
 
-    const allowedNow = await authedRequest(app, token, "/api/sessions");
+    const allowedNow = await authedRequest(app, newToken, "/api/sessions");
     expect(allowedNow.status).toBe(200);
   });
 

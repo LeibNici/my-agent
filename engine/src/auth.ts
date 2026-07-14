@@ -33,12 +33,22 @@ export interface TokenUser {
   id: number;
   username: string;
   role: string;
+  // Codex full-repo review (2026-07-14, Warning): a password change/reset
+  // used to only stop the CURRENT password from working — the JWT itself
+  // stayed valid for up to tokenExpireHours regardless, so a stolen token
+  // survived the very action meant to lock the attacker out. Optional (not
+  // every one of this session's ~18 createToken call sites needs updating)
+  // — omitted defaults to 0, matching users.token_version's DB default, so
+  // pre-existing tokens/tests keep working unless a password change bumps
+  // the DB value out from under them.
+  tokenVersion?: number;
 }
 
 export interface DecodedToken {
   user_id: number;
   username: string;
   role: string;
+  token_version: number;
   exp: number;
   iat: number;
 }
@@ -53,7 +63,7 @@ export interface DecodedToken {
  */
 export function createToken(user: TokenUser, settings: Settings): string {
   return jwt.sign(
-    { sub: String(user.id), username: user.username, role: user.role },
+    { sub: String(user.id), username: user.username, role: user.role, token_version: user.tokenVersion ?? 0 },
     settings.jwtSecret,
     {
       algorithm: "HS256",
@@ -94,6 +104,11 @@ export function decodeToken(token: string, settings: Settings): DecodedToken {
     user_id: Number(payload.sub),
     username: payload.username,
     role: payload.role,
+    // A token signed before this field existed simply has no claim — treat
+    // that the same as version 0, matching users.token_version's DB
+    // default, so old-format tokens keep working until the next password
+    // change actually invalidates them.
+    token_version: typeof payload.token_version === "number" ? payload.token_version : 0,
     exp: payload.exp as number,
     iat: payload.iat as number,
   };

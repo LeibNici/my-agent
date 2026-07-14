@@ -335,6 +335,13 @@
                 btn.disabled = false;
                 return;
             }
+            // Codex full-repo review (2026-07-14, Warning): a password
+            // change now bumps token_version server-side, invalidating
+            // every previously-issued token for this user — including the
+            // one this very request just authenticated with. The response
+            // carries a freshly-issued replacement; without storing it,
+            // the NEXT API call after redirecting would 401 immediately.
+            if (data.token) localStorage.setItem("token", data.token);
             const user = JSON.parse(localStorage.getItem("user"));
             user.must_change_password = false;
             localStorage.setItem("user", JSON.stringify(user));

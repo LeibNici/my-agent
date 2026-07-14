@@ -28,7 +28,7 @@ export function initSchema(dbPath: string): void {
   // Create all tables if they don't exist
   // All migration columns are included in the base CREATE TABLE DDL
 
-  // Users table with migration columns my_issues_seen_at, must_change_password
+  // Users table with migration columns my_issues_seen_at, must_change_password, token_version
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +38,8 @@ export function initSchema(dbPath: string): void {
       is_active INTEGER DEFAULT 1,
       created_at TEXT NOT NULL,
       my_issues_seen_at TEXT,
-      must_change_password INTEGER NOT NULL DEFAULT 0
+      must_change_password INTEGER NOT NULL DEFAULT 0,
+      token_version INTEGER NOT NULL DEFAULT 0
     )
   `);
   // BUG-003: covers the case where `users` already existed (a real prior
@@ -47,6 +48,12 @@ export function initSchema(dbPath: string): void {
   // missing. No-ops on a fresh install (the column is already present from
   // the CREATE TABLE itself).
   ensureColumn(db, "users", "must_change_password", "must_change_password INTEGER NOT NULL DEFAULT 0");
+  // Codex full-repo review (2026-07-14, Warning): bumped on every password
+  // change/reset so already-issued JWTs stop working immediately instead of
+  // staying valid for up to tokenExpireHours after the very action meant to
+  // invalidate a stolen token (see auth.ts's createToken/decodeToken and
+  // app.ts's auth middleware).
+  ensureColumn(db, "users", "token_version", "token_version INTEGER NOT NULL DEFAULT 0");
 
   // Repositories table with migration columns
   db.exec(`

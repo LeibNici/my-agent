@@ -18,6 +18,7 @@
 // listener when imported.
 import { pathToFileURL, fileURLToPath } from "node:url";
 import * as path from "node:path";
+import { isMainThread } from "node:worker_threads";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
@@ -149,6 +150,20 @@ export type StartedServer = {
  * (which wires the HTTP surface on top of all of it).
  */
 export async function startServer(opts: StartServerOptions = {}): Promise<StartedServer> {
+  // Codex full-repo review (2026-07-14, Warning): nothing pinned the
+  // process umask, so agent_data.db (webhook secrets, repo credentials,
+  // password hashes) and every secret file below inherited whatever the
+  // shell/container's ambient umask happened to be — often 022, i.e.
+  // world-readable. process.umask(mask) applies to the whole OS process
+  // (not per-thread) — but Node explicitly forbids the SETTER form from a
+  // worker thread (ERR_WORKER_UNSUPPORTED_OPERATION), which is exactly
+  // where this file's own e2e tests run it (vitest's worker-pool runner).
+  // Production always calls startServer() from the real main thread
+  // (`tsx src/server/main.ts` has none), so isMainThread is true there.
+  if (isMainThread) {
+    process.umask(0o077);
+  }
+
   const settings = loadSettings(opts.env);
   if (!settings.jwtSecret) {
     settings.jwtSecret = loadOrCreateJwtSecret(REPO_ROOT);
@@ -163,15 +178,19 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   // above — moved here, after the DB is open, per GitHub issue #6 (the old
   // file-based approach silently regenerated a new secret on every restart
   // instead of persisting one; see config.ts's history comment). The admin
-  // panel's regenerate endpoint (admin-routes.ts) is the only other writer
-  // of these two rows.
+  // panel's Webhook tab (admin-routes.ts's GET/regenerate endpoints) is the
+  // intended distribution channel — printing the raw value here too
+  // (Codex full-repo review, 2026-07-14, Warning) would put a live
+  // production secret in cleartext in every process log/journal an
+  // operator ever collects, for no benefit now that there's an
+  // authenticated UI to read it from.
   if (!settings.githubWebhookSecret) {
     settings.githubWebhookSecret = await db.getOrCreateAppSecret("github_webhook_secret");
-    console.log(`GitHub webhook secret (Settings → Webhooks → Secret): ${settings.githubWebhookSecret}`);
+    console.log("GitHub webhook secret loaded — see Admin → Webhook to view/copy it.");
   }
   if (!settings.gitlabWebhookSecret) {
     settings.gitlabWebhookSecret = await db.getOrCreateAppSecret("gitlab_webhook_secret");
-    console.log(`GitLab webhook secret (Settings → Webhooks → Secret Token): ${settings.gitlabWebhookSecret}`);
+    console.log("GitLab webhook secret loaded — see Admin → Webhook to view/copy it.");
   }
 
   // Phase 4b Task 5: repo-sync.ts's default onSyncSuccess needs Settings for

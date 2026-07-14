@@ -34,6 +34,11 @@ RestartSec=3
 TimeoutStopSec=30
 # Basic, low-risk hardening — never lets a setuid/setgid exec regain privilege.
 NoNewPrivileges=true
+# Every file this process creates (agent_data.db, .jwt_secret, WAL/SHM
+# files) defaults to owner-only instead of inheriting whatever the shell's
+# umask happened to be — the DB now holds webhook secrets and repo
+# credentials in plaintext (Codex full-repo review, 2026-07-14, Warning).
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
