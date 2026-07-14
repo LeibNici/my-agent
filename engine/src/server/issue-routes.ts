@@ -388,10 +388,54 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     const draftResp = await verifyDraftRepoId(c, deps.db, sessionId, draftToolUseId, body.repo_id);
     if (draftResp) return draftResp;
 
-    const result = await applyRepoIssueAction(repo, body.issue_number, body.action, body.comment);
-    if ("error" in result) return c.json({ detail: result.error }, 502);
+    // Codex full-repo review (2026-07-14, Warning): applyRepoIssueAction is
+    // a real POST to GitHub/GitLab (comment/close/reopen) — it used to run
+    // completely unconditionally, so a double-click posted the same
+    // comment twice on the tracker. Same claim-before-the-real-call shape
+    // as /api/issues/submit: claim BEFORE calling the tracker, finalize on
+    // success, release on failure. Same legacy no-draft-id fallback too
+    // (synthetic key from session+repo+issue+action).
+    const effectiveDraftKey =
+      draftToolUseId ??
+      (sessionId ? `synthetic:${sessionKey(sessionId, body.repo_id, `${body.issue_number}:${body.action}`)}` : null);
 
-    if (sessionId) {
+    let claimedId: number | null = null;
+    if (sessionId && effectiveDraftKey) {
+      const claim = await deps.db.claimDraftAction({
+        sessionId,
+        repoId: body.repo_id,
+        userId: user.id,
+        issueNumber: body.issue_number,
+        action: body.action,
+        comment: body.comment,
+        draftToolUseId: effectiveDraftKey,
+      });
+      if (!claim.claimed) {
+        if (claim.existing.pending === 0) {
+          return c.json({
+            ok: true,
+            issue_number: claim.existing.issue_number,
+            issue_url: claim.existing.issue_url,
+            already_submitted: true,
+          });
+        }
+        return c.json(
+          { detail: "This action is already being submitted — please wait a moment and retry." },
+          409
+        );
+      }
+      claimedId = claim.id;
+    }
+
+    const result = await applyRepoIssueAction(repo, body.issue_number, body.action, body.comment);
+    if ("error" in result) {
+      if (claimedId !== null) await deps.db.releaseDraftAction(claimedId);
+      return c.json({ detail: result.error }, 502);
+    }
+
+    if (claimedId !== null) {
+      await deps.db.finalizeIssueAction(claimedId, { issueUrl: result.url });
+    } else if (sessionId) {
       // Session deliberately left open here too — same rationale as
       // /api/issues/submit above: a comment/close/reopen shouldn't force
       // the next message onto a fresh session with no memory of this issue.
@@ -405,6 +449,9 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
         issueUrl: result.url,
         draftToolUseId,
       });
+    }
+
+    if (sessionId) {
       // Best-effort recheck of whatever submission (if any) this repo+issue
       // number corresponds to — manage_issue can act on an issue CodeAxis
       // never itself filed, so a matching row isn't guaranteed.

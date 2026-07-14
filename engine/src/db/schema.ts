@@ -163,9 +163,22 @@ export function initSchema(dbPath: string): void {
       issue_url TEXT,
       draft_tool_use_id TEXT,
       applied_at TEXT NOT NULL,
+      pending INTEGER NOT NULL DEFAULT 0,
+      claim_expires_at INTEGER,
       FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
     )
   `);
+  // Codex full-repo review (2026-07-14, Warning): comment/close/reopen
+  // actions had ZERO idempotency protection — applyRepoIssueAction (a real
+  // POST to GitHub/GitLab) ran unconditionally, so a double-click posted
+  // the same comment twice on the tracker. Same claim-before-real-call
+  // shape as issue_submissions' draft_tool_use_id fix: `pending` marks a
+  // row as claimed-but-not-yet-confirmed (issue_url can legitimately be
+  // NULL even on success, so it can't double as the pending signal the way
+  // issue_submissions.issue_number does), `claim_expires_at` is the same
+  // staleness-reclaim mechanism.
+  ensureColumn(db, "issue_actions", "pending", "pending INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "issue_actions", "claim_expires_at", "claim_expires_at INTEGER");
 
   // Per-LLM-call timing/usage
   db.exec(`
@@ -279,6 +292,12 @@ export function initSchema(dbPath: string): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_issue_submissions_repo_issue " +
       "ON issue_submissions(repo_id, issue_number)"
+  );
+  // Idempotent-action guard (Codex full-repo review, 2026-07-14, Warning) —
+  // same shape as idx_issue_submissions_draft_tool_use_id above.
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_actions_draft_tool_use_id " +
+      "ON issue_actions(draft_tool_use_id) WHERE draft_tool_use_id IS NOT NULL"
   );
 
   db.close();

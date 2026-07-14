@@ -795,6 +795,102 @@ describe("claimDraftSubmission / finalizeIssueSubmission / releaseDraftSubmissio
   });
 });
 
+describe("claimDraftAction / finalizeIssueAction / releaseDraftAction（2026-07-14，comment/close/reopen 的幂等结构性修复）", () => {
+  it("首次 claim 成功，行存在但 pending=1", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c", draftToolUseId: "tu_action_1",
+    });
+    expect(claim.claimed).toBe(true);
+    if (!claim.claimed) throw new Error("unreachable");
+    const rows = storage.getIssueActionsForSession("s1");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(claim.id);
+  });
+
+  it("同一 draft_tool_use_id 第二次 claim ⇒ claimed:false，pending=1", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const first = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c", draftToolUseId: "tu_action_2",
+    });
+    expect(first.claimed).toBe(true);
+    const second = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c-different", draftToolUseId: "tu_action_2",
+    });
+    expect(second.claimed).toBe(false);
+    if (second.claimed) throw new Error("unreachable");
+    expect(second.existing.pending).toBe(1);
+    expect(storage.getIssueActionsForSession("s1")).toHaveLength(1);
+  });
+
+  it("finalizeIssueAction 之后，第二次 claim 返回 pending=0 的已存在行", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c", draftToolUseId: "tu_action_3",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+    storage.finalizeIssueAction(claim.id, { issueUrl: "https://x/5" });
+
+    const second = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c", draftToolUseId: "tu_action_3",
+    });
+    expect(second.claimed).toBe(false);
+    if (second.claimed) throw new Error("unreachable");
+    expect(second.existing.pending).toBe(0);
+    expect(second.existing.issue_url).toBe("https://x/5");
+  });
+
+  it("releaseDraftAction 之后，同一 draft_tool_use_id 可以重新 claim", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c", draftToolUseId: "tu_action_4",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+    storage.releaseDraftAction(claim.id);
+    expect(storage.getIssueActionsForSession("s1")).toHaveLength(0);
+
+    const retry = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c", draftToolUseId: "tu_action_4",
+    });
+    expect(retry.claimed).toBe(true);
+  });
+
+  it("releaseDraftAction 不会删除已经 finalize 过的行（守卫 pending=1）", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c", draftToolUseId: "tu_action_5",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+    storage.finalizeIssueAction(claim.id, { issueUrl: "https://x/5" });
+    storage.releaseDraftAction(claim.id); // must be a no-op now
+    expect(storage.getIssueActionsForSession("s1")).toHaveLength(1);
+  });
+
+  it("过期未完成的 claim 在下一次 claim 时被回收，而不是永久 409", () => {
+    const uid = storage.createUser("alice", "hashed-pw", "user");
+    const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+    const claim = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c", draftToolUseId: "tu_action_stale",
+    });
+    if (!claim.claimed) throw new Error("unreachable");
+
+    const db = new Database(dbPath);
+    db.prepare("UPDATE issue_actions SET claim_expires_at = ? WHERE id = ?").run(Date.now() - 1000, claim.id);
+    db.close();
+
+    const retry = storage.claimDraftAction({
+      sessionId: "s1", repoId, userId: uid, issueNumber: 5, action: "comment", comment: "c2", draftToolUseId: "tu_action_stale",
+    });
+    expect(retry.claimed).toBe(true);
+    expect(storage.getIssueActionsForSession("s1")).toHaveLength(1);
+  });
+});
+
 describe("getSubmissionForTracking / getSubmissionByIssue（2026-07-13，操作后单条 recheck 用的查询）", () => {
   it("getSubmissionForTracking：按 id 查到已有 issue_number/issue_url 的行", () => {
     const uid = storage.createUser("alice", "hashed-pw", "user");

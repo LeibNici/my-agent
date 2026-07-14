@@ -24,6 +24,9 @@ import type {
   IssueTrackingOverview,
   RecordIssueActionFields,
   IssueActionRow,
+  ClaimDraftActionFields,
+  ClaimDraftActionResult,
+  FinalizeIssueActionFields,
   UsageSummary,
   UsageByUserRow,
   FeedbackSummary,
@@ -92,6 +95,9 @@ export type DbClient = {
   markMyIssuesSeen(userId: number): Promise<void>;
   getIssueTrackingOverview(limit?: number): Promise<IssueTrackingOverview>;
   recordIssueAction(fields: RecordIssueActionFields): Promise<number>;
+  claimDraftAction(fields: ClaimDraftActionFields): Promise<ClaimDraftActionResult>;
+  finalizeIssueAction(id: number, fields: FinalizeIssueActionFields): Promise<void>;
+  releaseDraftAction(id: number): Promise<void>;
   getIssueActionsForSession(sessionId: string): Promise<IssueActionRow[]>;
   getUsageSummary(): Promise<UsageSummary>;
   getUsageByUser(): Promise<UsageByUserRow[]>;
@@ -257,6 +263,9 @@ export function createDbClient(dbPath: string): DbClient {
     markMyIssuesSeen: (userId) => call<void>("markMyIssuesSeen", [userId]),
     getIssueTrackingOverview: (limit) => call<IssueTrackingOverview>("getIssueTrackingOverview", [limit]),
     recordIssueAction: (fields) => call<number>("recordIssueAction", [fields]),
+    claimDraftAction: (fields) => call<ClaimDraftActionResult>("claimDraftAction", [fields]),
+    finalizeIssueAction: (id, fields) => call<void>("finalizeIssueAction", [id, fields]),
+    releaseDraftAction: (id) => call<void>("releaseDraftAction", [id]),
     getIssueActionsForSession: (sessionId) =>
       call<IssueActionRow[]>("getIssueActionsForSession", [sessionId]),
     getUsageSummary: () => call<UsageSummary>("getUsageSummary", []),

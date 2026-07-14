@@ -361,6 +361,27 @@ export type IssueActionRow = {
   applied_at: string;
 };
 
+// Codex full-repo review (2026-07-14, Warning) — same claim-before-the-
+// real-call idempotency shape as ClaimDraftSubmissionFields, applied to
+// issue_actions (comment/close/reopen) instead of issue_submissions.
+export type ClaimDraftActionFields = {
+  sessionId: string;
+  repoId: number;
+  userId: number;
+  issueNumber: number;
+  action: string;
+  comment: string;
+  draftToolUseId: string;
+};
+
+export type ClaimDraftActionResult =
+  | { claimed: true; id: number }
+  | { claimed: false; existing: IssueActionRow & { pending: number } };
+
+export type FinalizeIssueActionFields = {
+  issueUrl: string | null;
+};
+
 // ==================== Usage / feedback / semantic-search reporting ====================
 
 // get_usage_summary's row (database.py:992) — overall totals across every
@@ -502,6 +523,9 @@ export type Storage = {
   markMyIssuesSeen(userId: number): void;
   getIssueTrackingOverview(limit?: number): IssueTrackingOverview;
   recordIssueAction(fields: RecordIssueActionFields): number;
+  claimDraftAction(fields: ClaimDraftActionFields, retrying?: boolean): ClaimDraftActionResult;
+  finalizeIssueAction(id: number, fields: FinalizeIssueActionFields): void;
+  releaseDraftAction(id: number): void;
   getIssueActionsForSession(sessionId: string): IssueActionRow[];
   getUsageSummary(): UsageSummary;
   getUsageByUser(): UsageByUserRow[];
@@ -1587,6 +1611,82 @@ export function openStorage(dbPath: string): Storage {
           now
         );
       return Number(res.lastInsertRowid);
+    },
+
+    // Codex full-repo review (2026-07-14, Warning): comment/close/reopen
+    // had zero idempotency — applyRepoIssueAction (a real POST to
+    // GitHub/GitLab) ran unconditionally before this row was ever
+    // recorded, so a double-click posted the same comment twice on the
+    // tracker. Same claim-before-the-real-call shape as
+    // claimDraftSubmission: this INSERT (via the unique index on
+    // draft_tool_use_id) is the atomic decision point. `pending` marks a
+    // row as claimed-but-not-yet-confirmed — issue_url can legitimately be
+    // NULL even on a SUCCESSFUL action (a comment-only GitLab action whose
+    // post-action re-fetch fails), so unlike issue_submissions'
+    // issue_number, issue_url can't double as the "still pending" signal.
+    claimDraftAction(fields: ClaimDraftActionFields, retrying = false): ClaimDraftActionResult {
+      const now = pyLocalIsoNow();
+      const claimExpiresAt = Date.now() + CLAIM_TTL_MS;
+      try {
+        const res = db
+          .prepare(
+            "INSERT INTO issue_actions " +
+              "(session_id, repo_id, user_id, issue_number, action, comment, draft_tool_use_id, applied_at, pending, claim_expires_at) " +
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)"
+          )
+          .run(
+            fields.sessionId,
+            fields.repoId,
+            fields.userId,
+            fields.issueNumber,
+            fields.action,
+            fields.comment,
+            fields.draftToolUseId,
+            now,
+            claimExpiresAt
+          );
+        return { claimed: true, id: Number(res.lastInsertRowid) };
+      } catch (err) {
+        if (err instanceof Database.SqliteError && err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+          const row = db
+            .prepare(
+              `SELECT id, repo_id, user_id, issue_number, action, comment, issue_url, draft_tool_use_id, applied_at,
+                      pending, claim_expires_at
+               FROM issue_actions WHERE draft_tool_use_id = ?`
+            )
+            .get(fields.draftToolUseId) as
+            | (IssueActionRow & { pending: number; claim_expires_at: number | null })
+            | undefined;
+          if (!row) throw err;
+          if (
+            !retrying &&
+            row.pending === 1 &&
+            row.claim_expires_at !== null &&
+            row.claim_expires_at < Date.now()
+          ) {
+            const txn = db.transaction(() => {
+              db.prepare("DELETE FROM issue_actions WHERE id = ? AND pending = 1").run(row.id);
+            });
+            txn();
+            return storage.claimDraftAction(fields, true);
+          }
+          return { claimed: false, existing: row };
+        }
+        throw err;
+      }
+    },
+
+    finalizeIssueAction(id: number, fields: FinalizeIssueActionFields): void {
+      db.prepare("UPDATE issue_actions SET issue_url = ?, pending = 0, claim_expires_at = NULL WHERE id = ?").run(
+        fields.issueUrl,
+        id
+      );
+    },
+
+    // Guarded on pending = 1 so this can never delete a row a concurrent
+    // request has since finalized.
+    releaseDraftAction(id: number): void {
+      db.prepare("DELETE FROM issue_actions WHERE id = ? AND pending = 1").run(id);
     },
 
     // v1's get_issue_actions_for_session (database.py:955) — used to

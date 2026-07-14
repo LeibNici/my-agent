@@ -835,6 +835,65 @@ describe("POST /api/issues/action", () => {
     expect((await resp.json()).detail).toBe("GitLab note API error (500): internal server error");
     expect(await client.getIssueActionsForSession(sessionId)).toHaveLength(0);
   });
+
+  // Codex full-repo review (2026-07-14, Warning): comment/close/reopen had
+  // ZERO idempotency protection — applyRepoIssueAction ran unconditionally,
+  // so a double-click posted the same comment twice on the tracker.
+  it("idempotency: two CONCURRENT identical action requests only ever post ONE real comment", async () => {
+    const { id: userId, token } = await seedUser("admin", "action-concurrent");
+    const repoId = await seedRepo();
+    const sessionId = await client.createSession("New Chat", userId);
+    const fetchMock = stubFetch([issueNoteRoute(201), issueGetRoute(200, { iid: 5, web_url: "https://gitlab.example.com/group/proj/-/issues/5", title: "T" })]);
+    const app = buildTestApp();
+    const body = {
+      action: "comment",
+      repo_id: repoId,
+      issue_number: 5,
+      comment: "same comment",
+      session_id: sessionId,
+      draft_tool_use_id: "tu_action_concurrent_1",
+    };
+
+    const [respA, respB] = await Promise.all([
+      authed(app, token, "/api/issues/action", { method: "POST", body: JSON.stringify(body) }),
+      authed(app, token, "/api/issues/action", { method: "POST", body: JSON.stringify(body) }),
+    ]);
+
+    const noteCalls = fetchMock.mock.calls.filter(([url, init]) => isIssueNote(url as string, (init ?? {}) as RequestInit)).length;
+    expect(noteCalls).toBe(1);
+
+    for (const resp of [respA, respB]) {
+      expect([200, 409]).toContain(resp.status);
+    }
+    expect(await client.getIssueActionsForSession(sessionId)).toHaveLength(1);
+  });
+
+  it("idempotency also covers a SESSION-scoped action with no draft_tool_use_id at all (legacy card replay)", async () => {
+    const { id: userId, token } = await seedUser("admin", "action-no-draft-id");
+    const repoId = await seedRepo();
+    const sessionId = await client.createSession("New Chat", userId);
+    const fetchMock = stubFetch([issueNoteRoute(201), issueGetRoute(200, { iid: 6, web_url: "https://gitlab.example.com/group/proj/-/issues/6", title: "T" })]);
+    const app = buildTestApp();
+    const body = {
+      action: "comment",
+      repo_id: repoId,
+      issue_number: 6,
+      comment: "same comment",
+      session_id: sessionId,
+      // No draft_tool_use_id.
+    };
+
+    const [respA, respB] = await Promise.all([
+      authed(app, token, "/api/issues/action", { method: "POST", body: JSON.stringify(body) }),
+      authed(app, token, "/api/issues/action", { method: "POST", body: JSON.stringify(body) }),
+    ]);
+
+    const noteCalls = fetchMock.mock.calls.filter(([url, init]) => isIssueNote(url as string, (init ?? {}) as RequestInit)).length;
+    expect(noteCalls).toBe(1);
+    for (const resp of [respA, respB]) {
+      expect([200, 409]).toContain(resp.status);
+    }
+  });
 });
 
 // ==================== POST /api/issues/check-duplicates ====================

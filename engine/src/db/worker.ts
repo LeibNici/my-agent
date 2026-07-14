@@ -293,6 +293,23 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.recordIssueAction(fields) });
         break;
       }
+      case "claimDraftAction": {
+        const [fields] = args as [Parameters<typeof storage.claimDraftAction>[0]];
+        reply({ id, ok: true, result: storage.claimDraftAction(fields) });
+        break;
+      }
+      case "finalizeIssueAction": {
+        const [actionId, fields] = args as [number, Parameters<typeof storage.finalizeIssueAction>[1]];
+        storage.finalizeIssueAction(actionId, fields);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "releaseDraftAction": {
+        const [actionId] = args as [number];
+        storage.releaseDraftAction(actionId);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
       case "getIssueActionsForSession": {
         const [sessionId] = args as [string];
         reply({ id, ok: true, result: storage.getIssueActionsForSession(sessionId) });
