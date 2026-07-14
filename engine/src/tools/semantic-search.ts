@@ -37,7 +37,13 @@ import * as path from "node:path";
 import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef, type ToolContext } from "./registry.js";
 import { getAllowedPaths, getToolUserId, noAccessReason } from "./access.js";
-import { embeddingKeyOrFallback, l2Normalize, withTimeout } from "./embedding-client.js";
+import {
+  embeddingKeyOrFallback,
+  l2Normalize,
+  withTimeout,
+  currentModelFingerprint,
+  readModelFingerprint,
+} from "./embedding-client.js";
 import { readEmbeddingIndex } from "./embed-store.js";
 import { truncateChars } from "./chunking.js";
 import { loadSettings, type Settings } from "../config.js";
@@ -216,13 +222,25 @@ async function runSemanticSearch(
   let q = Float32Array.from(payload.data[0].embedding);
   q = l2Normalize(q);
 
+  // Codex full-repo review (2026-07-14, Warning): dims alone doesn't prove
+  // an index was built by the CURRENT embedding model — a same-dimension
+  // model swap (e.g. APP_EMBEDDING_MODEL changed to a different model that
+  // happens to also emit the same-length vectors) would otherwise pass the
+  // dims check below and get scored anyway, silently mixing two unrelated
+  // vector spaces in one cosine comparison. embedAndSaveIndex already
+  // writes this fingerprint sidecar on every successful build (used there
+  // to decide full-rebuild-vs-incremental-reuse) — reused here as the same
+  // identity check, applied at query time.
+  const expectedFingerprint = currentModelFingerprint(settings);
+
   const hits: Hit[] = [];
   let anyIndex = false;
   for (const repoPath of allowedPaths) {
     const idx = readEmbeddingIndex(repoPath);
     if (idx === null) continue;
-    anyIndex = true; // an index file exists, even if empty/dims-mismatched
+    anyIndex = true; // an index file exists, even if empty/dims-mismatched/stale-model
     if (idx.vectors.length === 0 || idx.dims !== q.length) continue;
+    if (readModelFingerprint(repoPath) !== expectedFingerprint) continue;
 
     const repoName = path.basename(repoPath);
     const scored = idx.vectors.map((vec, i) => ({ score: dot(vec, q), i }));

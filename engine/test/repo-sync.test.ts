@@ -8,6 +8,7 @@ import { createDbClient, type DbClient } from "../src/db/client.js";
 import * as symbolIndex from "../src/tools/symbol-index.js";
 import { loadSettings, type Settings } from "../src/config.js";
 import { readEmbeddingIndex } from "../src/tools/embed-store.js";
+import * as embedStore from "../src/tools/embed-store.js";
 import {
   maskUrlCredentials,
   getRepoLocalPath,
@@ -33,6 +34,18 @@ vi.mock("../src/tools/symbol-index.js", async (importOriginal) => {
   return { ...actual, buildIndex: vi.fn() };
 });
 const mockedBuildIndex = vi.mocked(symbolIndex.buildIndex);
+
+// Spies on writeEmbeddingIndex (real implementation still runs — no mock
+// return value substituted) so the generation-guard race test below can
+// count how many of two overlapping builds' embed results actually made it
+// to disk, without needing to distinguish written vector *content* (both
+// overlapping builds embed the exact same unchanged repo checkout, so their
+// output bytes would be identical anyway).
+vi.mock("../src/tools/embed-store.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/tools/embed-store.js")>();
+  return { ...actual, writeEmbeddingIndex: vi.fn(actual.writeEmbeddingIndex) };
+});
+const mockedWriteEmbeddingIndex = vi.mocked(embedStore.writeEmbeddingIndex);
 
 // __internal.*Unvalidated 绕开 validateUrl，只用于让"clone/sync/persist 机制
 // 本身对不对"这批测试能对一个真实本地临时目录跑真实 git 子进程——见
@@ -679,6 +692,99 @@ describe("两阶段索引构建 —— chunk 收集 + embedding（Phase 4b Task 
     // 确认 embed 阶段确实在后台跑完了（不是被完全跳过）——只是没有拖住 r2。
     const localPath = getRepoLocalPath(reposDir, repoId);
     await waitFor(() => readEmbeddingIndex(localPath) !== null);
+  });
+
+  it("两次重叠的重建：先开始、后写完的一次（慢）不应该覆盖后开始、先写完的一次（快）—— generation 守卫按“开始顺序”判断，而不是“完成顺序”（Codex 全仓库审查，2026-07-14，Warning）", async () => {
+    const dims = 4;
+    // 这个 spy 是模块级的（vi.mock 的实现只在整个测试文件加载时创建一次），
+    // 这个 describe 块里更早的用例已经调用过它——清空调用计数，只统计这条
+    // 用例自己触发的写入次数。
+    mockedWriteEmbeddingIndex.mockClear();
+    configureIndexing(makeEmbeddingSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) }));
+    let calls = 0;
+    const fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
+      const callIndex = calls++;
+      // 第一次触发的重建（先开始）故意拖慢；紧随其后触发的第二次重建（后
+      // 开始）不延迟——第二次会比第一次先完成并先发布，模拟"一次周期性
+      // 后台重建还没跑完 embed，一次手动重新 sync 就落地了，而且更快跑
+      // 完"这个真实场景。
+      const delay = callIndex === 0 ? 250 : 0;
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      const body = JSON.parse(init.body) as { input: string[] };
+      const data = body.input.map((_text, index) => ({
+        index,
+        embedding: Array.from({ length: dims }, (_v, i) => (index + i + 1) / 10),
+      }));
+      return { status: 200, json: async () => ({ data }) } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // 两次都很快 resolve（git 同步本身很快，ctags+chunk 收集在锁内也很
+    // 快）——真正重叠的是锁外的 embed 阶段，和上面"不持有仓库锁"测试的
+    // 结构完全一致，只是这里第一次的 embed 被人为拖慢。
+    const r1 = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+    });
+    expect(r1.ok).toBe(true);
+    const r2 = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+    });
+    expect(r2.ok).toBe(true);
+
+    // 等两次后台 embed 都真正跑完（包括那次被拖慢、最终应该被守卫拦下的
+    // 第一次）——不只是等第一次成功写入就提前返回。
+    await new Promise((r) => setTimeout(r, 400));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // 两次的 API 调用都真的发生了，代价没有被跳过
+    // 只有"后开始"的那次(generation 更新)真正发布到磁盘；"先开始、后写完"
+    // 的那次在发布前的 isStillLatest() 检查里发现自己已经不是最新，直接
+    // 丢弃结果，不覆盖已经写好的更新数据。
+    expect(mockedWriteEmbeddingIndex).toHaveBeenCalledTimes(1);
+
+    const localPath = getRepoLocalPath(reposDir, repoId);
+    expect(readEmbeddingIndex(localPath)).not.toBeNull();
+  });
+});
+
+describe("索引构建 generation 守卫 —— beginIndexBuild / isLatestIndexBuild（Codex 全仓库审查，2026-07-14，Warning）", () => {
+  it("同一 repoId 连续 begin，ticket 严格单调递增", () => {
+    const repoId = 900001;
+    const g1 = __internal.beginIndexBuild(repoId);
+    const g2 = __internal.beginIndexBuild(repoId);
+    const g3 = __internal.beginIndexBuild(repoId);
+    expect(g2).toBeGreaterThan(g1);
+    expect(g3).toBeGreaterThan(g2);
+  });
+
+  it("不同 repoId 的 ticket 计数器互不影响", () => {
+    const repoA = 900002;
+    const repoB = 900003;
+    __internal.beginIndexBuild(repoA);
+    const bBefore = __internal.beginIndexBuild(repoB);
+    __internal.beginIndexBuild(repoA);
+    __internal.beginIndexBuild(repoA);
+    const bAfter = __internal.beginIndexBuild(repoB);
+    // repoA 又 begin 了两次，完全不影响 repoB 的下一个 ticket 只比它自己
+    // 上一个 ticket 大 1。
+    expect(bAfter).toBe(bBefore + 1);
+  });
+
+  it("最新一次 begin 之后，旧 ticket 不再是 latest；只有最新 ticket 是 latest（这正是 embedAndSaveIndex 发布前检查所依赖的判定）", () => {
+    const repoId = 900004;
+    const g1 = __internal.beginIndexBuild(repoId);
+    expect(__internal.isLatestIndexBuild(repoId, g1)).toBe(true);
+    const g2 = __internal.beginIndexBuild(repoId);
+    expect(__internal.isLatestIndexBuild(repoId, g1)).toBe(false);
+    expect(__internal.isLatestIndexBuild(repoId, g2)).toBe(true);
+  });
+
+  it("从未 begin 过的 repoId，isLatestIndexBuild 对任何 generation 都返回 false（不会误判成“最新”）", () => {
+    expect(__internal.isLatestIndexBuild(900005, 1)).toBe(false);
+    expect(__internal.isLatestIndexBuild(900005, 0)).toBe(false);
   });
 });
 

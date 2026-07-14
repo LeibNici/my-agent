@@ -543,3 +543,89 @@ describe("embedAndSaveIndex — per-batch 60s timeout", () => {
     await expect(resultPromise).resolves.toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// embedAndSaveIndex — isStillLatest staleness guard (Codex full-repo review,
+// 2026-07-14, Warning: two overlapping rebuilds for the same repo can race
+// to publish, and the one that merely finishes LAST used to win regardless
+// of which one started most recently)
+// ---------------------------------------------------------------------------
+
+describe("embedAndSaveIndex — isStillLatest staleness guard", () => {
+  it("isStillLatest 从一开始就为 false -> 不发任何请求，不写入索引", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const chunks = [makeChunk("a.ts", "foo", "function foo() {}")];
+    const ok = await embedAndSaveIndex(repo, chunks, settings, () => false);
+
+    expect(ok).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readEmbeddingIndex(repo)).toBeNull();
+  });
+
+  it("isStillLatest 在 embed 请求进行期间（写入之前）变为 false（模拟一次更新的重建在此期间开始了）-> 已经花的 API 调用结果被丢弃，不覆盖已有索引", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+
+    // Seed an existing index first, so we can prove it's untouched by the
+    // stale build below (not just "nothing was ever written").
+    const seedFetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", seedFetchMock);
+    const priorChunk = makeChunk("prior.ts", "prior", "existing prior content");
+    const seedOk = await embedAndSaveIndex(repo, [priorChunk], settings);
+    expect(seedOk).toBe(true);
+    const before = readEmbeddingIndex(repo)!;
+
+    // A newer rebuild "starts" (flips the flag) as a side effect of THIS
+    // build's own embed call actually going out over the network — proving
+    // the guard right before publish (not just the cheap early-exit one)
+    // is what catches this, since isStillLatest() was still true when the
+    // expensive work began.
+    let stillLatest = true;
+    const staleFetchMock = makeFetchMock({ dims });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: { body: string }) => {
+        const result = await staleFetchMock(url, init);
+        stillLatest = false; // a newer build began while this fetch was in flight
+        return result;
+      })
+    );
+
+    const chunks = [makeChunk("a.ts", "foo", "function foo() { return 1; }")];
+    const ok = await embedAndSaveIndex(repo, chunks, settings, () => stillLatest);
+    expect(ok).toBe(false);
+
+    const after = readEmbeddingIndex(repo)!;
+    expect(after.meta.map((m) => m.path)).toEqual(before.meta.map((m) => m.path));
+  });
+
+  it("isStillLatest 未传入（省略）-> 默认行为不变，照常写入（不破坏现有 14 处调用方）", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const chunks = [makeChunk("a.ts", "foo", "function foo() {}")];
+    const ok = await embedAndSaveIndex(repo, chunks, settings);
+
+    expect(ok).toBe(true);
+    expect(readEmbeddingIndex(repo)).not.toBeNull();
+  });
+
+  it("isStillLatest 全程为 true -> 正常写入（回归保护：新增守卫不误伤正常单次构建）", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const chunks = [makeChunk("a.ts", "foo", "function foo() {}")];
+    const ok = await embedAndSaveIndex(repo, chunks, settings, () => true);
+
+    expect(ok).toBe(true);
+    expect(readEmbeddingIndex(repo)).not.toBeNull();
+  });
+});

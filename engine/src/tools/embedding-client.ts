@@ -31,11 +31,17 @@ function modelFingerprintPath(repoPath: string): string {
   return embPath(repoPath) + ".model";
 }
 
-function currentModelFingerprint(settings: Settings): string {
+// Exported (not just used internally by the incremental-reuse decision
+// below): semantic-search.ts's query path needs the exact same identity
+// check — a same-dimension model swap (e.g. APP_EMBEDDING_MODEL changed to
+// a different model that happens to also emit 1536-dim vectors) would
+// otherwise pass the dims-only check at query time and silently score a
+// fresh query vector against a DIFFERENT, incompatible vector space.
+export function currentModelFingerprint(settings: Settings): string {
   return `${settings.embeddingBaseUrl}|${settings.embeddingModel}`;
 }
 
-function readModelFingerprint(repoPath: string): string | null {
+export function readModelFingerprint(repoPath: string): string | null {
   try {
     return fs.readFileSync(modelFingerprintPath(repoPath), "utf8");
   } catch {
@@ -221,6 +227,7 @@ async function doEmbedAndSave(
   settings: Settings,
   key: string,
   signal: AbortSignal,
+  isStillLatest: () => boolean,
 ): Promise<boolean> {
   const hashes = chunks.map((c) => chunkHash(c));
   const dims = settings.embeddingDimensions;
@@ -257,6 +264,17 @@ async function doEmbedAndSave(
     }
   }
 
+  // Codex full-repo review (2026-07-14, Warning): a rebuild's expensive
+  // embedding calls deliberately run outside the repo lock (see
+  // repo-sync.ts's runIndexBuild comment) so a slow cold build doesn't
+  // block subsequent syncs — but that means two overlapping rebuilds for
+  // the SAME repo (a manual re-sync landing while a periodic sync's build
+  // is still in flight) can both reach here, and whichever finishes LAST
+  // used to win unconditionally regardless of which one reflects the
+  // actual latest checkout. Bail before spending any API calls if a newer
+  // rebuild has since started for this repo.
+  if (!isStillLatest()) return false;
+
   if (todo.length > 0) {
     const batches: number[][] = [];
     for (let s = 0; s < todo.length; s += EMBED_BATCH) {
@@ -289,6 +307,12 @@ async function doEmbedAndSave(
     }
   }
 
+  // The real correctness guard (the check above is just a cheap early
+  // exit): re-checked right before publish, since the whole point is that
+  // ANOTHER rebuild could have started (and even finished) during the
+  // embed calls above, which just spent real minutes on the network.
+  if (!isStillLatest()) return false;
+
   const normalized = vectors.map((v) => l2Normalize(v));
   const meta: EmbeddingChunkMeta[] = chunks.map((c, i) => ({
     path: c.path,
@@ -320,6 +344,12 @@ export async function embedAndSaveIndex(
   repoPath: string,
   chunks: Chunk[],
   settings: Settings,
+  // Codex full-repo review (2026-07-14, Warning): optional and
+  // defaulting to "always latest" so the many existing callers (tests,
+  // and any future one-shot caller that doesn't have overlapping-rebuild
+  // concerns) don't need to be touched — only repo-sync.ts's periodic
+  // rebuild path passes a real generation check.
+  isStillLatest: () => boolean = () => true,
 ): Promise<boolean> {
   const key = embeddingKeyOrFallback(settings);
   if (!key || chunks.length === 0) return false;
@@ -328,7 +358,7 @@ export async function embedAndSaveIndex(
   const timer = setTimeout(() => controller.abort(), BUILD_TIMEOUT_MS);
   timer.unref?.();
   try {
-    return await doEmbedAndSave(repoPath, chunks, settings, key, controller.signal);
+    return await doEmbedAndSave(repoPath, chunks, settings, key, controller.signal, isStillLatest);
   } catch {
     return false;
   } finally {

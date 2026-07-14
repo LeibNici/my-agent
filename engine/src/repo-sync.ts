@@ -459,6 +459,28 @@ export function configureIndexing(settings: Settings): void {
   indexingSettings = settings;
 }
 
+// Codex full-repo review (2026-07-14, Warning): embedAndSaveIndex's publish
+// step runs outside withRepoLock (see the comment on runIndexBuild below for
+// why), so two overlapping rebuilds for the SAME repo — e.g. a manual
+// re-sync landing while a periodic sync's build is still mid-flight — can
+// both reach the publish step, and whichever finished LAST used to win
+// unconditionally even if it was actually the STALER checkout. A
+// monotonically-increasing per-repo ticket, claimed at the START of each
+// build (before any slow embedding calls), lets the publish step check
+// "is a newer build already in flight" and bail instead of overwriting a
+// fresher index with a stale one.
+const indexBuildGeneration = new Map<number, number>();
+
+function beginIndexBuild(repoId: number): number {
+  const next = (indexBuildGeneration.get(repoId) ?? 0) + 1;
+  indexBuildGeneration.set(repoId, next);
+  return next;
+}
+
+function isLatestIndexBuild(repoId: number, generation: number): boolean {
+  return indexBuildGeneration.get(repoId) === generation;
+}
+
 // Task 6 挂的默认 onSyncSuccess —— 模块级 import buildIndex（symbol-index.ts
 // 不反向依赖 repo-sync.ts，两者本就在同一 Node 进程里，不像 v1 要担心动态
 // import 的时机）。对 syncAndPersistImpl 而言仍是 fire-and-forget（这里自己
@@ -492,12 +514,15 @@ function defaultOnSyncSuccess(repoId: number, localPath: string): void {
 // `_background_build_index` 把 `collect_index_chunks`（锁内）和
 // `embed_and_save_index`（锁外）分成两段的理由完全一致。
 async function runIndexBuild(repoId: number, localPath: string): Promise<void> {
+  const generation = beginIndexBuild(repoId);
   const chunks = await withRepoLock(repoId, async () => {
     const ok = await buildIndex(localPath);
     return ok ? collectChunks(localPath) : [];
   });
   if (chunks.length === 0 || !indexingSettings) return;
-  await embedAndSaveIndex(localPath, chunks, indexingSettings);
+  await embedAndSaveIndex(localPath, chunks, indexingSettings, () =>
+    isLatestIndexBuild(repoId, generation)
+  );
 }
 
 export async function syncAndPersist(
@@ -549,6 +574,12 @@ export const __internal = {
     syncAllReposImpl(db, repos, reposDir, onSyncSuccess, (d, o, cb) =>
       syncAndPersistImpl(d, o, cb, (oo) => syncRepoImpl(oo, cloneRepoCore))
     ),
+  // 供测试模拟"同一仓库两次重叠的索引重建"场景，验证发布阶段的
+  // generation 守卫——不通过真实的 runIndexBuild（那需要真正跑完
+  // buildIndex + collectChunks + embedAndSaveIndex 全套），直接摆弄
+  // ticket 计数器本身。
+  beginIndexBuild,
+  isLatestIndexBuild,
 };
 
 export type RepoSyncDescriptor = {
