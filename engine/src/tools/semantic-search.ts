@@ -84,26 +84,32 @@ function zeroHitsMessage(query: string): string {
 // is left unguarded too, matching v1's unguarded resp.json()["data"][0].
 // ---------------------------------------------------------------------------
 
+// Codex full-repo review (2026-07-14, Warning): the timer used to be
+// cleared as soon as fetch() itself resolved (response headers arrived),
+// leaving the caller's subsequent .json() call on the returned
+// response completely unbounded. Deliberately not clearing it here — the
+// same AbortSignal that guards fetch() also aborts an in-flight
+// body-reading call on the result (WHATWG fetch spec) — so it stays armed
+// through whatever the caller does with the body next. See
+// issue-tracker-client.ts's fetchWithTimeout for why leaving it un-cleared
+// through a fast call is harmless (the underlying timer is already
+// unref()'d).
 async function fetchQueryEmbedding(query: string, settings: Settings, key: string): Promise<{ status: number; json: () => Promise<unknown> }> {
-  const { signal, clear } = withTimeout(QUERY_TIMEOUT_MS);
-  try {
-    return await fetch(`${settings.embeddingBaseUrl}/embeddings`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: settings.embeddingModel,
-        input: [truncateChars(query, 2000)],
-        dimensions: settings.embeddingDimensions,
-        encoding_format: "float",
-      }),
-      signal,
-    });
-  } finally {
-    clear();
-  }
+  const { signal } = withTimeout(QUERY_TIMEOUT_MS);
+  return fetch(`${settings.embeddingBaseUrl}/embeddings`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: settings.embeddingModel,
+      input: [truncateChars(query, 2000)],
+      dimensions: settings.embeddingDimensions,
+      encoding_format: "float",
+    }),
+    signal,
+  });
 }
 
 function dot(a: Float32Array, b: Float32Array): number {

@@ -137,43 +137,54 @@ async function embedBatch(
   key: string,
   signal: AbortSignal,
 ): Promise<Float32Array[] | null> {
+  // Codex full-repo review (2026-07-14, Warning): `clear` used to run in a
+  // `finally` right after fetch()'s own promise resolved (response headers
+  // arrived), leaving the subsequent resp.json() completely unbounded — a
+  // slow/stalled body could hang past BATCH_TIMEOUT_MS indefinitely. Now
+  // wraps BOTH fetch() and resp.json() in one outer try/finally so the
+  // timer (and the abort it can still fire) stays armed through body
+  // consumption too — see fetchWithTimeout's own comment
+  // (issue-tracker-client.ts) for why leaving it un-cleared through a fast
+  // call is harmless (already unref()'d).
   const { signal: requestSignal, clear } = withTimeout(BATCH_TIMEOUT_MS, signal);
-  let resp: Response;
   try {
-    resp = await fetch(`${settings.embeddingBaseUrl}/embeddings`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: settings.embeddingModel,
-        input: texts,
-        dimensions: settings.embeddingDimensions,
-        encoding_format: "float",
-      }),
-      signal: requestSignal,
-    });
-  } catch {
-    // Network error, whole-build timeout/abort, or this batch's own 60s
-    // timeout — either way this batch didn't complete.
-    return null;
+    let resp: Response;
+    try {
+      resp = await fetch(`${settings.embeddingBaseUrl}/embeddings`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: settings.embeddingModel,
+          input: texts,
+          dimensions: settings.embeddingDimensions,
+          encoding_format: "float",
+        }),
+        signal: requestSignal,
+      });
+    } catch {
+      // Network error, whole-build timeout/abort, or this batch's own 60s
+      // timeout — either way this batch didn't complete.
+      return null;
+    }
+    if (resp.status !== 200) return null;
+
+    let payload: { data?: EmbedDataEntry[] };
+    try {
+      payload = (await resp.json()) as { data?: EmbedDataEntry[] };
+    } catch {
+      return null;
+    }
+    const data = Array.isArray(payload.data) ? payload.data : [];
+    if (data.length !== texts.length) return null;
+
+    const sorted = [...data].sort((a, b) => a.index - b.index);
+    return sorted.map((d) => Float32Array.from(d.embedding));
   } finally {
     clear();
   }
-  if (resp.status !== 200) return null;
-
-  let payload: { data?: EmbedDataEntry[] };
-  try {
-    payload = (await resp.json()) as { data?: EmbedDataEntry[] };
-  } catch {
-    return null;
-  }
-  const data = Array.isArray(payload.data) ? payload.data : [];
-  if (data.length !== texts.length) return null;
-
-  const sorted = [...data].sort((a, b) => a.index - b.index);
-  return sorted.map((d) => Float32Array.from(d.embedding));
 }
 
 // ---------------------------------------------------------------------------

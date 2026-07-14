@@ -41,19 +41,32 @@ const GITLAB_GET_TIMEOUT_MS = 15_000; // v1's timeout=15 (labels page, single-is
 const GITLAB_SEARCH_TIMEOUT_MS = 10_000; // v1's timeout=10
 const GITLAB_UPLOAD_TIMEOUT_MS = 60_000; // v1's timeout=60
 
-/** Bounds one fetch with `withTimeout` and always clears the timer — does
- * NOT catch a thrown network/abort error, so callers that must propagate
- * one (submit/action/upload) get it for free, and callers that must
- * degrade instead (labels/search) wrap this in their own try/catch.
- * Exported for issue-tracker.ts's poller, which hits the same GitHub/GitLab
- * APIs on the same timeout-bounded-fetch shape. */
+/** Bounds one fetch with `withTimeout` — does NOT catch a thrown
+ * network/abort error, so callers that must propagate one (submit/action/
+ * upload) get it for free, and callers that must degrade instead (labels/
+ * search) wrap this in their own try/catch. Exported for issue-tracker.ts's
+ * poller, which hits the same GitHub/GitLab APIs on the same
+ * timeout-bounded-fetch shape.
+ *
+ * Codex full-repo review (2026-07-14, Warning): this used to clear the
+ * timer in a `finally` right after fetch()'s own promise resolved — i.e.
+ * the moment response HEADERS arrive — leaving body consumption
+ * (resp.json()/resp.text(), which every single caller does immediately
+ * after this returns) completely unbounded. A slow/stalled body (a
+ * misbehaving or malicious tracker endpoint sending headers promptly then
+ * stalling mid-body) could hang forever past the intended timeout. The
+ * SAME AbortSignal that guards fetch() also aborts any of the returned
+ * Response's body-reading methods still in flight when it fires (WHATWG
+ * fetch spec), so deliberately leaving it armed — not clearing it here at
+ * all — closes that gap for free, covering whatever the caller does with
+ * the body next. The underlying timer is already unref()'d
+ * (embedding-client.ts's withTimeout), so a request that finishes quickly
+ * just leaves a bounded (at most timeoutMs), harmless, already-unref'd
+ * timer to fire later as a no-op abort() on a controller nothing is
+ * listening to anymore — not a real leak. */
 export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const { signal, clear } = withTimeout(timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal });
-  } finally {
-    clear();
-  }
+  const { signal } = withTimeout(timeoutMs);
+  return fetch(url, { ...init, signal });
 }
 
 function safeHostname(url: string): string {
