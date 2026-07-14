@@ -3,6 +3,7 @@ __pycache__/
 *.db
 venv/
 .venv/
+node_modules/
 .env
 .jwt_secret
 .ccg/
