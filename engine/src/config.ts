@@ -44,10 +44,10 @@ You have NO tool that edits, writes, or creates files — only read-only tools (
 If you have a draft_issue tool: draft at most ONE issue per confirmed problem per conversation. Once you've drafted an issue, that is your deliverable for this problem — do not draft a second, reworded issue for the same thing (e.g. because you couldn't also apply the code change). If you later realize the draft should change, say so in text and ask the user whether to redraft; never silently call draft_issue again as a way to conclude the turn.`;
 
 /** Atomic create-if-absent for a secret persisted as a plain file (0600) at
- * the repo root — `.jwt_secret` was the original use; webhook secrets
- * (2026-07-13) reuse the exact same "generate, exclusive-create, re-read on
- * EEXIST" shape rather than duplicating it, since there's no meaningful
- * difference beyond the filename. */
+ * the repo root. Only `.jwt_secret` uses this now — it's needed before the
+ * DB is even open, unlike the webhook secrets that used to live here too
+ * (moved to the DB, 2026-07-14, see the comment below `loadOrCreateJwtSecret`
+ * for why). */
 function loadOrCreateSecretFile(repoRoot: string, filename: string): string {
   const secretFile = path.join(repoRoot, filename);
   const secret = crypto.randomBytes(32).toString("hex");
@@ -68,17 +68,15 @@ function loadOrCreateSecretFile(repoRoot: string, filename: string): string {
       if (existingSecret) {
         return existingSecret;
       }
-      // The file exists but is empty — this is NOT a rare race, it's the
-      // normal steady state for a bind-mounted secret file that had to be
-      // pre-touched as an empty placeholder before the very first `docker
-      // compose up` (Docker creates a DIRECTORY instead of erroring if the
-      // host path doesn't exist at all — see docker-compose.yml's own
-      // comment). The exclusive-create above always hits EEXIST against
-      // that empty file, so without persisting here, every single restart
-      // silently generates a brand-new secret and never saves it — exactly
-      // what an operator sees as "the webhook secret changes on every
-      // deploy" (QA-reported, GitHub issue #6): whatever was registered on
-      // GitHub/GitLab goes stale the moment the container restarts.
+      // The file exists but is empty (e.g. pre-touched as a placeholder for
+      // a bind mount, or truncated some other way) — persist our freshly
+      // generated secret into it rather than silently returning it without
+      // saving. Discovered the hard way (GitHub issue #6, 2026-07-14): the
+      // webhook secrets used to hit exactly this path on every restart
+      // (their host file had to be pre-touched empty for Docker's
+      // bind-mount to work at all) and this branch used to just return an
+      // in-memory value without writing it back, so a "restart" and
+      // "generate a brand-new secret" were silently the same event.
       fs.writeFileSync(secretFile, secret, { mode: 0o600 });
       return secret;
     }
@@ -91,18 +89,16 @@ export function loadOrCreateJwtSecret(repoRoot: string): string {
   return loadOrCreateSecretFile(repoRoot, ".jwt_secret");
 }
 
-// Auto-generated, not read from .env — the operator's only job is to copy
-// the printed value into GitHub/GitLab's webhook config (Settings ->
-// Webhooks -> Secret), not to invent a secure secret themselves. One
-// shared secret per provider, not per-repo — see webhook-routes.ts's
-// module header for why that's an acceptable simplification here.
-export function loadOrCreateGithubWebhookSecret(repoRoot: string): string {
-  return loadOrCreateSecretFile(repoRoot, ".github_webhook_secret");
-}
-
-export function loadOrCreateGitlabWebhookSecret(repoRoot: string): string {
-  return loadOrCreateSecretFile(repoRoot, ".gitlab_webhook_secret");
-}
+// Webhook secrets used to live here too (file-based, same pattern as
+// jwtSecret), but that required the host-side file to be pre-touched empty
+// for Docker's bind-mount to work at all, and the empty-file branch above
+// didn't persist what it generated — every restart silently minted (and
+// discarded) a new secret (GitHub issue #6, 2026-07-14). Moved to the DB
+// (storage.ts's getOrCreateAppSecret/regenerateAppSecret, wired in
+// main.ts) instead: it's already the one thing every deployment persists
+// correctly, and it gets admin-triggered rotation almost for free (an
+// UPDATE instead of an SSH session + container restart). jwtSecret stays
+// file-based deliberately — it's needed before the DB is even open.
 
 export function loadSettings(env?: Record<string, string | undefined>): Settings {
   // When env is NOT provided (production path), call dotenv.config() once.

@@ -255,11 +255,12 @@
                         <span style="width:70px;color:var(--faint);font-size:12.5px;">Secret</span>
                         <input id="webhook-github-secret" readonly style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
                         <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="copyWebhookField('webhook-github-secret')">复制</button>
+                        <button class="btn btn-sm btn-danger" onclick="regenerateWebhookSecret('github', this)">重新生成</button>
                     </div>
                     <div style="font-size:12px;color:var(--faint);margin-top:4px;">
                         填入 GitHub 仓库 Settings → Webhooks → Add webhook：Payload URL 用上面的 URL，
                         Content type 选 <code>application/json</code>，Secret 用上面的值，
-                        勾选 Issues + Issue comments 事件。
+                        勾选 Issues + Issue comments 事件。重新生成后旧值立即失效，记得同步更新 GitHub 那边的配置。
                     </div>
                 </div>
                 <div class="card">
@@ -273,10 +274,11 @@
                         <span style="width:70px;color:var(--faint);font-size:12.5px;">Secret Token</span>
                         <input id="webhook-gitlab-secret" readonly style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
                         <button class="btn btn-sm" style="background:var(--ink-800);color:var(--paper);" onclick="copyWebhookField('webhook-gitlab-secret')">复制</button>
+                        <button class="btn btn-sm btn-danger" onclick="regenerateWebhookSecret('gitlab', this)">重新生成</button>
                     </div>
                     <div style="font-size:12px;color:var(--faint);margin-top:4px;">
                         填入 GitLab 仓库 Settings → Webhooks：URL 用上面的 URL，Secret Token 用上面的值，
-                        勾选 Issues events + Comments 事件。
+                        勾选 Issues events + Comments 事件。重新生成后旧值立即失效，记得同步更新 GitLab 那边的配置。
                     </div>
                 </div>
                 <div style="font-size:12px;color:var(--faint);">

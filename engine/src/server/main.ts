@@ -25,8 +25,6 @@ import { serve } from "@hono/node-server";
 import {
   loadSettings,
   loadOrCreateJwtSecret,
-  loadOrCreateGithubWebhookSecret,
-  loadOrCreateGitlabWebhookSecret,
   type Settings,
 } from "../config.js";
 import { initSchema } from "../db/schema.js";
@@ -155,23 +153,26 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   if (!settings.jwtSecret) {
     settings.jwtSecret = loadOrCreateJwtSecret(REPO_ROOT);
   }
-  // Webhook secrets: same override-or-generate pattern as jwtSecret above.
-  // Printed once at startup (not logged again on every request) so an
-  // operator can copy it straight into GitHub/GitLab's Settings -> Webhooks
-  // -> Secret field — this is the only place either value is ever surfaced.
-  if (!settings.githubWebhookSecret) {
-    settings.githubWebhookSecret = loadOrCreateGithubWebhookSecret(REPO_ROOT);
-    console.log(`GitHub webhook secret (Settings → Webhooks → Secret): ${settings.githubWebhookSecret}`);
-  }
-  if (!settings.gitlabWebhookSecret) {
-    settings.gitlabWebhookSecret = loadOrCreateGitlabWebhookSecret(REPO_ROOT);
-    console.log(`GitLab webhook secret (Settings → Webhooks → Secret Token): ${settings.gitlabWebhookSecret}`);
-  }
 
   const dbPath = resolveDbPath(opts.env ?? process.env);
   initSchema(dbPath);
   const db = createDbClient(dbPath);
   await ensureAdminUser(db, settings);
+
+  // Webhook secrets (2026-07-14): DB-backed, not file-based like jwtSecret
+  // above — moved here, after the DB is open, per GitHub issue #6 (the old
+  // file-based approach silently regenerated a new secret on every restart
+  // instead of persisting one; see config.ts's history comment). The admin
+  // panel's regenerate endpoint (admin-routes.ts) is the only other writer
+  // of these two rows.
+  if (!settings.githubWebhookSecret) {
+    settings.githubWebhookSecret = await db.getOrCreateAppSecret("github_webhook_secret");
+    console.log(`GitHub webhook secret (Settings → Webhooks → Secret): ${settings.githubWebhookSecret}`);
+  }
+  if (!settings.gitlabWebhookSecret) {
+    settings.gitlabWebhookSecret = await db.getOrCreateAppSecret("gitlab_webhook_secret");
+    console.log(`GitLab webhook secret (Settings → Webhooks → Secret Token): ${settings.gitlabWebhookSecret}`);
+  }
 
   // Phase 4b Task 5: repo-sync.ts's default onSyncSuccess needs Settings for
   // its embedding-build phase but doesn't import the config singleton itself

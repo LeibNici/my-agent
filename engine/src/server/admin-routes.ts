@@ -377,4 +377,27 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
       gitlab_secret: deps.settings.gitlabWebhookSecret,
     })
   );
+
+  // Rotation (2026-07-14, requested after GitHub issue #6): the whole point
+  // of moving these off the filesystem and into the DB — an admin can now
+  // invalidate a leaked/misconfigured secret without an SSH session and a
+  // container restart. Persists via regenerateAppSecret AND updates the
+  // in-memory settings this same process holds (webhook-routes.ts reads
+  // deps.settings directly for verification) — otherwise the new value
+  // would only take effect on the next restart, defeating the purpose.
+  app.post("/api/admin/webhook-config/regenerate", async (c) => {
+    const body = await parseBody<{ provider?: unknown }>(c);
+    if (body === null) return c.json({ detail: "Invalid JSON body" }, 422);
+    if (body.provider !== "github" && body.provider !== "gitlab") {
+      return c.json({ detail: "provider must be 'github' or 'gitlab'" }, 422);
+    }
+    const name = body.provider === "github" ? "github_webhook_secret" : "gitlab_webhook_secret";
+    const newSecret = await deps.db.regenerateAppSecret(name);
+    if (body.provider === "github") {
+      deps.settings.githubWebhookSecret = newSecret;
+    } else {
+      deps.settings.gitlabWebhookSecret = newSecret;
+    }
+    return c.json({ ok: true, secret: newSecret });
+  });
 }

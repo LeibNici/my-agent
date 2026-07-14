@@ -214,6 +214,22 @@ export function initSchema(dbPath: string): void {
     )
   `);
 
+  // Small key/value store for server-generated secrets that need to
+  // survive restarts (GitHub/GitLab webhook secrets, 2026-07-14) — the DB
+  // is already the one thing every deployment persists correctly (its own
+  // proven bind mount), unlike the file-based approach these replaced
+  // (GitHub issue #6: a file that had to be pre-touched empty for Docker's
+  // bind-mount to work then silently regenerated its secret on every
+  // restart without ever persisting it). jwtSecret deliberately stays
+  // file-based — it's needed before the DB is even open.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS app_secrets (
+      name TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+
   // Create indexes
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)"

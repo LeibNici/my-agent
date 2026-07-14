@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 import { pythonJsonDumps, pyLocalIsoNow } from "./py-compat.js";
 
 export class SchemaError extends Error {}
@@ -436,6 +436,8 @@ export type SemanticSearchRecentRow = {
 };
 
 export type Storage = {
+  getOrCreateAppSecret(name: string): string;
+  regenerateAppSecret(name: string): string;
   addMessage(sessionId: string, role: string, content: string | unknown[]): number;
   getMessages(sessionId: string): StoredMessageRow[];
   recordLlmCallMetrics(rows: LlmMetricsRow[]): void;
@@ -645,6 +647,42 @@ export function openStorage(dbPath: string): Storage {
   // binding at call time (not during literal construction) — self-reference
   // (getUserRepos delegating to listReposForUser) is safe.
   const storage: Storage = {
+    // DB-backed replacement for the old file-based webhook secrets
+    // (2026-07-14, GitHub issue #6) — same "atomic create-if-absent, return
+    // existing on conflict" shape as config.ts's loadOrCreateSecretFile,
+    // but via SQLite's own INSERT ... ON CONFLICT instead of a filesystem
+    // exclusive-create + EEXIST dance. No separate "is it empty" branch to
+    // get wrong: a row either exists with a real value, or it doesn't yet.
+    getOrCreateAppSecret(name: string): string {
+      const now = pyLocalIsoNow();
+      const value = randomBytes(32).toString("hex");
+      db.prepare(
+        "INSERT INTO app_secrets (name, value, created_at) VALUES (?, ?, ?) " +
+          "ON CONFLICT(name) DO NOTHING"
+      ).run(name, value, now);
+      const row = db.prepare("SELECT value FROM app_secrets WHERE name = ?").get(name) as
+        | { value: string }
+        | undefined;
+      // The SELECT is guaranteed to find a row: either this INSERT just
+      // created it, or a concurrent/prior call already did.
+      return row!.value;
+    },
+
+    // Admin-triggered rotation (the DB migration's whole point over the old
+    // file-based approach: a leaked/rotated secret needed an SSH session
+    // and a container restart before; this is just an UPDATE). Callers must
+    // also update their in-memory Settings copy — this only changes what's
+    // durably stored, not what any already-running process holds.
+    regenerateAppSecret(name: string): string {
+      const now = pyLocalIsoNow();
+      const value = randomBytes(32).toString("hex");
+      db.prepare(
+        "INSERT INTO app_secrets (name, value, created_at) VALUES (?, ?, ?) " +
+          "ON CONFLICT(name) DO UPDATE SET value = excluded.value"
+      ).run(name, value, now);
+      return value;
+    },
+
     addMessage(sessionId: string, role: string, content: string | unknown[]): number {
       const now = pyLocalIsoNow();
       const contentStr =

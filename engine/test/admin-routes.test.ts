@@ -97,6 +97,7 @@ describe("admin-only guard", () => {
     ["GET", "/api/admin/permissions"],
     ["POST", "/api/admin/permissions"],
     ["GET", "/api/admin/webhook-config"],
+    ["POST", "/api/admin/webhook-config/regenerate"],
   ])("%s %s → 403 {detail} for an authenticated non-admin", async (method, path) => {
     const { token } = await seedUser("user");
     const app = buildTestApp();
@@ -582,5 +583,58 @@ describe("webhook config", () => {
       gitlab_path: "/api/webhooks/gitlab",
       gitlab_secret: "gl-secret-xyz",
     });
+  });
+
+  // 2026-07-14, after GitHub issue #6 (webhook secrets moved off the
+  // filesystem and into the DB) — rotation is the whole point of that
+  // move: an admin can invalidate a leaked/misconfigured secret without an
+  // SSH session and a container restart.
+  it("POST regenerate rotates the github secret, persists it, and updates the SAME process's in-memory settings immediately", async () => {
+    settings.githubWebhookSecret = "old-github-secret";
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+
+    const resp = await authed(app, token, "/api/admin/webhook-config/regenerate", {
+      method: "POST", body: JSON.stringify({ provider: "github" }),
+    });
+    expect(resp.status).toBe(200);
+    const { secret } = await resp.json();
+    expect(secret).not.toBe("old-github-secret");
+    expect(secret.length).toBe(64);
+
+    // The in-memory settings object this same buildApp instance holds must
+    // already reflect the new value — webhook-routes.ts reads it directly
+    // for signature verification, so a GET right after must agree.
+    const getResp = await authed(app, token, "/api/admin/webhook-config");
+    expect((await getResp.json()).github_secret).toBe(secret);
+
+    // ...and it's durably persisted, not just held in memory.
+    expect(await client.getOrCreateAppSecret("github_webhook_secret")).toBe(secret);
+  });
+
+  it("POST regenerate rotates ONLY the requested provider — gitlab's secret is untouched", async () => {
+    settings.githubWebhookSecret = "old-github-secret";
+    settings.gitlabWebhookSecret = "old-gitlab-secret";
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+
+    await authed(app, token, "/api/admin/webhook-config/regenerate", {
+      method: "POST", body: JSON.stringify({ provider: "github" }),
+    });
+
+    const getResp = await authed(app, token, "/api/admin/webhook-config");
+    expect((await getResp.json()).gitlab_secret).toBe("old-gitlab-secret");
+  });
+
+  it("POST regenerate with an invalid provider → 422, nothing changed", async () => {
+    settings.githubWebhookSecret = "old-github-secret";
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+
+    const resp = await authed(app, token, "/api/admin/webhook-config/regenerate", {
+      method: "POST", body: JSON.stringify({ provider: "bitbucket" }),
+    });
+    expect(resp.status).toBe(422);
+    expect(settings.githubWebhookSecret).toBe("old-github-secret");
   });
 });

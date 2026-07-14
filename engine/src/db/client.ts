@@ -33,6 +33,8 @@ import type {
 } from "./storage.js";
 
 export type DbClient = {
+  getOrCreateAppSecret(name: string): Promise<string>;
+  regenerateAppSecret(name: string): Promise<string>;
   addMessage(sessionId: string, role: string, content: string | unknown[]): Promise<number>;
   getMessages(sessionId: string): Promise<StoredMessageRow[]>;
   recordLlmCallMetrics(rows: LlmMetricsRow[]): Promise<void>;
@@ -195,6 +197,8 @@ export function createDbClient(dbPath: string): DbClient {
   }
 
   return {
+    getOrCreateAppSecret: (name) => call<string>("getOrCreateAppSecret", [name]),
+    regenerateAppSecret: (name) => call<string>("regenerateAppSecret", [name]),
     addMessage: (sessionId, role, content) => call<number>("addMessage", [sessionId, role, content]),
     getMessages: (sessionId) => call<StoredMessageRow[]>("getMessages", [sessionId]),
     recordLlmCallMetrics: (rows) => call<void>("recordLlmCallMetrics", [rows]),

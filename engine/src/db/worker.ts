@@ -21,6 +21,16 @@ parentPort.on("message", (req: Request) => {
   const { id, method, args } = req;
   try {
     switch (method) {
+      case "getOrCreateAppSecret": {
+        const [name] = args as [string];
+        reply({ id, ok: true, result: storage.getOrCreateAppSecret(name) });
+        break;
+      }
+      case "regenerateAppSecret": {
+        const [name] = args as [string];
+        reply({ id, ok: true, result: storage.regenerateAppSecret(name) });
+        break;
+      }
       case "addMessage": {
         const [sessionId, role, content] = args as [string, string, string | unknown[]];
         reply({ id, ok: true, result: storage.addMessage(sessionId, role, content) });

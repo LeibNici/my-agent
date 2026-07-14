@@ -47,6 +47,39 @@ describe("openStorage", () => {
   });
 });
 
+describe("getOrCreateAppSecret / regenerateAppSecret（2026-07-14，DB 取代文件持久化 webhook secret）", () => {
+  it("首次调用生成一个 64 位十六进制值并落库", () => {
+    const secret = storage.getOrCreateAppSecret("github_webhook_secret");
+    expect(secret.length).toBe(64);
+    expect(/^[0-9a-f]{64}$/.test(secret)).toBe(true);
+  });
+
+  it("同一 name 重复调用返回同一个值（跨“重启”稳定，不像旧的文件方案那样每次都重新生成）", () => {
+    const first = storage.getOrCreateAppSecret("github_webhook_secret");
+    const second = storage.getOrCreateAppSecret("github_webhook_secret"); // simulates the next restart
+    expect(second).toBe(first);
+  });
+
+  it("不同 name 互不影响", () => {
+    const github = storage.getOrCreateAppSecret("github_webhook_secret");
+    const gitlab = storage.getOrCreateAppSecret("gitlab_webhook_secret");
+    expect(github).not.toBe(gitlab);
+  });
+
+  it("regenerateAppSecret 产生一个新值并覆盖旧的，后续 getOrCreateAppSecret 拿到的是新值", () => {
+    const original = storage.getOrCreateAppSecret("github_webhook_secret");
+    const rotated = storage.regenerateAppSecret("github_webhook_secret");
+    expect(rotated).not.toBe(original);
+    expect(storage.getOrCreateAppSecret("github_webhook_secret")).toBe(rotated);
+  });
+
+  it("regenerateAppSecret 在还没有该 name 的行时也能正常工作（先建后转的等价写法）", () => {
+    const secret = storage.regenerateAppSecret("gitlab_webhook_secret");
+    expect(secret.length).toBe(64);
+    expect(storage.getOrCreateAppSecret("gitlab_webhook_secret")).toBe(secret);
+  });
+});
+
 describe("addMessage / getMessages（test_message_codec goldens 对齐）", () => {
   it("纯字符串原样存取", () => {
     storage.addMessage("s1", "assistant", "普通回答");

@@ -668,6 +668,30 @@ async function copyWebhookField(id) {
     }
 }
 
+// The whole point of moving these secrets into the DB (2026-07-14, GitHub
+// issue #6) — rotating a leaked/misconfigured one used to mean SSHing into
+// the host and restarting the container; now it's a button.
+async function regenerateWebhookSecret(provider, btn) {
+    const label = provider === "github" ? "GitHub" : "GitLab";
+    const ok = await confirmDialog({
+        title: `重新生成 ${label} Webhook Secret`,
+        message: `旧的 secret 会立即失效——如果 ${label} 那边已经配置了 webhook，需要马上同步更新，否则投递会开始返回 401 直到你更新为止。确定继续吗？`,
+        confirmLabel: "重新生成", danger: true,
+    });
+    if (!ok) return;
+    btn.disabled = true;
+    try {
+        const { ok: reqOk, data } = await apiRequest("/api/admin/webhook-config/regenerate", {
+            method: "POST", body: JSON.stringify({ provider }),
+        });
+        if (!reqOk) return showMsg(data.detail || "重新生成失败", false);
+        document.getElementById(`webhook-${provider}-secret`).value = data.secret;
+        showMsg(`${label} secret 已重新生成，别忘了同步更新到 ${label}`);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 // QA-reported 2026-07-14: webhook-driven status changes land in the DB
 // near-instantly, but this table only ever redrew on tab switch or the
 // explicit "刷新"/"立即同步" buttons — an externally-closed issue kept
