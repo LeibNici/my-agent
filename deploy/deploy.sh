@@ -39,6 +39,19 @@ fi
 # it never becomes a tracked/committed file.
 git rev-parse HEAD > engine/.git-sha
 
+# Codex full-repo review (2026-07-14, Warning): docker-compose.yml's
+# ./data/agent_data.db and ./data/jwt_secret are FILE bind-mounts — Docker
+# only bind-mounts an existing host path; if the source doesn't exist yet
+# (true on a genuinely first-ever deploy, since data/ is gitignored and so
+# never present in a fresh checkout) it silently creates a DIRECTORY at
+# that path instead of erroring, which then breaks both better-sqlite3
+# (can't open a directory as a db file) and jwt-secret loading. touch is
+# safe to run unconditionally on every deploy, not just the first — it
+# never truncates an already-existing file, only creates what's missing.
+echo "==> ensuring data/ bind-mount targets exist (first-deploy safety)"
+mkdir -p data/repos
+touch data/agent_data.db data/jwt_secret
+
 echo "==> docker compose build"
 docker compose build
 
@@ -59,6 +72,22 @@ if [ "$ok" != true ]; then
   exit 1
 fi
 echo "service is up"
+
+# Codex full-repo review (2026-07-14, Warning): auto-deploy.sh used to
+# compare `git rev-parse HEAD` against origin/main to decide whether
+# there's anything new to deploy — but the `git pull` above already moves
+# HEAD forward unconditionally, before the build/health-check that follows
+# it is known to succeed. If THIS run fails anywhere below that pull (a
+# build failure, or the health-check timeout above), HEAD is already at
+# the new commit even though it was never actually served successfully —
+# so the next auto-deploy.sh cron tick sees local HEAD == origin/main,
+# concludes "nothing new", and silently never retries, forever, until a
+# DIFFERENT new commit happens to be pushed. Writing this marker only here
+# — after the health check has actually passed — gives auto-deploy.sh a
+# "last known-good deploy" signal that's independent of git HEAD, so a
+# failed attempt keeps getting retried every 5 minutes as intended instead
+# of going silent.
+git rev-parse HEAD > deploy/.last-deployed-sha
 
 # Reclaim disk from old builds: dangling images are always safe to drop
 # (nothing references them, whether ours or another project's). Build

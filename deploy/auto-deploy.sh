@@ -16,15 +16,29 @@ if ! flock -n 200; then
 fi
 
 git fetch origin main --quiet
-local_rev=$(git rev-parse HEAD)
 remote_rev=$(git rev-parse origin/main)
 
-if [ "$local_rev" = "$remote_rev" ]; then
+# Codex full-repo review (2026-07-14, Warning): comparing against local
+# `git rev-parse HEAD` used to mean a FAILED deploy (build error, or the
+# health-check timing out) never got retried — deploy.sh's own `git pull`
+# already advances HEAD to remote_rev before the build/health-check that
+# can still fail, so on the next tick local HEAD looked identical to
+# remote_rev regardless of whether the deploy actually succeeded. Compare
+# against deploy.sh's own success marker (written only after its
+# health-check passes) instead — a failed attempt leaves the marker
+# unchanged, so it keeps not matching remote_rev and gets retried every 5
+# minutes until it either succeeds or a human intervenes. Missing marker
+# (no successful deploy has EVER completed on this host) reads as "always
+# behind", so the very first run attempts a deploy too.
+last_deployed_rev=""
+[ -f deploy/.last-deployed-sha ] && last_deployed_rev=$(cat deploy/.last-deployed-sha)
+
+if [ "$last_deployed_rev" = "$remote_rev" ]; then
   exit 0
 fi
 
 {
-  echo "=== $(date -Iseconds) deploying ${local_rev:0:9} -> ${remote_rev:0:9} ==="
+  echo "=== $(date -Iseconds) deploying ${last_deployed_rev:0:9} -> ${remote_rev:0:9} ==="
   bash deploy/deploy.sh
   echo "=== $(date -Iseconds) done ==="
 } >> "$LOG_FILE" 2>&1

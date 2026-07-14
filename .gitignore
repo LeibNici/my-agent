@@ -8,4 +8,6 @@ node_modules/
 .jwt_secret
 .ccg/
 deploy/auto-deploy.log
+deploy/.last-deployed-sha
 engine/.git-sha
+/data/
