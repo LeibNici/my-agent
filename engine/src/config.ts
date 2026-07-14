@@ -4,7 +4,12 @@ import * as crypto from "crypto";
 import dotenv from "dotenv";
 
 export interface Settings {
-  // Anthropic/LLM settings
+  // Anthropic/LLM settings. These four are just the .env/default layer —
+  // main.ts overrides them post-load from db.getLlmConfig() when an admin
+  // has configured one via Admin → LLM 配置 (2026-07-14), which then wins
+  // outright. Kept here so a fresh deploy with no DB row yet still boots
+  // with something usable, and so tests that only call loadSettings() in
+  // isolation don't need a DB at all.
   apiKey: string;
   baseUrl: string;
   model: string;

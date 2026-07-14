@@ -145,6 +145,7 @@
             <button class="tab-btn" onclick="switchTab('perms', this)">权限</button>
             <button class="tab-btn" onclick="switchTab('issues', this)">工单</button>
             <button class="tab-btn" onclick="switchTab('webhook', this)">Webhook</button>
+            <button class="tab-btn" onclick="switchTab('llm', this)">LLM 配置</button>
             <button class="tab-btn" onclick="switchTab('usage', this)">用量</button>
             <button class="tab-btn" onclick="switchTab('semantic', this)">语义检索</button>
         </div>
@@ -283,6 +284,36 @@
                 </div>
                 <div style="font-size:12px;color:var(--faint);">
                     两个 secret 由服务首次启动时自动生成并持久化，所有仓库共用同一对，不是每个仓库单独一个。
+                </div>
+            </div>
+
+            <!-- LLM Config Panel -->
+            <div id="panel-llm" class="panel">
+                <div class="card">
+                    <h3>LLM 模型 <span id="llm-config-status" style="font-weight:normal;font-size:12px;margin-left:8px;"></span></h3>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:100px;color:var(--faint);font-size:12.5px;">Base URL</span>
+                        <input id="llm-base-url" placeholder="https://dashscope.aliyuncs.com/apps/anthropic" style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
+                    </div>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:100px;color:var(--faint);font-size:12.5px;">Model</span>
+                        <input id="llm-model" placeholder="qwen3.7-plus" style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
+                    </div>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:100px;color:var(--faint);font-size:12.5px;">Max Tokens</span>
+                        <input id="llm-max-tokens" type="number" min="1" placeholder="4096" style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
+                    </div>
+                    <div class="form-row" style="align-items:center;">
+                        <span style="width:100px;color:var(--faint);font-size:12.5px;">API Key</span>
+                        <input id="llm-api-key" type="password" placeholder="留空则不修改已保存的 key" style="flex:1;min-width:280px;font-family:var(--font-mono);font-size:12.5px;">
+                    </div>
+                    <div class="form-row">
+                        <button class="btn btn-primary" onclick="saveLlmConfig(this)">保存</button>
+                    </div>
+                    <div style="font-size:12px;color:var(--faint);margin-top:4px;">
+                        未配置 API key 之前，Agent 能力（聊天/工具调用）不可用，聊天入口会提示"当前未配置 LLM 模型"。
+                        保存后不回显已保存的 key——重新打开此页时 API Key 输入框永远是空的，这不代表配置丢失。
+                    </div>
                 </div>
             </div>
 

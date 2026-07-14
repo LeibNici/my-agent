@@ -193,6 +193,39 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
     console.log("GitLab webhook secret loaded — see Admin → Webhook to view/copy it.");
   }
 
+  // LLM provider config (2026-07-14, production P0): a host-side permission
+  // mismatch on engine/.env made ANTHROPIC_API_KEY silently unreadable —
+  // dotenv swallowed the read error, every ANTHROPIC_* setting fell back to
+  // config.ts's hardcoded defaults (empty key, real api.anthropic.com
+  // instead of DashScope), and the service reported "listening on" and
+  // looked healthy while every single chat turn failed. Moving this to the
+  // DB (admin-routes.ts's GET/POST /api/admin/llm-config, same pattern as
+  // the webhook secrets above) removes the .env file — and its host-side
+  // permissions — from this path entirely; an admin edits it through an
+  // authenticated UI instead of an SSH session. A DB row, when present,
+  // wins outright over .env for each of the four fields (NULL means "not
+  // set here, keep whatever .env/loadSettings already put in `settings`").
+  const llmConfig = await db.getLlmConfig();
+  if (llmConfig?.api_key) settings.apiKey = llmConfig.api_key;
+  if (llmConfig?.base_url) settings.baseUrl = llmConfig.base_url;
+  if (llmConfig?.model) settings.model = llmConfig.model;
+  if (llmConfig?.max_tokens) settings.maxTokens = llmConfig.max_tokens;
+  // The loud half of the same fix: today's incident was invisible precisely
+  // because nothing checked this and failed noisily — the process booted
+  // clean, logged "listening on", and only the FIRST real chat attempt ever
+  // revealed the problem, as an opaque library error with no connection to
+  // the actual cause. sse.ts's chatEventStream also short-circuits with a
+  // clear user-facing message before ever reaching the engine, but that only
+  // helps someone who's already looking at the chat UI — this is for
+  // whoever's watching the deploy log.
+  if (!settings.apiKey) {
+    console.warn(
+      "WARNING: no LLM API key configured (checked DB llm_config, then " +
+        "ANTHROPIC_API_KEY) — chat/tool calls will fail until an admin sets " +
+        "one via Admin → LLM 配置."
+    );
+  }
+
   // Phase 4b Task 5: repo-sync.ts's default onSyncSuccess needs Settings for
   // its embedding-build phase but doesn't import the config singleton itself
   // (see configureIndexing's doc comment) — must run before the startup sync

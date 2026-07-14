@@ -473,9 +473,26 @@ export type SemanticSearchRecentRow = {
   username: string;
 };
 
+export type LlmConfigRow = {
+  api_key: string | null;
+  base_url: string | null;
+  model: string | null;
+  max_tokens: number | null;
+  updated_at: string;
+};
+
+export type LlmConfigPatch = {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  maxTokens?: number;
+};
+
 export type Storage = {
   getOrCreateAppSecret(name: string): string;
   regenerateAppSecret(name: string): string;
+  getLlmConfig(): LlmConfigRow | null;
+  setLlmConfig(patch: LlmConfigPatch): LlmConfigRow;
   addMessage(sessionId: string, role: string, content: string | unknown[]): number;
   getMessages(sessionId: string): StoredMessageRow[];
   getMessagesForTurn(sessionId: string): StoredMessageRow[];
@@ -745,6 +762,36 @@ export function openStorage(dbPath: string): Storage {
           "ON CONFLICT(name) DO UPDATE SET value = excluded.value"
       ).run(name, value, now);
       return value;
+    },
+
+    getLlmConfig(): LlmConfigRow | null {
+      const row = db
+        .prepare("SELECT api_key, base_url, model, max_tokens, updated_at FROM llm_config WHERE id = 1")
+        .get() as LlmConfigRow | undefined;
+      return row ?? null;
+    },
+
+    // Admin-typed config, never auto-generated (unlike getOrCreateAppSecret
+    // above) — a partial patch merges onto whatever's already stored, so
+    // saving just one field (e.g. model) doesn't blank out the others,
+    // matching the "留空则不修改" convention repo credential edits already
+    // use (admin-routes.ts's repo PATCH).
+    setLlmConfig(patch: LlmConfigPatch): LlmConfigRow {
+      const now = pyLocalIsoNow();
+      const existing = storage.getLlmConfig();
+      const merged: LlmConfigRow = {
+        api_key: patch.apiKey ?? existing?.api_key ?? null,
+        base_url: patch.baseUrl ?? existing?.base_url ?? null,
+        model: patch.model ?? existing?.model ?? null,
+        max_tokens: patch.maxTokens ?? existing?.max_tokens ?? null,
+        updated_at: now,
+      };
+      db.prepare(
+        "INSERT INTO llm_config (id, api_key, base_url, model, max_tokens, updated_at) VALUES (1, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT(id) DO UPDATE SET api_key = excluded.api_key, base_url = excluded.base_url, " +
+          "model = excluded.model, max_tokens = excluded.max_tokens, updated_at = excluded.updated_at"
+      ).run(merged.api_key, merged.base_url, merged.model, merged.max_tokens, merged.updated_at);
+      return merged;
     },
 
     addMessage(sessionId: string, role: string, content: string | unknown[]): number {

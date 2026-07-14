@@ -428,4 +428,60 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     }
     return c.json({ ok: true, secret: newSecret });
   });
+
+  // ==================== LLM config ====================
+  // 2026-07-14 production P0: a host-side permission mismatch on engine/.env
+  // made ANTHROPIC_API_KEY silently unreadable, and the failure was invisible
+  // until the first real chat attempt — see main.ts's post-load DB override
+  // for the full incident context. These two routes are the fix's UI half:
+  // an admin configures the LLM provider here instead of an .env file an
+  // operator has to get file permissions right on.
+
+  // Unlike webhook-config above, this deliberately never echoes the real
+  // api_key back — it's a credential, not a value meant to be copy-pasted
+  // out of the admin UI. `configured` mirrors adminRepoView's `has_token`
+  // pattern (line 68 above): report whether a key is set, not what it is.
+  app.get("/api/admin/llm-config", async (c) =>
+    c.json({
+      configured: Boolean(deps.settings.apiKey),
+      base_url: deps.settings.baseUrl,
+      model: deps.settings.model,
+      max_tokens: deps.settings.maxTokens,
+    })
+  );
+
+  // Partial save: an omitted/blank field keeps whatever's already stored
+  // (setLlmConfig's merge-onto-existing behavior) — the frontend leaves the
+  // api_key input blank on load and only sends it when the admin actually
+  // types a new one, so re-saving just base_url/model/max_tokens can't
+  // accidentally wipe a previously-configured key. Persists to the DB AND
+  // mutates deps.settings in place so the new config takes effect on the
+  // very next chat turn, no restart (same reasoning as the webhook secret
+  // rotation above — settings is the one shared object every request path
+  // reads from).
+  app.post("/api/admin/llm-config", async (c) => {
+    const body = await parseBody<{
+      api_key?: unknown;
+      base_url?: unknown;
+      model?: unknown;
+      max_tokens?: unknown;
+    }>(c);
+    if (body === null) return c.json({ detail: "Invalid JSON body" }, 422);
+
+    const patch: { apiKey?: string; baseUrl?: string; model?: string; maxTokens?: number } = {};
+    if (typeof body.api_key === "string" && body.api_key.trim()) patch.apiKey = body.api_key.trim();
+    if (typeof body.base_url === "string" && body.base_url.trim()) patch.baseUrl = body.base_url.trim();
+    if (typeof body.model === "string" && body.model.trim()) patch.model = body.model.trim();
+    if (typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens) && body.max_tokens > 0) {
+      patch.maxTokens = Math.floor(body.max_tokens);
+    }
+
+    const saved = await deps.db.setLlmConfig(patch);
+    if (saved.api_key) deps.settings.apiKey = saved.api_key;
+    if (saved.base_url) deps.settings.baseUrl = saved.base_url;
+    if (saved.model) deps.settings.model = saved.model;
+    if (saved.max_tokens) deps.settings.maxTokens = saved.max_tokens;
+
+    return c.json({ ok: true, configured: Boolean(deps.settings.apiKey) });
+  });
 }

@@ -117,6 +117,8 @@ describe("admin-only guard", () => {
     ["POST", "/api/admin/permissions"],
     ["GET", "/api/admin/webhook-config"],
     ["POST", "/api/admin/webhook-config/regenerate"],
+    ["GET", "/api/admin/llm-config"],
+    ["POST", "/api/admin/llm-config"],
   ])("%s %s → 403 {detail} for an authenticated non-admin", async (method, path) => {
     const { token } = await seedUser("user");
     const app = buildTestApp();
@@ -719,5 +721,92 @@ describe("webhook config", () => {
     });
     expect(resp.status).toBe(422);
     expect(settings.githubWebhookSecret).toBe("old-github-secret");
+  });
+});
+
+// ==================== LLM config ====================
+// 2026-07-14, production P0: a host-side .env permission mismatch made
+// ANTHROPIC_API_KEY silently unreadable — see main.ts's post-load DB
+// override comment for the full incident. These routes replace the .env
+// file as the admin-facing way to configure the LLM provider.
+
+describe("llm config", () => {
+  it("GET never echoes the real api key — only whether one is configured, plus the non-secret fields", async () => {
+    settings.apiKey = "sk-real-secret-value";
+    settings.baseUrl = "https://dashscope.aliyuncs.com/apps/anthropic";
+    settings.model = "qwen3.7-plus";
+    settings.maxTokens = 8192;
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/admin/llm-config");
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body).toEqual({
+      configured: true,
+      base_url: "https://dashscope.aliyuncs.com/apps/anthropic",
+      model: "qwen3.7-plus",
+      max_tokens: 8192,
+    });
+    expect(JSON.stringify(body)).not.toContain("sk-real-secret-value");
+  });
+
+  it("GET reports configured:false when no key is set", async () => {
+    settings.apiKey = "";
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/admin/llm-config");
+    expect((await resp.json()).configured).toBe(false);
+  });
+
+  it("POST saves all four fields, persists to DB, updates the SAME process's in-memory settings immediately, and never echoes the key back", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/admin/llm-config", {
+      method: "POST",
+      body: JSON.stringify({
+        api_key: "sk-new-key",
+        base_url: "https://dashscope.aliyuncs.com/apps/anthropic",
+        model: "qwen3.7-plus",
+        max_tokens: 4096,
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body).toEqual({ ok: true, configured: true });
+    expect(JSON.stringify(body)).not.toContain("sk-new-key");
+
+    // In-memory settings this process holds must already reflect it — the
+    // very next chat turn should use the new key, no restart.
+    expect(settings.apiKey).toBe("sk-new-key");
+    expect(settings.baseUrl).toBe("https://dashscope.aliyuncs.com/apps/anthropic");
+    expect(settings.model).toBe("qwen3.7-plus");
+    expect(settings.maxTokens).toBe(4096);
+
+    // ...and durably persisted.
+    const stored = await client.getLlmConfig();
+    expect(stored!.api_key).toBe("sk-new-key");
+  });
+
+  it("POST with a blank api_key keeps the previously-saved key — re-saving other fields can't accidentally wipe it", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    await authed(app, token, "/api/admin/llm-config", {
+      method: "POST",
+      body: JSON.stringify({ api_key: "sk-original", model: "qwen3.7-plus" }),
+    });
+    const resp = await authed(app, token, "/api/admin/llm-config", {
+      method: "POST",
+      body: JSON.stringify({ api_key: "", model: "qwen-max" }),
+    });
+    expect(resp.status).toBe(200);
+    expect(settings.apiKey).toBe("sk-original");
+    expect(settings.model).toBe("qwen-max");
+  });
+
+  it("POST with invalid JSON → 422", async () => {
+    const { token } = await seedUser("admin");
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/admin/llm-config", { method: "POST", body: "not json" });
+    expect(resp.status).toBe(422);
   });
 });

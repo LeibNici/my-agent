@@ -34,11 +34,15 @@ import type {
   RecentLlmCallRow,
   SemanticSearchStats,
   SemanticSearchRecentRow,
+  LlmConfigRow,
+  LlmConfigPatch,
 } from "./storage.js";
 
 export type DbClient = {
   getOrCreateAppSecret(name: string): Promise<string>;
   regenerateAppSecret(name: string): Promise<string>;
+  getLlmConfig(): Promise<LlmConfigRow | null>;
+  setLlmConfig(patch: LlmConfigPatch): Promise<LlmConfigRow>;
   addMessage(sessionId: string, role: string, content: string | unknown[]): Promise<number>;
   getMessages(sessionId: string): Promise<StoredMessageRow[]>;
   getMessagesForTurn(sessionId: string): Promise<StoredMessageRow[]>;
@@ -208,6 +212,8 @@ export function createDbClient(dbPath: string): DbClient {
   return {
     getOrCreateAppSecret: (name) => call<string>("getOrCreateAppSecret", [name]),
     regenerateAppSecret: (name) => call<string>("regenerateAppSecret", [name]),
+    getLlmConfig: () => call<LlmConfigRow | null>("getLlmConfig", []),
+    setLlmConfig: (patch) => call<LlmConfigRow>("setLlmConfig", [patch]),
     addMessage: (sessionId, role, content) => call<number>("addMessage", [sessionId, role, content]),
     getMessages: (sessionId) => call<StoredMessageRow[]>("getMessages", [sessionId]),
     getMessagesForTurn: (sessionId) => call<StoredMessageRow[]>("getMessagesForTurn", [sessionId]),

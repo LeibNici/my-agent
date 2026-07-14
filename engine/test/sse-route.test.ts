@@ -35,7 +35,10 @@ beforeEach(() => {
   dir = f.dir;
   dbPath = f.dbPath;
   client = createDbClient(f.dbPath);
-  settings = loadSettings({ APP_JWT_SECRET: "test-secret-do-not-use-in-prod" });
+  settings = loadSettings({
+    APP_JWT_SECRET: "test-secret-do-not-use-in-prod",
+    ANTHROPIC_API_KEY: "sk-mock-offline-not-a-real-key",
+  });
 });
 
 afterEach(async () => {
@@ -332,6 +335,53 @@ describe("POST /api/chat — SSE contract (oracle: v1-python-final:tests/test_ss
 });
 
 // ==================== Supplementary SSE semantics (beyond the four core scenarios) ====================
+
+describe("POST /api/chat — 未配置 LLM key 时提前拒绝（2026-07-14 production P0）", () => {
+  // Before this guard, an unconfigured key still reached the engine and
+  // failed deep inside pi-ai with a raw library error naming an internal
+  // provider id — see engine's own change history. The frontend/user-facing
+  // contract this test protects: a clean, actionable message, BEFORE any
+  // session-creation DB write, not a pass-through of whatever the engine
+  // stub would have produced.
+  it("settings.apiKey 为空 -> 立即 sseReject，engine 完全不被调用，不新建 session", async () => {
+    const { id: userId, token } = await seedUser();
+    const unconfigured: Settings = { ...settings, apiKey: "" };
+    let engineCalled = false;
+    const app = buildApp({
+      db: client,
+      settings: unconfigured,
+      engine: (async function* () {
+        engineCalled = true;
+      }) as RunTurnFn,
+    });
+    const { frames } = await postChat(app, token, { message: "你好" });
+    expect(engineCalled).toBe(false);
+
+    const errorFrame = frames.find((f) => f.event === "error")!;
+    const errorData = JSON.parse(errorFrame.data);
+    expect(errorData.message).toContain("未配置 LLM 模型");
+
+    const doneFrame = frames.find((f) => f.event === "done")!;
+    expect(JSON.parse(doneFrame.data).session_id).toBeNull();
+
+    const sessions = await client.listSessions(userId);
+    expect(sessions.length).toBe(0);
+  });
+
+  it("settings.apiKey 非空 -> 正常走到 engine（对照组，证明 guard 只拦截真正未配置的情况）", async () => {
+    const { token } = await seedUser();
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([{ type: "done", data: { text: "ok", success: true, budgetExhausted: false } }]),
+    });
+    const { frames } = await postChat(app, token, { message: "你好" });
+    const errorFrame = frames.find((f) => f.event === "error");
+    expect(errorFrame).toBeUndefined();
+    const doneFrame = frames.find((f) => f.event === "done")!;
+    expect(JSON.parse(doneFrame.data).session_id).not.toBeNull();
+  });
+});
 
 describe("POST /api/chat — supplementary semantics", () => {
   // Codex full-repo review (2026-07-14, Warning): the browser's terminal

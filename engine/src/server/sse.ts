@@ -269,6 +269,18 @@ export async function* chatEventStream(
 ): AsyncGenerator<SseFrame> {
   const { db, settings, engine, tools } = deps;
 
+  // 2026-07-14 production P0: with no key configured, every turn used to
+  // reach the engine anyway and fail deep inside pi-ai with a raw library
+  // error ("No API key for provider: anthropic") that named an internal
+  // provider id instead of explaining anything a user could act on. Checked
+  // first, before session/message validation below, since it doesn't depend
+  // on req at all and should short-circuit before any session-creation DB
+  // writes happen.
+  if (!settings.apiKey) {
+    yield* sseReject("当前未配置 LLM 模型，Agent 能力暂不可用，请联系管理员在 Admin 后台配置。");
+    return;
+  }
+
   if (req.message.length > MAX_MESSAGE_LENGTH) {
     yield* sseReject(`Message too long (${req.message.length} chars). Max ${MAX_MESSAGE_LENGTH}.`);
     return;

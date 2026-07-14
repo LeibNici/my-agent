@@ -740,6 +740,49 @@ async function regenerateWebhookSecret(provider, btn) {
     }
 }
 
+// ===== LLM config =====
+// 2026-07-14 production P0: a host-side .env permission mismatch made the
+// real ANTHROPIC_API_KEY silently unreadable and Agent 能力 failed with an
+// opaque library error on every turn, with nothing in the deploy log to
+// point at the actual cause (see main.ts's post-load DB override for the
+// full incident). This tab replaces the .env file as the source of truth —
+// GET never returns the real key (only whether one is configured, same
+// has_token pattern repo credentials already use), and the API Key input is
+// always left blank on load so re-saving other fields can't blank it out.
+async function loadLlmConfig() {
+    const resp = await fetch("/api/admin/llm-config", { headers: authHeaders() });
+    const data = await resp.json();
+    document.getElementById("llm-base-url").value = data.base_url || "";
+    document.getElementById("llm-model").value = data.model || "";
+    document.getElementById("llm-max-tokens").value = data.max_tokens || "";
+    document.getElementById("llm-api-key").value = "";
+    document.getElementById("llm-api-key").placeholder = data.configured
+        ? "已配置（留空则不修改）" : "留空则不修改已保存的 key";
+    document.getElementById("llm-config-status").innerHTML = data.configured
+        ? '<span style="color:var(--moss)">✓ 已配置</span>'
+        : '<span style="color:var(--rust)">✗ 未配置 — Agent 能力暂不可用</span>';
+}
+
+async function saveLlmConfig(btn) {
+    const body = {
+        base_url: document.getElementById("llm-base-url").value.trim(),
+        model: document.getElementById("llm-model").value.trim(),
+        max_tokens: Number(document.getElementById("llm-max-tokens").value) || undefined,
+        api_key: document.getElementById("llm-api-key").value,
+    };
+    btn.disabled = true;
+    try {
+        const { ok, data } = await apiRequest("/api/admin/llm-config", {
+            method: "POST", body: JSON.stringify(body),
+        });
+        if (!ok) return showMsg(data.detail || "保存失败", false);
+        showMsg("LLM 配置已保存，立即生效，无需重启");
+        await loadLlmConfig();
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 // QA-reported 2026-07-14: webhook-driven status changes land in the DB
 // near-instantly, but this table only ever redrew on tab switch or the
 // explicit "刷新"/"立即同步" buttons — an externally-closed issue kept
@@ -761,6 +804,7 @@ if (isAuthorizedAdmin) {
     loadPerms();
     loadIssueTracking();
     loadWebhookConfig();
+    loadLlmConfig();
     loadUsage();
     loadSemanticSearch();
 }

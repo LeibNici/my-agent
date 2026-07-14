@@ -31,6 +31,15 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.regenerateAppSecret(name) });
         break;
       }
+      case "getLlmConfig": {
+        reply({ id, ok: true, result: storage.getLlmConfig() });
+        break;
+      }
+      case "setLlmConfig": {
+        const [patch] = args as [Parameters<typeof storage.setLlmConfig>[0]];
+        reply({ id, ok: true, result: storage.setLlmConfig(patch) });
+        break;
+      }
       case "addMessage": {
         const [sessionId, role, content] = args as [string, string, string | unknown[]];
         reply({ id, ok: true, result: storage.addMessage(sessionId, role, content) });

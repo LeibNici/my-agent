@@ -80,6 +80,42 @@ describe("getOrCreateAppSecret / regenerateAppSecret（2026-07-14，DB 取代文
   });
 });
 
+describe("getLlmConfig / setLlmConfig（2026-07-14，Admin 页面配置 LLM 取代 .env 权限踩坑）", () => {
+  it("没有任何行时返回 null，而不是自动生成——api key 绝不能被静默创造", () => {
+    expect(storage.getLlmConfig()).toBeNull();
+  });
+
+  it("setLlmConfig 首次写入：四个字段原样落库", () => {
+    const row = storage.setLlmConfig({
+      apiKey: "sk-test-123",
+      baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic",
+      model: "qwen3.7-plus",
+      maxTokens: 8192,
+    });
+    expect(row.api_key).toBe("sk-test-123");
+    expect(row.base_url).toBe("https://dashscope.aliyuncs.com/apps/anthropic");
+    expect(row.model).toBe("qwen3.7-plus");
+    expect(row.max_tokens).toBe(8192);
+    expect(storage.getLlmConfig()).toEqual(row);
+  });
+
+  it("partial patch 合并到已有行：只传 model，其余字段（含 api_key）原样保留，不被清空", () => {
+    storage.setLlmConfig({ apiKey: "sk-original", baseUrl: "https://a.example", model: "old-model", maxTokens: 4096 });
+    const updated = storage.setLlmConfig({ model: "new-model" });
+    expect(updated.model).toBe("new-model");
+    expect(updated.api_key).toBe("sk-original");
+    expect(updated.base_url).toBe("https://a.example");
+    expect(updated.max_tokens).toBe(4096);
+  });
+
+  it("再次 setLlmConfig 是 UPSERT，不是插入第二行（singleton row）", () => {
+    storage.setLlmConfig({ apiKey: "sk-1" });
+    storage.setLlmConfig({ apiKey: "sk-2" });
+    const row = storage.getLlmConfig();
+    expect(row!.api_key).toBe("sk-2");
+  });
+});
+
 describe("addMessage / getMessages（test_message_codec goldens 对齐）", () => {
   it("纯字符串原样存取", () => {
     storage.addMessage("s1", "assistant", "普通回答");

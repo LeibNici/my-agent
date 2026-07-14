@@ -273,6 +273,27 @@ export function initSchema(dbPath: string): void {
     )
   `);
 
+  // Admin-editable LLM provider config (2026-07-14, production P0: a host-side
+  // permission mismatch on engine/.env made the real ANTHROPIC_* env vars
+  // silently unreadable, and the app degraded to empty/wrong defaults with no
+  // loud failure — see main.ts's post-load check). A singleton row (CHECK
+  // id=1) rather than app_secrets' name/value shape: max_tokens needs a real
+  // INTEGER column, not a re-parsed string, and these four fields are one
+  // logical config object an admin edits together, not independent secrets.
+  // NULL columns mean "not set here, fall back to .env/hardcoded defaults"
+  // (see config.ts's loadSettings + main.ts's post-load override) — this
+  // table is an override layer, not the sole source of truth.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS llm_config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      api_key TEXT,
+      base_url TEXT,
+      model TEXT,
+      max_tokens INTEGER,
+      updated_at TEXT NOT NULL
+    )
+  `);
+
   // Create indexes
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)"
