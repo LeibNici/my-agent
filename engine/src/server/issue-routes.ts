@@ -22,7 +22,6 @@ import { userOwnsSession, type CurrentUser } from "./sse.js";
 import {
   getRepoLabels,
   normalizeLabels,
-  isGithubHosted,
   submitRepoIssue,
   applyRepoIssueAction,
   searchRepoIssues,
@@ -221,13 +220,18 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     const vocabulary = await getRepoLabels(repo);
     if (vocabulary !== null) {
       labels = normalizeLabels(labels, vocabulary).accepted;
-    } else if (!isGithubHosted(repo)) {
-      // GitLab governance is unavailable right now (API outage/auth
-      // issue, not "no labels configured") — don't pass the model's
-      // un-validated free-form labels straight through. GitHub has no
-      // equivalent governance at all (getRepoLabels always returns null
-      // for it), so its labels pass through untouched either way — this
-      // branch must stay GitLab-only, mirroring v1's asymmetry exactly.
+    } else {
+      // Codex full-repo review (2026-07-14, production QA): getRepoLabels
+      // used to always return null for GitHub (label vocabulary fetching
+      // was GitLab-only by design — see that function's own comment for
+      // the fix), so this branch used to be GitLab-only too: GitHub's
+      // labels always passed straight through untouched, since there was
+      // never any governance to fall back to.  Now that GitHub has a real
+      // vocabulary fetch of its own, a null here means the SAME thing for
+      // both platforms — governance temporarily unavailable (API outage/
+      // auth issue, not "no labels configured") — so both platforms get
+      // the same fail-closed treatment instead of passing the model's
+      // un-validated free-form labels straight through.
       labels = [];
     }
 

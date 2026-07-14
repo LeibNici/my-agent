@@ -640,6 +640,64 @@ describe("POST /api/issues/submit", () => {
     // only the normalized/accepted labels, never the raw un-validated input.
     expect(sentBody.labels).toBe("Type::Bug,Urgency::High");
   });
+
+  // Codex full-repo review (2026-07-14, production QA): label vocabulary
+  // fetching used to be GitLab-only by design (getRepoLabels always
+  // returned null for GitHub), so this route's "vocabulary unavailable ->
+  // strip all labels" fail-closed branch used to be GitLab-only too —
+  // GitHub's labels always passed straight through untouched regardless of
+  // whether the vocabulary was genuinely unavailable. Confirmed in
+  // production: a nonexistent label on a GitHub-hosted draft was
+  // submittable unchanged. These two tests prove GitHub now gets the exact
+  // same governance GitLab already had.
+  it("GitHub repo: 标签词表真实可用 -> 未知标签在提交前被剔除（不再是 GitHub 专属的“直接放行”）", async () => {
+    const { token } = await seedUser("admin", "submit-admin-github-labels");
+    const repoId = await seedRepo({ url: "https://github.com/acme/widget.git", credToken: "ghp_test_token" });
+    const fetchMock = stubFetch([
+      { when: isLabelsGet, status: 200, body: [{ name: "type::bug" }, { name: "module::MES" }] },
+      { when: isIssuesCreate, status: 201, body: { number: 1, html_url: "https://github.com/acme/widget/issues/1", title: "T" } },
+    ]);
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/issues/submit", {
+      method: "POST",
+      body: JSON.stringify({
+        repo_id: repoId,
+        title: "Bug title",
+        body: "Bug body",
+        labels: ["type::bug", "qa::nonexistent-0714"],
+      }),
+    });
+    expect(resp.status).toBe(200);
+
+    const createCall = findFetchCall(fetchMock, isIssuesCreate);
+    const sentBody = JSON.parse(createCall.init.body as string);
+    // GitHub wants an array (submitGithubIssue), unlike GitLab's comma string.
+    expect(sentBody.labels).toEqual(["type::bug"]);
+  });
+
+  it("GitHub repo: 标签词表拉取失败（API 出错，无历史缓存）-> 所有标签在提交前被清空，不再未经校验直接透传", async () => {
+    const { token } = await seedUser("admin", "submit-admin-github-labels-unavailable");
+    const repoId = await seedRepo({ url: "https://github.com/acme/widget.git", credToken: "ghp_test_token" });
+    const fetchMock = stubFetch([
+      { when: isLabelsGet, status: 500, body: {} },
+      { when: isIssuesCreate, status: 201, body: { number: 2, html_url: "https://github.com/acme/widget/issues/2", title: "T" } },
+    ]);
+    const app = buildTestApp();
+    const resp = await authed(app, token, "/api/issues/submit", {
+      method: "POST",
+      body: JSON.stringify({
+        repo_id: repoId,
+        title: "Bug title",
+        body: "Bug body",
+        labels: ["type::bug", "qa::nonexistent-0714"],
+      }),
+    });
+    expect(resp.status).toBe(200);
+
+    const createCall = findFetchCall(fetchMock, isIssuesCreate);
+    const sentBody = JSON.parse(createCall.init.body as string);
+    expect(sentBody.labels).toEqual([]);
+  });
 });
 
 // ==================== POST /api/issues/action ====================

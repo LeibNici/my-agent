@@ -195,13 +195,62 @@ describe("normalizeLabels", () => {
 // ---------------------------------------------------------------------------
 
 describe("getRepoLabels", () => {
-  it("github 托管的仓库直接返回 null，不发任何请求", async () => {
-    const repo = makeRepo({ id: 601, url: "https://github.com/acme/widget.git" });
+  // Codex full-repo review (2026-07-14, production QA): label vocabulary
+  // fetching used to be GitLab-only by design — getRepoLabels always
+  // returned null for a GitHub-hosted repo without ever calling fetch, so
+  // an invalid label on a GitHub draft passed through completely
+  // unvalidated (confirmed in production: a nonexistent label showed no
+  // label_note and was submittable). These tests replace the old
+  // "GitHub always short-circuits" expectation with real GitHub Labels
+  // API coverage, mirroring the GitLab tests below.
+  it("github 托管的仓库真的调用 GitHub Labels API，返回真实标签词表", async () => {
+    const repo = makeRepo({ id: 601, url: "https://github.com/acme/widget.git", cred_token: "ghp_test_token" });
+    const names = ["bug", "type::bug", "module::MES"];
+    const fetchMock = vi.fn(async () => ({
+      status: 200,
+      json: async () => names.map((name) => ({ name })),
+    } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await getRepoLabels(repo);
+    expect(result).toEqual(names);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit & { headers: Record<string, string> }];
+    expect(url).toBe("https://api.github.com/repos/acme/widget/labels?per_page=100&page=1");
+    expect(init.headers.Authorization).toBe("token ghp_test_token");
+  });
+
+  it("github 分页：第一页恰好 100 条时继续拉第二页，并拼接全部标签名", async () => {
+    const repo = makeRepo({ id: 6011, url: "https://github.com/acme/widget.git", cred_token: "ghp_test_token" });
+    const page1 = Array.from({ length: 100 }, (_, i) => `label-${i}`);
+    const page2 = ["extra-0", "extra-1"];
+    const fetchMock = vi.fn(async (url: string) => {
+      const page = Number(new URL(url).searchParams.get("page"));
+      const names = page === 1 ? page1 : page2;
+      return { status: 200, json: async () => names.map((name) => ({ name })) } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await getRepoLabels(repo);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result).toEqual([...page1, ...page2]);
+  });
+
+  it("github 仓库没有配置 cred_token -> 直接返回 null，不发任何请求", async () => {
+    const repo = makeRepo({ id: 6012, url: "https://github.com/acme/widget.git", cred_token: null });
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     const result = await getRepoLabels(repo);
     expect(result).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("github Labels API 非 200 -> null（无历史缓存时）", async () => {
+    const repo = makeRepo({ id: 6013, url: "https://github.com/acme/widget.git", cred_token: "ghp_test_token" });
+    const fetchMock = vi.fn(async () => ({ status: 404, json: async () => ({}) } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await getRepoLabels(repo);
+    expect(result).toBeNull();
   });
 
   it("分页：第一页恰好 100 条时继续拉第二页，并拼接全部标签名", async () => {

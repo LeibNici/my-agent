@@ -11,9 +11,10 @@
 // only unambiguous case.
 //
 // Neither tool needs Settings (getRepoLabels/normalizeLabels are pure
-// GitLab-vocabulary lookups, no GitHub token or LLM settings involved) —
-// unlike semantic-search.ts, there's no module-level SETTINGS singleton
-// here.
+// tracker-vocabulary lookups — GitHub and GitLab both, as of the 2026-07-14
+// production QA fix; see issue-tracker-client.ts's getRepoLabels — no LLM
+// settings involved) — unlike semantic-search.ts, there's no module-level
+// SETTINGS singleton here.
 import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef, type ToolContext } from "./registry.js";
 import { getActiveRepo } from "./access.js";

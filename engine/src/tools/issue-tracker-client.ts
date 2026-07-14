@@ -38,6 +38,12 @@ const GITHUB_MUTATE_TIMEOUT_MS = 30_000; // v1's timeout=30 (issue create/commen
 const GITHUB_SEARCH_TIMEOUT_MS = 10_000; // v1's timeout=10
 const GITLAB_MUTATE_TIMEOUT_MS = 30_000; // v1's timeout=30 (issue create/note/state)
 const GITLAB_GET_TIMEOUT_MS = 15_000; // v1's timeout=15 (labels page, single-issue re-fetch)
+// Codex full-repo review (2026-07-14, production QA): no v1 precedent for
+// this one — v1 never fetched a GitHub label vocabulary at all (see
+// getRepoLabels's own comment on why that asymmetry existed). New
+// constant, not a port; matches GITLAB_GET_TIMEOUT_MS's tier since it's
+// the same kind of call (a paginated GET, not a mutation).
+const GITHUB_GET_TIMEOUT_MS = 15_000;
 const GITLAB_SEARCH_TIMEOUT_MS = 10_000; // v1's timeout=10
 const GITLAB_UPLOAD_TIMEOUT_MS = 60_000; // v1's timeout=60
 
@@ -172,22 +178,9 @@ type LabelsCacheEntry = { fetchedAt: number; labels: string[] };
 const LABELS_CACHE = new Map<number, LabelsCacheEntry>();
 const LABELS_TTL_MS = 600_000; // v1's _LABELS_TTL_SECONDS = 600
 
-/** Project's current label names, cached. null = vocabulary unavailable
- * (GitHub-hosted, fetch failed with no cache, or the fetch came back with
- * ZERO labels) — callers should then skip validation rather than reject
- * everything. A genuinely empty result is deliberately NOT cached: a real
- * GitLab project having zero labels is almost always transient (labels not
- * configured yet, a scope/permission hiccup on the token) rather than the
- * intended steady state, and caching it for the full TTL would silently
- * reject every label on every draft/submit for 10 minutes even after the
- * underlying cause is fixed. */
-export async function getRepoLabels(repo: FullRepoRow): Promise<string[] | null> {
-  if (isGithubHosted(repo)) return null;
-  const cached = LABELS_CACHE.get(repo.id);
-  if (cached && Date.now() - cached.fetchedAt < LABELS_TTL_MS) return cached.labels;
-
+async function fetchGitlabLabels(repo: FullRepoRow): Promise<string[] | null> {
   const { error, base } = await gitlabProjectApiBaseFromRepoUrl(repo.url, repo.cred_token);
-  if (error || !base) return cached ? cached.labels : null;
+  if (error || !base) return null;
 
   const names: string[] = [];
   try {
@@ -198,17 +191,70 @@ export async function getRepoLabels(repo: FullRepoRow): Promise<string[] | null>
         { headers: { "PRIVATE-TOKEN": repo.cred_token ?? "" } },
         GITLAB_GET_TIMEOUT_MS,
       );
-      if (resp.status !== 200) return cached ? cached.labels : null;
+      if (resp.status !== 200) return null;
       const batch = (await resp.json()) as Array<{ name: string }>;
       names.push(...batch.map((l) => l.name));
       if (batch.length < 100) break;
       page++;
     }
   } catch {
-    return cached ? cached.labels : null;
+    return null;
   }
+  return names;
+}
 
-  if (names.length === 0) return cached ? cached.labels : null;
+// Codex full-repo review (2026-07-14, production QA): label vocabulary
+// validation used to be GitLab-only by design (see the old comment this
+// replaced — v1 never fetched GitHub labels at all, and v2 deliberately
+// preserved that asymmetry rather than fixing it). Confirmed in production:
+// a nonexistent label (qa::nonexistent-0714) on a GitHub-hosted draft
+// showed no label_note and was submittable unchanged, because
+// getRepoLabels always returned null for GitHub, so normalizeLabels (below)
+// never ran at all. GitHub's REST API has the same kind of endpoint GitLab
+// does (GET /repos/{owner}/{repo}/labels) — nothing platform-specific
+// blocked this, it just was never implemented.
+async function fetchGithubLabels(repo: FullRepoRow): Promise<string[] | null> {
+  if (!repo.cred_token) return null;
+  const parsed = parseOwnerRepo(repo.url);
+  if (!parsed) return null;
+
+  const names: string[] = [];
+  try {
+    let page = 1;
+    for (;;) {
+      const resp = await fetchWithTimeout(
+        `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/labels?per_page=100&page=${page}`,
+        { headers: githubHeaders(repo.cred_token) },
+        GITHUB_GET_TIMEOUT_MS,
+      );
+      if (resp.status !== 200) return null;
+      const batch = (await resp.json()) as Array<{ name: string }>;
+      names.push(...batch.map((l) => l.name));
+      if (batch.length < 100) break;
+      page++;
+    }
+  } catch {
+    return null;
+  }
+  return names;
+}
+
+/** Project's current label names, cached. null = vocabulary unavailable
+ * (fetch failed with no cache, or the fetch came back with ZERO labels) —
+ * callers should then skip validation rather than reject everything. A
+ * genuinely empty result is deliberately NOT cached: a real project having
+ * zero labels is almost always transient (labels not configured yet, a
+ * scope/permission hiccup on the token) rather than the intended steady
+ * state, and caching it for the full TTL would silently reject every label
+ * on every draft/submit for 10 minutes even after the underlying cause is
+ * fixed. */
+export async function getRepoLabels(repo: FullRepoRow): Promise<string[] | null> {
+  const cached = LABELS_CACHE.get(repo.id);
+  if (cached && Date.now() - cached.fetchedAt < LABELS_TTL_MS) return cached.labels;
+
+  const names = isGithubHosted(repo) ? await fetchGithubLabels(repo) : await fetchGitlabLabels(repo);
+  if (!names || names.length === 0) return cached ? cached.labels : null;
+
   LABELS_CACHE.set(repo.id, { fetchedAt: Date.now(), labels: names });
   return names;
 }

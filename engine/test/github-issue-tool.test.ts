@@ -139,7 +139,7 @@ describe("draftIssueTool (name draft_issue)", () => {
     });
   });
 
-  describe("vocabulary unavailable (getRepoLabels -> null, e.g. GitHub-hosted repo or fetch failure)", () => {
+  describe("vocabulary unavailable (getRepoLabels -> null, e.g. a real fetch failure/API outage — both GitHub and GitLab can genuinely fetch a vocabulary as of the 2026-07-14 production QA fix, so this is no longer GitHub-specific)", () => {
     it("passes labels through UNCHANGED from the input and omits label_note", async () => {
       mockedGetRepoLabels.mockResolvedValue(null);
       const result = await draftIssueTool.execute(
