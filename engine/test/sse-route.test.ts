@@ -1005,6 +1005,60 @@ describe("auth middleware — 401 shape matches v1 FastAPI's {detail: ...}", () 
   });
 });
 
+// Codex full-repo review (2026-07-14, Warning): login/webhook handlers used
+// to buffer the FULL request body before any auth/signature check ran —
+// an unauthenticated caller could force arbitrary memory allocation with
+// zero credentials. Body-limit middleware now runs before auth, uniformly.
+describe("body size limit — Codex 全仓审查 Warning", () => {
+  it("超出默认上限（Content-Length 声明值即可判定，不需要真的发那么多字节）→ 413，且不到达路由处理器", async () => {
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await app.request("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(10 * 1024 * 1024) },
+      body: JSON.stringify({ username: "whoever", password: "whatever" }),
+    });
+    expect(resp.status).toBe(413);
+  });
+
+  it("webhook 路由（无需 JWT）同样受限 — 鉴权豁免不等于 body 大小豁免", async () => {
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await app.request("/api/webhooks/github", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(10 * 1024 * 1024) },
+      body: "{}",
+    });
+    expect(resp.status).toBe(413);
+  });
+
+  it("普通 JSON 路由请求在默认上限内 → 正常放行", async () => {
+    const { token } = await seedUser();
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const resp = await authedRequest(app, token, "/api/sessions");
+    expect(resp.status).toBe(200);
+  });
+
+  it("/api/chat 有单独更大的上限（默认上限本身放不下一张图片）", async () => {
+    const { token } = await seedUser();
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([{ type: "done", data: { text: "ok", success: true, budgetExhausted: false } }]),
+    });
+    // Bigger than the default 2MB cap, but within the chat-specific one —
+    // proves the two routes genuinely have different limits, not that the
+    // default limit was just set too high everywhere. Drains the SSE
+    // stream via .text() (same as postChat) so it finishes before the
+    // test's own afterEach tears down the db client out from under it.
+    const resp = await authedRequest(app, token, "/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(3 * 1024 * 1024) },
+      body: JSON.stringify({ message: "x" }),
+    });
+    await resp.text();
+    expect(resp.status).not.toBe(413);
+  });
+});
+
 // Codex full-repo review (2026-07-14, Critical #1): must_change_password
 // used to be surfaced ONLY in the login response for the frontend to react
 // to — the blanket /api/* middleware never checked it, so a JWT for an

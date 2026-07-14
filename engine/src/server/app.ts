@@ -12,6 +12,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { serveStatic } from "@hono/node-server/serve-static";
 import * as fs from "node:fs";
@@ -174,6 +175,25 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
       credentials: true,
     })
   );
+
+  // ==================== Body size limit ====================
+  // Codex full-repo review (2026-07-14, Warning): login and webhook
+  // handlers buffered the FULL request body (c.req.json()/c.req.text())
+  // BEFORE any auth/signature check ever ran — an unauthenticated caller
+  // could force the server to allocate memory for an arbitrarily large
+  // body with zero credentials. Mounted before the auth middleware below
+  // so it applies uniformly to every /api/* route, including the two that
+  // bypass auth (login, webhooks). hono/body-limit checks Content-Length
+  // when present and otherwise enforces the cap while streaming, so a
+  // client can't dodge it by omitting the header. Chat gets a much larger
+  // budget (up to 5 images at MAX_IMAGE_BASE64_CHARS each, see sse.ts) —
+  // everything else this app sends is plain JSON, orders of magnitude
+  // smaller.
+  const defaultBodyLimit = bodyLimit({ maxSize: 2 * 1024 * 1024 });
+  const chatBodyLimit = bodyLimit({
+    maxSize: MAX_IMAGES_PER_MESSAGE * MAX_IMAGE_BASE64_CHARS + 1024 * 1024,
+  });
+  app.use("/api/*", (c, next) => (c.req.path === "/api/chat" ? chatBodyLimit : defaultBodyLimit)(c, next));
 
   // ==================== Auth ====================
   // One blanket middleware over /api/* (except the login route itself,
