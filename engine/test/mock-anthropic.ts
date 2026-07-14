@@ -33,7 +33,24 @@ export type RecordedRequest = { at: number; body: unknown };
 export type MockServer = {
   url: string;
   requests: RecordedRequest[];
+  // Populated (by request index, 0-based) when startMock's delayRequestIndex
+  // option is set and that specific request's underlying TCP connection
+  // closed BEFORE the (deliberately delayed) response finished writing —
+  // i.e. the client actually aborted the in-flight request rather than
+  // merely discarding an already-complete response. Test 9's real proof
+  // that an AbortSignal reaches all the way down to the fetch, not just
+  // "the consumer stopped reading."
+  abortedRequestIndexes: number[];
   close: () => Promise<void>;
+};
+
+export type StartMockOptions = {
+  // Delays writing the response for exactly this request index (0-based)
+  // by delayMs — gives a test a real window to abort mid-flight and
+  // observe the connection actually torn down, instead of a response
+  // that's already fully sent by the time any abort could matter.
+  delayRequestIndex?: number;
+  delayMs?: number;
 };
 
 /** A single-content-block assistant turn that ends in plain text. */
@@ -142,8 +159,9 @@ export function textThenToolTurn(
  * it leaves the original "exhausted mid-script ⇒ fallback text" behavior for
  * non-empty scripts untouched.
  */
-export function startMock(turns: SseEvent[][]): MockServer {
+export function startMock(turns: SseEvent[][], opts: StartMockOptions = {}): MockServer {
   const requests: RecordedRequest[] = [];
+  const abortedRequestIndexes: number[] = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
@@ -158,21 +176,34 @@ export function startMock(turns: SseEvent[][]): MockServer {
       const requestIndex = requests.length;
       requests.push({ at: Date.now(), body });
 
-      if (turns.length === 0) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({
-          type: "error",
-          error: { type: "internal_server_error", message: "mock: no turns configured" },
-        }));
-        return;
-      }
+      const writeResponse = () => {
+        if (turns.length === 0) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            type: "error",
+            error: { type: "internal_server_error", message: "mock: no turns configured" },
+          }));
+          return;
+        }
 
-      const turn = turns[requestIndex] ?? textTurn("(script exhausted)");
-      res.writeHead(200, { "content-type": "text/event-stream" });
-      for (const ev of turn) {
-        res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+        const turn = turns[requestIndex] ?? textTurn("(script exhausted)");
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        for (const ev of turn) {
+          res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+        }
+        res.end();
+      };
+
+      if (opts.delayRequestIndex === requestIndex && opts.delayMs) {
+        req.on("close", () => {
+          if (!res.writableEnded) abortedRequestIndexes.push(requestIndex);
+        });
+        setTimeout(() => {
+          if (!res.writableEnded) writeResponse();
+        }, opts.delayMs);
+      } else {
+        writeResponse();
       }
-      res.end();
     });
   });
   server.listen(0);
@@ -181,6 +212,7 @@ export function startMock(turns: SseEvent[][]): MockServer {
   return {
     url,
     requests,
+    abortedRequestIndexes,
     close: () => new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
   };
 }

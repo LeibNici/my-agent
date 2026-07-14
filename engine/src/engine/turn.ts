@@ -257,6 +257,7 @@ async function runWrapup(
   settings: Settings,
   transcript: Message[],
   channel: { put(e: DomainEvent): void },
+  signal: AbortSignal,
 ): Promise<void> {
   const wrapupMessage: Message = {
     role: "user",
@@ -271,6 +272,18 @@ async function runWrapup(
     {
       apiKey: settings.apiKey,
       maxTokens: WRAPUP_MAX_TOKENS,
+      // Codex full-repo review (2026-07-14, Warning): this call bypasses
+      // the Agent entirely (see file header) — Agent.abort() (called in
+      // runTurn's finally on client disconnect) only ever aborts
+      // Agent.activeRun's OWN AbortController, which the Agent tears down
+      // in its own finally as soon as agent.prompt() settles, before this
+      // wrap-up call even starts. Without wiring a signal here, a client
+      // disconnecting during the wrap-up call left its fetch to
+      // Anthropic/DashScope running to completion in the background,
+      // spending real API cost for a response nothing was left consuming.
+      // runTurn hands this a SEPARATE AbortController it owns for exactly
+      // this call, aborted in the same finally alongside agent.abort().
+      signal,
       // Same off-switch as buildModelSetup's streamFn — this call bypasses
       // the Agent entirely (see file header), so the wiring has to be
       // repeated here rather than inherited.
@@ -351,6 +364,14 @@ export type RunTurnFn = (deps: RunTurnDeps, req: RunTurnRequest) => AsyncGenerat
 
 export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGenerator<DomainEvent> {
   const { settings, tools, ctx } = deps;
+  // Codex full-repo review (2026-07-14, Warning): owned separately from
+  // Agent's own internal AbortController — that one gets torn down by the
+  // Agent as soon as agent.prompt() settles (finishRun's own finally),
+  // which is BEFORE the wrap-up call below even starts, so agent.abort()
+  // alone can't reach it. Aborted alongside agent.abort() in the finally
+  // below, so a client disconnect during the wrap-up call actually cancels
+  // its upstream fetch too, not just the Agent's own in-flight call.
+  const wrapupAbort = new AbortController();
   const setup = buildModelSetup(settings);
   const adapter = createEventAdapter({ model: settings.model });
 
@@ -437,7 +458,7 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
       // CustomAgentMessages), so this is also the type-correct way to get a
       // Message[] for the wrap-up Context.
       const transcript = await agent.convertToLlm(agent.state.messages);
-      await runWrapup(setup, settings, transcript, channel);
+      await runWrapup(setup, settings, transcript, channel, wrapupAbort.signal);
     })
     .then(
       () => channel.close(),
@@ -451,16 +472,22 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
   // agent.prompt() (LLM call + tool loop) keeps running server-side with
   // nothing consuming its output. agent.abort() is a documented no-op if
   // the run has already finished normally, so this is safe on every exit
-  // path, not just the early one. `run` itself can't reject (its own
-  // .then(onFulfilled, onRejected) above already funnels every failure,
-  // abort included, into channel.close(err)) — the .catch is defensive
-  // only, so callers awaiting engineIter.return() see this fully settled
-  // before their own await resolves.
+  // path, not just the early one. wrapupAbort.abort() covers the OTHER
+  // in-flight call this finally needs to reach: once agent.prompt()
+  // settles, the Agent tears down its own AbortController before the
+  // wrap-up call (above) even starts, so agent.abort() alone can't cancel
+  // it — a disconnect during wrap-up needs this separate controller.
+  // `run` itself can't reject (its own .then(onFulfilled, onRejected)
+  // above already funnels every failure, abort included, into
+  // channel.close(err)) — the .catch is defensive only, so callers
+  // awaiting engineIter.return() see this fully settled before their own
+  // await resolves.
   try {
     yield* channel.drain();
     await run;
   } finally {
     agent.abort();
+    wrapupAbort.abort();
     await run.catch(() => {});
   }
 }

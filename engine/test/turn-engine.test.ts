@@ -181,6 +181,67 @@ describe("runTurn — turn engine (Task 4)", () => {
     await mock.close();
   });
 
+  // Codex full-repo review (2026-07-14, Warning): the wrap-up call
+  // (runWrapup) bypasses the Agent entirely, so agent.abort() in runTurn's
+  // finally — the mechanism a client disconnect relies on to cancel the
+  // Agent's own in-flight LLM call — used to be a no-op for THIS call: by
+  // the time wrap-up starts, the Agent has already torn down its own
+  // AbortController in its own finally. Without a signal of its own, a
+  // disconnect during wrap-up left the upstream fetch running to
+  // completion in the background, wasting real API cost for a response
+  // nothing was left consuming. Proven end-to-end against a REAL mock HTTP
+  // server (not a stubbed engine) — delays exactly the wrap-up request so
+  // there's a genuine window to abort mid-flight, then checks the mock
+  // observed the underlying TCP connection actually torn down, not merely
+  // "the consumer stopped reading an already-complete response."
+  it("9. client 断连发生在 wrap-up 请求进行中 -> wrap-up 自己的上游请求也被真正取消，不是只停止消费", async () => {
+    const turns = exhaustingTurns();
+    // Long delay relative to the poll/assert windows below — gives a wide,
+    // unambiguous margin for "genuinely still in flight" rather than a
+    // coincidence of timing.
+    const mock = startMock(turns, { delayRequestIndex: 8, delayMs: 5000 });
+    const settings = testSettings({ baseUrl: mock.url, maxToolIterations: 8 });
+    const gen = runTurn(
+      { settings, tools: [calculatorTool], ctx: EMPTY_CTX },
+      { sessionId: "s1", history: [], userText: "查" },
+    );
+
+    // makeChannel's put() is non-blocking (plain array push, no
+    // backpressure — see turn.ts) — the Agent's own tool loop and the
+    // eventual wrap-up call are driven entirely by real HTTP round-trips
+    // to the mock, independent of whether this test is consuming events.
+    // A single .next() call is enough to kick off runTurn's (lazy) async
+    // generator body; after that, polling mock.requests.length directly
+    // (NOT via more .next() calls, which would block waiting for the next
+    // channel item — i.e. until the delayed wrap-up response actually
+    // starts arriving, defeating the point of aborting mid-flight) lets
+    // this test observe "the wrap-up request has been sent" well before
+    // its artificially delayed response would ever arrive.
+    void gen.next();
+
+    const start = Date.now();
+    while (mock.requests.length < 9 && Date.now() - start < 2000) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // Reached with ~4.5s+ still left on the mock's 5s delay — genuinely
+    // mid-flight, not a race against the response arriving.
+    expect(mock.requests.length).toBe(9);
+
+    // Simulate sse.ts's raceAbort calling engineIter.return() on client
+    // disconnect, mid-wrap-up.
+    const returnStart = Date.now();
+    await gen.return(undefined);
+    const returnElapsed = Date.now() - returnStart;
+
+    // Resolved promptly — nowhere near the mock's 5s artificial delay —
+    // proving the wrap-up's own fetch was actually aborted rather than
+    // awaited to completion in the background.
+    expect(returnElapsed).toBeLessThan(2000);
+    expect(mock.abortedRequestIndexes).toContain(8);
+
+    await mock.close();
+  });
+
   it("6. 每 turn 新 Agent：连续两次 runTurn，第二次的请求体只来自入参 history（无第一 turn 残留）", async () => {
     const mock: MockServer = startMock([textTurn("第一轮回复"), textTurn("第二轮回复")]);
     const settings = testSettings({ baseUrl: mock.url });
