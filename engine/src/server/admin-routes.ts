@@ -20,6 +20,7 @@
 // (127.0.0.1/bare local paths are exactly what that gate exists to
 // block) — see repo-sync.test.ts's own header comment for why that split
 // exists; this is the same pattern, reused rather than re-invented.
+import * as fs from "node:fs";
 import type { Hono, Context } from "hono";
 import type { DbClient } from "../db/client.js";
 import type { Settings } from "../config.js";
@@ -28,6 +29,7 @@ import type { Env } from "./app.js";
 import {
   syncAndPersist as realSyncAndPersist,
   maskUrlCredentials,
+  getRepoLocalPath,
   type SyncAndPersistOptions,
 } from "../repo-sync.js";
 import { hashPassword } from "../auth.js";
@@ -315,6 +317,21 @@ export function mountAdminRoutes(app: Hono<Env>, deps: AdminRoutesDeps): void {
     const repo = Number.isFinite(repoId) ? await deps.db.getRepoAdmin(repoId) : null;
     if (!repo) return c.json({ detail: "Repo not found" }, 404);
     await deps.db.deleteRepo(repoId);
+    // Codex full-repo review (2026-07-14, Warning): deleteRepo only ever
+    // dropped the DB row (matching v1's delete_repo exactly — see
+    // storage.ts) — the local git checkout under reposDir/<id> was never
+    // cleaned up, so a "removed" repo's actual source stayed readable on
+    // disk indefinitely, and disk usage grew unboundedly across
+    // delete+re-add cycles (repo ids are never reused). The DB delete
+    // itself is fine on the credential side (cred_token is a column on the
+    // now-deleted row, genuinely erased) — this only needed to catch up on
+    // the filesystem side. Best-effort: a failure here (e.g. permission
+    // issue) must not turn an already-committed DB delete into a 500.
+    try {
+      fs.rmSync(getRepoLocalPath(deps.settings.reposDir, repoId), { recursive: true, force: true });
+    } catch (err) {
+      console.warn(`repo ${repoId} deleted from DB but local checkout cleanup failed:`, err);
+    }
     return c.json({ ok: true });
   });
 

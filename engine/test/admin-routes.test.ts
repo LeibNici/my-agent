@@ -18,7 +18,7 @@ import { loadSettings, type Settings } from "../src/config.js";
 import { createToken, hashPassword } from "../src/auth.js";
 import { buildApp, type BuildAppDeps } from "../src/server/app.js";
 import type { RunTurnFn } from "../src/engine/turn.js";
-import { __internal } from "../src/repo-sync.js";
+import { __internal, getRepoLocalPath } from "../src/repo-sync.js";
 import type { SyncAndPersistFn } from "../src/server/admin-routes.js";
 
 const noopEngine: RunTurnFn = async function* () {};
@@ -490,6 +490,31 @@ describe("repos", () => {
     const app = buildTestApp();
     const resp = await authed(app, token, "/api/admin/repos/999999", { method: "DELETE" });
     expect(resp.status).toBe(404);
+  });
+
+  it("DELETE 也清理本地 checkout 目录（Codex 全仓库审查，2026-07-14，Warning：以前只删 DB 行，本地代码永久留在磁盘上）", async () => {
+    const { token } = await seedUser("admin");
+    const repoId = await client.createRepo({ name: "r1", url: "https://example.com/r1.git" });
+    const localPath = getRepoLocalPath(reposDir, repoId);
+    mkdirSync(localPath, { recursive: true });
+    writeFileSync(join(localPath, "sentinel.txt"), "should be gone after delete");
+    expect(existsSync(localPath)).toBe(true);
+
+    const app = buildTestApp();
+    const resp = await authed(app, token, `/api/admin/repos/${repoId}`, { method: "DELETE" });
+    expect(resp.status).toBe(200);
+    expect(existsSync(localPath)).toBe(false);
+  });
+
+  it("DELETE 对本来就没有本地 checkout 目录的 repo 仍然正常成功（不因为 ENOENT 报错）", async () => {
+    const { token } = await seedUser("admin");
+    const repoId = await client.createRepo({ name: "r1", url: "https://example.com/r1-never-synced.git" });
+    expect(existsSync(getRepoLocalPath(reposDir, repoId))).toBe(false);
+
+    const app = buildTestApp();
+    const resp = await authed(app, token, `/api/admin/repos/${repoId}`, { method: "DELETE" });
+    expect(resp.status).toBe(200);
+    expect(await resp.json()).toEqual({ ok: true });
   });
 
   it("POST /:id/sync manually re-syncs (real git)", async () => {
