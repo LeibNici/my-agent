@@ -150,6 +150,37 @@ async function fetchGitlabStateEvents(
   return { reopenCount: reopens, lastClosedAt };
 }
 
+// 生产 QA 复测（2026-07-14）：GitHub 路径的 reopen_count 从功能上线起就
+// 一直硬编码传 0（从未真正计算过，不是回归——deriveStatus(remoteState,
+// labels, 0) 这行字面量 0 从 pollGithub 和 fetchGitlabStateEvents 同一次提
+// 交起就是这样）。GitHub REST API 没有 GitLab resource_state_events 那样
+// 专门的状态事件端点，但有 Timeline API（/issues/{n}/timeline），事件里
+// 类型为 "reopened" 的条目就是每一次重新打开——镜像
+// fetchGitlabStateEvents 的分页/计数写法，让 GitHub 也有真实的重开计数，
+// 而不是永远停在初始值。
+async function fetchGithubTimelineReopens(
+  owner: string,
+  repoName: string,
+  issueNumber: number,
+  token: string,
+): Promise<number> {
+  let reopens = 0;
+  for (let page = 1; page <= EVENTS_MAX_PAGES; page++) {
+    const resp = await fetchWithTimeout(
+      `https://api.github.com/repos/${owner}/${repoName}/issues/${issueNumber}/timeline?per_page=100&page=${page}`,
+      { headers: githubHeaders(token) },
+      POLL_TIMEOUT_MS,
+    );
+    if (resp.status !== 200) break; // degrade to snapshot-only, same posture as the GitLab path
+    const events = (await resp.json()) as Array<{ event?: string }>;
+    for (const ev of events) {
+      if (ev.event === "reopened") reopens++;
+    }
+    if (events.length < 100) break;
+  }
+  return reopens;
+}
+
 /** Pulls the issue's comments and persists every codex-report/v1 marker.
  * Keyed by note_id (upsertFixReport's ON CONFLICT), so re-polling is
  * idempotent and a re-fix after reopen adds a second report instead of
@@ -309,12 +340,15 @@ async function pollGithub(
     typeof l === "object" && l !== null ? String(l.name) : String(l),
   );
 
+  const reopenCount = await fetchGithubTimelineReopens(owner, repoName, sub.issue_number, token);
+
   await db.updateIssueTracking(
     sub.id,
     {
-      trackStatus: deriveStatus(remoteState, labels, 0),
+      trackStatus: deriveStatus(remoteState, labels, reopenCount),
       remoteState,
       remoteLabels: JSON.stringify(labels),
+      reopenCount,
       closedAt: data.closed_at || undefined,
       clearError: true,
     },

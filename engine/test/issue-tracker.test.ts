@@ -415,23 +415,93 @@ describe("pollTrackedIssues", () => {
       issueUrl: "https://github.com/acme/widgets/issues/42",
     });
 
-    const fetchMock = vi.fn(async () => ({
-      status: 200,
-      json: async () => ({ state: "open", labels: ["bug"], closed_at: null }),
-    })) as unknown as typeof fetch;
+    // Codex 全仓库审查（2026-07-14，生产 QA 复测）：pollGithub 现在还会额外
+    // 调一次 Timeline API（/timeline）算真实的 reopen 次数，不再是硬编码的
+    // 0——mock 按 URL 区分两个端点，而不是不管什么请求都返回同一个 issue
+    // 详情形状（真实 Timeline 响应是数组，不是 issue 详情那样的对象）。
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/timeline")) {
+        return { status: 200, json: async () => [] } as unknown as Response;
+      }
+      return {
+        status: 200,
+        json: async () => ({ state: "open", labels: ["bug"], closed_at: null }),
+      } as unknown as Response;
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     await pollTrackedIssues(client, settings);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = (fetchMock as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit & { headers: Record<string, string> }];
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const issueCall = fetchMock.mock.calls.find(([u]) => !String(u).includes("/timeline"))!;
+    const [url, init] = issueCall as [string, RequestInit & { headers: Record<string, string> }];
     expect(url).toBe("https://api.github.com/repos/acme/widgets/issues/42");
     expect(init.headers.Authorization).toBe("token repo-own-github-token");
+    const timelineCall = fetchMock.mock.calls.find(([u]) => String(u).includes("/timeline"))!;
+    expect(timelineCall[0]).toBe("https://api.github.com/repos/acme/widgets/issues/42/timeline?per_page=100&page=1");
 
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_status).toBe("submitted");
     expect(raw.remote_state).toBe("opened");
     expect(JSON.parse(raw.remote_labels)).toEqual(["bug"]);
+    expect(raw.reopen_count).toBe(0);
+  });
+
+  // 生产 QA 复测（2026-07-14）：外部在 GitHub 上重开一个 issue 后，webhook
+  // 回调正常触发 pollGithub 重新轮询，状态从"已关闭"正确变回"已提报"，但
+  // reopen 计数一直停在 0——因为 pollGithub 从功能上线起就一直硬编码传 0
+  // 给 deriveStatus，从没真的算过。这条测试还原完整场景：仓库当前是
+  // opened（真实重开后的状态），Timeline API 返回一条真实的 reopened
+  // 事件，验证 reopen_count 落库为 1，而不是永远的 0。
+  it("GitHub issue 真实被重开过一次 -> Timeline API 返回一条 reopened 事件，reopen_count 落库为 1（不再永远是 0）", async () => {
+    const settings = makeSettings();
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://github.com/acme/widgets.git",
+      credToken: "repo-own-github-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 42,
+      issueUrl: "https://github.com/acme/widgets/issues/42",
+    });
+    // 预先埋一个"曾经是 closed"的旧状态，证明重开后不仅状态会变，
+    // reopen_count 也会真的从 0 变成非 0。
+    await client.updateIssueTracking(
+      subId,
+      { trackStatus: "closed", remoteState: "closed", reopenCount: 0 },
+      await client.beginPoll(subId),
+    );
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/timeline")) {
+        return {
+          status: 200,
+          json: async () => [
+            { event: "closed", created_at: "2026-07-10T08:00:00Z" },
+            { event: "reopened", created_at: "2026-07-14T09:00:00Z" },
+            { event: "commented", created_at: "2026-07-14T09:05:00Z" },
+          ],
+        } as unknown as Response;
+      }
+      return {
+        status: 200,
+        json: async () => ({ state: "open", labels: [], closed_at: null }),
+      } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollSubmissionById(client, subId, settings);
+
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.reopen_count).toBe(1);
+    expect(raw.track_status).toBe("reopened"); // deriveStatus: reopenCount > 0 优先于 labels 判断
+    expect(raw.remote_state).toBe("opened");
   });
 
   it("issue_url 是 github.com 但主机与仓库当前 url 不一致 -> 护栏拦截，不发请求（GitHub 现在和 GitLab 走同一条主机匹配规则）", async () => {
@@ -733,15 +803,20 @@ describe("pollSubmissionById", () => {
       issueUrl: "https://github.com/acme/widgets/issues/42",
     });
 
-    const fetchMock = vi.fn(async () => ({
-      status: 200,
-      json: async () => ({ state: "closed", labels: [], closed_at: "2026-07-13 10:00:00.000000" }),
-    })) as unknown as typeof fetch;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/timeline")) {
+        return { status: 200, json: async () => [] } as unknown as Response;
+      }
+      return {
+        status: 200,
+        json: async () => ({ state: "closed", labels: [], closed_at: "2026-07-13 10:00:00.000000" }),
+      } as unknown as Response;
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     await pollSubmissionById(client, subId, makeSettings());
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_status).toBe("closed");
     expect(raw.remote_state).toBe("closed");
