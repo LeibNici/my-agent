@@ -7,7 +7,5 @@ node_modules/
 .env
 .jwt_secret
 .ccg/
-deploy/auto-deploy.log
-deploy/.last-deployed-sha
 engine/.git-sha
 /data/

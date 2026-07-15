@@ -27,7 +27,14 @@ services:
       # File-bind-mounts — the host-side file must already exist (Docker
       # creates a directory instead of erroring if it doesn't), see the
       # deploy step that touches these before the first `docker compose up`.
-      - ./data/agent_data.db:/app/agent_data.db
-      - ./data/jwt_secret:/app/.jwt_secret
-      - ./data/repos:/data/repos
-      - ./engine/.env:/app/engine/.env:ro
+      #
+      # Paths go through MY_AGENT_DATA_DIR (default ./data, unchanged for
+      # local/dev use) rather than being hardcoded relative to this file —
+      # deploy.sh now builds from a throwaway clone that gets deleted right
+      # after `docker compose build`/`up -d` run (2026-07-15, see deploy.sh),
+      # so the real data/secrets must live at a host path that outlives that
+      # directory, not inside it.
+      - ${MY_AGENT_DATA_DIR:-./data}/agent_data.db:/app/agent_data.db
+      - ${MY_AGENT_DATA_DIR:-./data}/jwt_secret:/app/.jwt_secret
+      - ${MY_AGENT_DATA_DIR:-./data}/repos:/data/repos
+      - ${MY_AGENT_DATA_DIR:-./data}/env:/app/engine/.env:ro

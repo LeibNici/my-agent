@@ -2,33 +2,48 @@
 # Docker-based redeploy for the 244 host — disk there is shared with other
 # projects (natfrp/kkfileview/xinchuan-dev), so every rebuild's dangling
 # image + build cache must be reclaimed immediately after, not left to pile
-# up. Run this FROM the deploy checkout (e.g. /opt/my-agent), not the repo
-# root you develop in.
+# up.
+#
+# 2026-07-15 rewrite: this used to run from a permanent checkout at
+# /opt/my-agent, updated in place via `git pull`. That left the full
+# application source (a real `.git` history included) sitting readable on
+# the host indefinitely — anyone with host access could read it, not just
+# whoever's supposed to operate the container. Runs from an EPHEMERAL clone
+# now instead: deploy/bootstrap.sh (the one thing that stays on the host)
+# clones fresh into a throwaway directory, invokes this script, and this
+# script deletes that directory itself once the new container is confirmed
+# healthy. Nothing but docker images and MY_AGENT_DATA_DIR (real data +
+# secrets, was ./data/+engine/.env under the old permanent-checkout layout)
+# persists on the host between deploys.
 set -euo pipefail
 
-cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
-echo "==> git pull (fast-forward only)"
-before_sha="$(git rev-parse HEAD)"
-git pull --ff-only
-after_sha="$(git rev-parse HEAD)"
+: "${MY_AGENT_DATA_DIR:=/opt/my-agent-data}"
+export MY_AGENT_DATA_DIR
+# Stable across every ephemeral clone — compose defaults the project name to
+# the containing directory's basename, which would otherwise change (and
+# rename/orphan the container) every single deploy since that directory is
+# now a fresh mktemp path each time.
+export COMPOSE_PROJECT_NAME=my-agent
 
-# Self-modification race: this script IS one of the files `git pull` just
-# rewrote on disk, but the bash process already executing it had buffered
-# earlier content into memory — bash doesn't necessarily re-read a script
-# file line-by-line as it runs, so lines added below THIS point by the
-# pull just now can silently never execute during this exact invocation
-# (confirmed: engine/.git-sha never got written on the deploy that first
-# added the next line, even though the pull itself succeeded and the build
-# went on to complete normally). Re-exec once with the freshly-pulled
-# content so every line after this point is guaranteed to be the new
-# version — the DEPLOY_SH_REEXECED guard stops this from looping forever
-# (the second run's pull is a no-op, so before_sha==after_sha and it falls
-# through instead of re-execing again).
-if [ "$before_sha" != "$after_sha" ] && [ -z "${DEPLOY_SH_REEXECED:-}" ]; then
-  echo "==> deploy.sh changed — re-executing the freshly-pulled script"
-  export DEPLOY_SH_REEXECED=1
-  exec bash "${BASH_SOURCE[0]}"
+# Codex full-repo review (2026-07-14, Warning): docker-compose.yml's
+# .../agent_data.db and .../jwt_secret are FILE bind-mounts — Docker only
+# bind-mounts an existing host path; if the source doesn't exist yet (true
+# on a genuinely first-ever deploy) it silently creates a DIRECTORY at that
+# path instead of erroring, which then breaks both better-sqlite3 (can't
+# open a directory as a db file) and jwt-secret loading. touch is safe to
+# run unconditionally on every deploy, not just the first — it never
+# truncates an already-existing file, only creates what's missing.
+echo "==> ensuring $MY_AGENT_DATA_DIR bind-mount targets exist (first-deploy safety)"
+mkdir -p "$MY_AGENT_DATA_DIR/repos"
+touch "$MY_AGENT_DATA_DIR/agent_data.db" "$MY_AGENT_DATA_DIR/jwt_secret"
+if [ ! -s "$MY_AGENT_DATA_DIR/env" ]; then
+  echo "!! $MY_AGENT_DATA_DIR/env is missing or empty — this holds the ANTHROPIC_* production" >&2
+  echo "   secrets that used to live at engine/.env inside the old permanent checkout." >&2
+  echo "   Create it once (ANTHROPIC_API_KEY=..., etc. — see .env.example) before redeploying." >&2
+  exit 1
 fi
 
 # So the running site can show which commit it's actually serving (see
@@ -38,19 +53,6 @@ fi
 # `COPY engine/ ./` picks it up with no Dockerfile change; gitignored so
 # it never becomes a tracked/committed file.
 git rev-parse HEAD > engine/.git-sha
-
-# Codex full-repo review (2026-07-14, Warning): docker-compose.yml's
-# ./data/agent_data.db and ./data/jwt_secret are FILE bind-mounts — Docker
-# only bind-mounts an existing host path; if the source doesn't exist yet
-# (true on a genuinely first-ever deploy, since data/ is gitignored and so
-# never present in a fresh checkout) it silently creates a DIRECTORY at
-# that path instead of erroring, which then breaks both better-sqlite3
-# (can't open a directory as a db file) and jwt-secret loading. touch is
-# safe to run unconditionally on every deploy, not just the first — it
-# never truncates an already-existing file, only creates what's missing.
-echo "==> ensuring data/ bind-mount targets exist (first-deploy safety)"
-mkdir -p data/repos
-touch data/agent_data.db data/jwt_secret
 
 echo "==> docker compose build"
 docker compose build
@@ -69,25 +71,24 @@ for _ in $(seq 1 30); do
 done
 if [ "$ok" != true ]; then
   echo "!! service did not report 'listening on' within 150s — check: docker compose logs --tail 100" >&2
+  echo "!! leaving $REPO_ROOT in place for inspection instead of deleting it" >&2
   exit 1
 fi
 echo "service is up"
 
 # Codex full-repo review (2026-07-14, Warning): auto-deploy.sh used to
 # compare `git rev-parse HEAD` against origin/main to decide whether
-# there's anything new to deploy — but the `git pull` above already moves
-# HEAD forward unconditionally, before the build/health-check that follows
-# it is known to succeed. If THIS run fails anywhere below that pull (a
-# build failure, or the health-check timeout above), HEAD is already at
-# the new commit even though it was never actually served successfully —
-# so the next auto-deploy.sh cron tick sees local HEAD == origin/main,
-# concludes "nothing new", and silently never retries, forever, until a
-# DIFFERENT new commit happens to be pushed. Writing this marker only here
-# — after the health check has actually passed — gives auto-deploy.sh a
-# "last known-good deploy" signal that's independent of git HEAD, so a
-# failed attempt keeps getting retried every 5 minutes as intended instead
-# of going silent.
-git rev-parse HEAD > deploy/.last-deployed-sha
+# there's anything new to deploy — but a naive "already pulled" marker
+# written before the build/health-check that follows it is known to
+# succeed means a failed attempt (build error, or the health-check timeout
+# above) would never get retried on the next cron tick. Writing this marker
+# only here — after the health check has actually passed — gives
+# auto-deploy.sh a "last known-good deploy" signal that's independent of
+# git HEAD, so a failed attempt keeps getting retried every 5 minutes as
+# intended instead of going silent. Lives in MY_AGENT_DATA_DIR now, not
+# deploy/.last-deployed-sha inside the checkout — this checkout won't exist
+# by the time the next cron tick reads it back.
+git rev-parse HEAD > "$MY_AGENT_DATA_DIR/.last-deployed-sha"
 
 # Reclaim disk from old builds: dangling images are always safe to drop
 # (nothing references them, whether ours or another project's). Build
@@ -109,3 +110,11 @@ docker builder prune -f --filter "until=24h"
 
 echo "==> disk after cleanup"
 docker system df
+
+# The whole point of the 2026-07-15 rewrite: don't leave a readable copy of
+# the application source (a real .git history included) sitting on the host
+# once the image that's actually running has been built from it. Last
+# thing this script does — nothing below this line may reference $REPO_ROOT.
+echo "==> deleting ephemeral checkout $REPO_ROOT"
+cd /
+rm -rf "$REPO_ROOT"
