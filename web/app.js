@@ -1084,6 +1084,19 @@ function appendAssistantMessage(content, toolResults = {}, submissionsById = {},
     if (typeof content === "string") {
         contentEl.innerHTML = renderMarkdown(content);
     } else if (Array.isArray(content)) {
+        // Grouped the same way the live-streaming path does (createToolGroup/
+        // messageToolGroup in sendMessage) — every tool call in this message
+        // collapses into ONE group pinned at the end, instead of each
+        // rendering as its own standalone block in the middle of the reply.
+        // 2026-07-15: this used to call appendToolBlock straight into
+        // contentEl per tool_use block, so any historical message with more
+        // than one tool call displayed as a scattered list of separate boxes
+        // — visibly different from how the SAME message looked seconds
+        // earlier while it was still streaming. Reopening a session mid-turn
+        // (the background-stream reattachment feature) made this common
+        // enough to notice, but it affects every completed multi-tool-call
+        // message, not just that case.
+        let messageToolGroup = null;
         content.forEach(block => {
             if (block.type === "text") {
                 // A dedicated child per text run, never `contentEl.innerHTML +=`:
@@ -1093,10 +1106,23 @@ function appendAssistantMessage(content, toolResults = {}, submissionsById = {},
                 // the live-streaming path's textRuns (see that code's comment).
                 const textEl = document.createElement("div");
                 textEl.innerHTML = renderMarkdown(block.text || "");
-                contentEl.appendChild(textEl);
+                // Keep text ahead of the (single) tool group, same as the
+                // live path — the log stays pinned at the end no matter how
+                // many tool calls this message contains.
+                if (messageToolGroup) {
+                    contentEl.insertBefore(textEl, messageToolGroup.el);
+                } else {
+                    contentEl.appendChild(textEl);
+                }
             } else if (block.type === "tool_use") {
+                if (!messageToolGroup) messageToolGroup = createToolGroup(contentEl);
                 const result = toolResults[block.id];
-                appendToolBlock(contentEl, block.name, block.input, result !== undefined ? result : "completed");
+                const resolvedResult = result !== undefined ? result : "completed";
+                appendToolBlock(messageToolGroup.bodyEl, block.name, block.input, resolvedResult);
+                messageToolGroup.total++;
+                messageToolGroup.done++;
+                messageToolGroup.counts[block.name] = (messageToolGroup.counts[block.name] || 0) + 1;
+                updateToolGroupSummary(messageToolGroup);
                 if (block.name === "draft_issue" && result !== undefined) {
                     try {
                         const draft = JSON.parse(result);
