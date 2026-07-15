@@ -39,29 +39,22 @@ export COMPOSE_PROJECT_NAME=my-agent
 echo "==> ensuring $MY_AGENT_DATA_DIR bind-mount targets exist (first-deploy safety)"
 mkdir -p "$MY_AGENT_DATA_DIR/repos"
 touch "$MY_AGENT_DATA_DIR/agent_data.db" "$MY_AGENT_DATA_DIR/jwt_secret"
-if [ ! -s "$MY_AGENT_DATA_DIR/env" ]; then
-  echo "!! $MY_AGENT_DATA_DIR/env is missing or empty — this holds the ANTHROPIC_* production" >&2
-  echo "   secrets that used to live at engine/.env inside the old permanent checkout." >&2
-  echo "   Create it once (ANTHROPIC_API_KEY=..., etc. — see .env.example) before redeploying." >&2
-  exit 1
-fi
-# 2026-07-15, production incident found while setting this whole rewrite up:
-# ./env is mounted :ro into the container as engine/.env, read by the app
-# process AFTER docker-entrypoint.sh has already dropped root and execve'd
-# into uid 1000 (node) via setpriv — unlike agent_data.db/jwt_secret (chowned
-# by that entrypoint script on every start), a :ro bind mount can't be
-# chowned from inside the container at all (the read-only mount flag blocks
-# metadata writes too, root or not). A file created here with the host's
-# default umask (or an explicit root-only chmod, which is exactly what
-# happened seeding this the first time) is silently unreadable by uid 1000
-# — dotenv.config() then finds nothing, ANTHROPIC_API_KEY is empty, and
-# main.ts's own loud check for that (2026-07-14 P0 fix, same failure mode
-# as this) is the only reason it didn't fail silently a second time. Forcing
-# ownership/mode here on every deploy is idempotent and makes this the one
-# place that can regress it, not "whatever chmod the file happened to get
-# when someone last touched it by hand".
-chown 1000:1000 "$MY_AGENT_DATA_DIR/env"
-chmod 600 "$MY_AGENT_DATA_DIR/env"
+# 2026-07-15: no engine/.env bind mount anymore. It used to hold
+# ANTHROPIC_API_KEY/BASE_URL/MODEL/MAX_TOKENS, but main.ts overrides all
+# four from db.getLlmConfig() (Admin → LLM 配置) whenever a row is present —
+# on this production DB there always is one, so those four .env values were
+# 100% dead weight, and every other Settings field either already has a
+# correct hardcoded default or is DB-backed the same way (issueFixBotUsername,
+# webhook secrets). Chasing the right host-side permissions for a :ro-mounted
+# secrets file that a real deploy incident (2026-07-14) already broke once
+# and this rewrite broke a second time (uid 1000 vs whatever chmod the file
+# happened to get) wasn't worth continuing to carry for a file nothing reads
+# a real value out of. A genuinely fresh deploy with no DB row yet boots on
+# Settings' built-in defaults and main.ts's own loud "no LLM API key
+# configured" warning — exactly the same as it already did the moment an
+# admin hadn't visited that page yet, .env present or not — until an admin
+# sets one via the UI. Local dev (`npm start` from engine/, cwd-relative
+# dotenv.config()) is unaffected; this only removes the production bind mount.
 
 # So the running site can show which commit it's actually serving (see
 # app.ts's readGitSha comment) — the container has no .git of its own

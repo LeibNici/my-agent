@@ -37,4 +37,14 @@ services:
       - ${MY_AGENT_DATA_DIR:-./data}/agent_data.db:/app/agent_data.db
       - ${MY_AGENT_DATA_DIR:-./data}/jwt_secret:/app/.jwt_secret
       - ${MY_AGENT_DATA_DIR:-./data}/repos:/data/repos
-      - ${MY_AGENT_DATA_DIR:-./data}/env:/app/engine/.env:ro
+      # 2026-07-15: engine/.env used to be bind-mounted here (:ro) — removed.
+      # It only ever held ANTHROPIC_API_KEY/BASE_URL/MODEL/MAX_TOKENS, all
+      # four unconditionally overridden by db.getLlmConfig() (Admin → LLM 配置)
+      # whenever a row exists, which it always does in production — the file
+      # provided no value a real deploy could observe, only a :ro-mount
+      # permission trap (a uid-1000-vs-host-chmod mismatch broke it twice:
+      # 2026-07-14's P0 incident, then again during this rewrite). See
+      # deploy.sh's matching comment. Still works locally via plain
+      # `npm start` from engine/ (dotenv reads cwd-relative, no container
+      # involved) if a developer wants one — this only removes the
+      # production container's bind mount.

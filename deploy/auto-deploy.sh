@@ -7,12 +7,21 @@
 # 2026-07-15 rewrite: this used to `git fetch`/`git rev-parse` against a
 # permanent local checkout at /opt/my-agent — but that checkout no longer
 # exists between deploys (see deploy/deploy.sh's rewrite comment), so
-# there's nothing local left to fetch into. `git ls-remote` answers "what's
-# the latest commit on origin/main" over the network with no local clone at
-# all, which is all this step ever needed.
+# there's nothing local left to fetch into.
+#
+# What answers "what's the latest commit on origin/main" changed again the
+# same day (Codex review, Critical): `git ls-remote` through
+# v4.gh-proxy.org is the SAME untrusted proxy that also serves the code
+# bootstrap.sh clones — a compromised proxy could tell this check "nothing's
+# new" to suppress a real deploy (e.g. a security fix) indefinitely, with
+# nothing here able to tell. api.github.com is reachable directly from this
+# host (confirmed: github.com times out, api.github.com doesn't) — asking
+# it instead means the polling decision itself no longer depends on the
+# proxy at all; bootstrap.sh's own SHA check (same api.github.com call)
+# catches it independently even if this one were somehow bypassed.
 set -euo pipefail
 
-REPO_URL="https://v4.gh-proxy.org/https://github.com/LeibNici/my-agent.git"
+GITHUB_REPO="LeibNici/my-agent"
 DATA_DIR="/opt/my-agent-data"
 BOOTSTRAP="/opt/my-agent-deploy/bootstrap.sh"
 LOCK_FILE="/tmp/my-agent-auto-deploy.lock"
@@ -26,7 +35,12 @@ if ! flock -n 200; then
   exit 0
 fi
 
-remote_rev=$(git ls-remote "$REPO_URL" refs/heads/main | cut -f1)
+remote_rev="$(curl -fsS --max-time 10 -H "Accept: application/vnd.github.sha" \
+  "https://api.github.com/repos/${GITHUB_REPO}/commits/main")"
+if [ -z "$remote_rev" ]; then
+  echo "$(date -Iseconds) skip: could not reach api.github.com for the latest SHA" >> "$LOG_FILE"
+  exit 0
+fi
 
 # Codex full-repo review (2026-07-14, Warning): comparing against local
 # `git rev-parse HEAD` used to mean a FAILED deploy (build error, or the
