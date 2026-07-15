@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # Cron entry point (every 5 min) — polls origin/main, runs bootstrap.sh only
-# when there's actually something new. flock guards against a slow build
-# still running when the next tick fires; silent when there's nothing to
-# do so the log doesn't fill up with "nothing changed" noise every 5 min.
+# when there's actually something new. Silent when there's nothing to do so
+# the log doesn't fill up with "nothing changed" noise every 5 min.
+#
+# 2026-07-15, Codex review (Critical): the run-serialization lock used to
+# live here, guarding only the cron path — a manually-run bootstrap.sh was
+# never covered, so it could race a concurrent cron tick. Moved into
+# bootstrap.sh itself (the one entry point both paths actually go through)
+# instead of also flock-ing here: bootstrap.sh runs as a CHILD process of
+# this script, inheriting this script's open file descriptors — a second
+# flock attempt on the same lock file from the child would compete with
+# fd 200 held by THIS process for the same run, not with some other
+# concurrent invocation, so locking twice here would just make bootstrap.sh
+# permanently fail to acquire its own lock during a normal cron-triggered
+# deploy.
 #
 # 2026-07-15 rewrite: this used to `git fetch`/`git rev-parse` against a
 # permanent local checkout at /opt/my-agent — but that checkout no longer
@@ -24,16 +35,9 @@ set -euo pipefail
 GITHUB_REPO="LeibNici/my-agent"
 DATA_DIR="/opt/my-agent-data"
 BOOTSTRAP="/opt/my-agent-deploy/bootstrap.sh"
-LOCK_FILE="/tmp/my-agent-auto-deploy.lock"
 LOG_FILE="$DATA_DIR/auto-deploy.log"
 
 mkdir -p "$DATA_DIR"
-
-exec 200>"$LOCK_FILE"
-if ! flock -n 200; then
-  echo "$(date -Iseconds) skip: previous run still in progress" >> "$LOG_FILE"
-  exit 0
-fi
 
 remote_rev="$(curl -fsS --max-time 10 -H "Accept: application/vnd.github.sha" \
   "https://api.github.com/repos/${GITHUB_REPO}/commits/main")"

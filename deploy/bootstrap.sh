@@ -15,6 +15,29 @@
 # manual redeploy both go through this, never deploy.sh directly.
 set -euo pipefail
 
+# 2026-07-15, Codex review (Critical): bootstrap.sh is the ONE thing both
+# auto-deploy.sh (cron, */5 min) and any manual redeploy go through (see
+# this file's own header comment above) — so the lock belongs here, not in
+# auto-deploy.sh, otherwise a manually-run bootstrap.sh races a concurrent
+# cron tick on the same Compose project / .last-deployed-sha. Non-blocking:
+# a losing side just skips this run rather than queuing — cron retries in
+# 5 min anyway, and a human re-running manually can just try again.
+exec 200>/tmp/my-agent-deploy.lock
+if ! flock -n 200; then
+  echo "==> another deploy is already in progress — skipping this run" >&2
+  exit 0
+fi
+
+# 2026-07-15, Codex review (Critical): a failed health check further down
+# deliberately leaves $BUILD_DIR in place for inspection instead of
+# deleting it — but with no cap, a stuck deploy failing every cron tick
+# (every 5 min) accumulates one full checkout + built layers per attempt
+# and can exhaust this shared host's disk. Sweep anything older than 2h
+# (generous enough that a failure someone's actively looking at survives
+# the next few ticks, bounded enough that it can't grow unboundedly) before
+# starting a fresh attempt.
+find /tmp -maxdepth 1 -name 'my-agent-build.*' -mmin +120 -exec rm -rf {} + 2>/dev/null || true
+
 GITHUB_REPO="LeibNici/my-agent"
 REPO_URL="https://v4.gh-proxy.org/https://github.com/${GITHUB_REPO}.git"
 BUILD_DIR="$(mktemp -d /tmp/my-agent-build.XXXXXX)"

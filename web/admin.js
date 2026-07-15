@@ -186,6 +186,15 @@ function embedIndexBadge(r) {
 async function pollRepoSyncStatus(repoId, maxWaitMs = 150000, intervalMs = 2000) {
     const start = Date.now();
     let syncMessageShown = false;
+    let syncFinishedAt = null;
+    // ctags/chunk 收集（repo-sync.ts runIndexBuild 里 embedding 之前的阶段）
+    // 是本地纯 CPU/文件 I/O，正常几秒内完事——sync 结束后这么久
+    // embed_index_status 还是 null，基本可以断定这个仓库压根没配置
+    // embedding（没有 API key，或者本来就没打算给它建语义索引），而不是
+    // "马上要进入 building 了"。给一个远小于 maxWaitMs 的宽限期，超过了就
+    // 安静退出——不然每个没配置语义检索的仓库同步一次都要在这里空等到
+    // maxWaitMs 才结束，体验倒退回比这次修的 bug 还差。
+    const NO_EMBEDDING_GRACE_MS = 15000;
     for (;;) {
         let r;
         try {
@@ -203,10 +212,25 @@ async function pollRepoSyncStatus(repoId, maxWaitMs = 150000, intervalMs = 2000)
             // embedIndexBadge 那行进度数字跟着往前走，而不是同步一结束这里
             // 就退出、界面停在"语义索引构建中(刚开始)"再也不刷新。
             syncMessageShown = true;
+            syncFinishedAt = Date.now();
             if (r.last_sync_status === 'ok') showMsg(`仓库 ${r.name} 同步成功：${r.last_sync_message || ''}`);
             else if (r.last_sync_status === 'error') showMsg(`仓库 ${r.name} 同步失败：${r.last_sync_message || ''}`, false);
         }
-        if (syncMessageShown && r.embed_index_status !== 'building') {
+        // 2026-07-15, Codex review (Warning): 这里原来写的是
+        // `embed_index_status !== 'building'`——git 同步一结束，
+        // embed_index_status 往往还是 null（repo-sync.ts runIndexBuild 还在
+        // ctags/chunk 收集阶段，真正进入 embedding 才会把状态从 null 改成
+        // 'building'），null !== 'building' 也成立，导致这里在 embedding
+        // 真正开始之前就退出了轮询，上面的进度徽标从此定格在"刚开始"再也
+        // 不刷新。只在明确到达终态（ready/failed）时才退出。
+        if (syncMessageShown && (r.embed_index_status === 'ready' || r.embed_index_status === 'failed')) {
+            return;
+        }
+        if (
+            syncMessageShown &&
+            (r.embed_index_status === null || r.embed_index_status === undefined) &&
+            Date.now() - syncFinishedAt > NO_EMBEDDING_GRACE_MS
+        ) {
             return;
         }
         if (Date.now() - start > maxWaitMs) {

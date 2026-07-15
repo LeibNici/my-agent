@@ -633,14 +633,23 @@ async function runIndexBuild(repoId: number, localPath: string): Promise<void> {
   // 2026-07-15: best-effort progress publishing — semantic_search used to
   // have no way to tell a caller "still building, X/Y done" vs. "hasn't
   // started" vs. "ready", just one static message regardless of actual
-  // state. A stale generation's write racing a newer build's is harmless
-  // (isLatestIndexBuild below already gates the actual publish step; a
-  // losing generation's status row just gets overwritten again once the
-  // winner reports its own progress) and a DB hiccup here must never fail
-  // the embedding build itself — every write is try/catch'd on its own.
+  // state. A DB hiccup here must never fail the embedding build itself —
+  // every write is try/catch'd on its own.
+  //
+  // 2026-07-15, Codex review (Warning): originally only the terminal
+  // ready/failed write checked isLatestIndexBuild — the intermediate
+  // onProgress writes didn't, so two overlapping builds for the same repo
+  // (e.g. a manual re-sync fired while a periodic one was still embedding)
+  // could interleave their done/total numbers, with a STALE generation's
+  // later-arriving write clobbering the winner's more current progress.
+  // Guarding inside publishProgress itself, not just at the one call site
+  // that used to check it, covers every write uniformly (including the
+  // initial "building" write) — a losing generation simply stops writing
+  // anything at all once a newer one has taken over, rather than "mostly
+  // stops except when its timing happens to interleave badly".
   const db = indexingDb;
   const publishProgress = async (fields: UpdateRepoFields) => {
-    if (!db) return;
+    if (!db || !isLatestIndexBuild(repoId, generation)) return;
     try {
       await db.updateRepo(repoId, fields);
     } catch {
@@ -658,9 +667,7 @@ async function runIndexBuild(repoId: number, localPath: string): Promise<void> {
     (done, total) => void publishProgress({ embedIndexDone: done, embedIndexTotal: total }),
   );
 
-  if (isLatestIndexBuild(repoId, generation)) {
-    await publishProgress({ embedIndexStatus: ok ? "ready" : "failed" });
-  }
+  await publishProgress({ embedIndexStatus: ok ? "ready" : "failed" });
 }
 
 export async function syncAndPersist(

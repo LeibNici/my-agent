@@ -18,6 +18,24 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# 2026-07-15, Codex review (Critical): the final `rm -rf "$REPO_ROOT"` below
+# used to rely entirely on the comment "only ever invoked by bootstrap.sh"
+# for safety — no code-level check that this is actually the ephemeral
+# mktemp checkout bootstrap.sh created, not e.g. a permanent path someone
+# invoked this script against directly. bootstrap.sh always creates
+# $BUILD_DIR under /tmp/my-agent-build.*, so refuse to proceed at all
+# (before touching anything, not just before the final rm -rf) if
+# $REPO_ROOT doesn't match that shape.
+case "$REPO_ROOT" in
+  /tmp/my-agent-build.*) ;;
+  *)
+    echo "!! refusing to run: \$REPO_ROOT ($REPO_ROOT) is not an ephemeral /tmp/my-agent-build.* checkout" >&2
+    echo "!! this script deletes \$REPO_ROOT when it finishes — only bootstrap.sh should invoke it" >&2
+    exit 1
+    ;;
+esac
+
 cd "$REPO_ROOT"
 
 : "${MY_AGENT_DATA_DIR:=/opt/my-agent-data}"

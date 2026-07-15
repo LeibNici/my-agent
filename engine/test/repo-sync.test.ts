@@ -858,6 +858,59 @@ describe("两阶段索引构建 —— chunk 收集 + embedding（Phase 4b Task 
     expect(readEmbeddingIndex(localPath)).not.toBeNull();
   });
 
+  it("同样的重叠场景下，先开始(慢)的一次不应该落地任何 embed_index_status/done/total 进度写入——generation 守卫现在包住 publishProgress 本身，不只是它被调用的那一个终态站点（Codex 全仓库审查后续，2026-07-15，Warning）", async () => {
+    const dims = 4;
+    configureIndexing(makeEmbeddingSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) }), client);
+    let calls = 0;
+    const fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
+      const callIndex = calls++;
+      const delay = callIndex === 0 ? 250 : 0;
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      const body = JSON.parse(init.body) as { input: string[] };
+      const data = body.input.map((_text, index) => ({
+        index,
+        embedding: Array.from({ length: dims }, (_v, i) => (index + i + 1) / 10),
+      }));
+      return { status: 200, json: async () => ({ data }) } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const updateRepoSpy = vi.spyOn(client, "updateRepo");
+
+    const r1 = await __internal.defaultOnSyncSuccessUnvalidated(client, { repoId, url: originDir, reposDir });
+    expect(r1.ok).toBe(true);
+    const r2 = await __internal.defaultOnSyncSuccessUnvalidated(client, { repoId, url: originDir, reposDir });
+    expect(r2.ok).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 400));
+
+    // 只看跟 embedding 进度相关的字段，过滤掉 git sync 本身的
+    // lastSyncStatus/lastSyncMessage 写入（跟这条测试要证明的东西无关）。
+    //
+    // generation 1(慢) 在 generation 2 开始之前，本来就合法地写过 2 次
+    // （初始 building、embedAndSaveIndex 单波次开始前的 onProgress(0,total)
+    // ——两次都发生在它确实还是最新一次构建的时候，不该被拦，也不是这条
+    // 测试要证明的东西）。generation 2(快) 完整写 4 次：building、
+    // onProgress(0,total)、onProgress(total,total)、终态 ready。
+    // generation 1 剩下那两次——延迟 250ms 才到达的 onProgress(total,total)
+    // 和终态 failed——到达时 generation 2 早已开始，是本该被拦的过时写入：
+    // 终态那次修复前就已经被 isLatestIndexBuild 挡住（旧代码就是这么判断
+    // 的），真正的差异在 onProgress(total,total) 这次——旧代码完全没有守
+    // 卫，会无条件落地；用"总落地次数"而不是逐条比对时间戳来断言，是因为
+    // generation 2 自己那次 onProgress(total,total) 跟它长得一模一样（都是
+    // {embedIndexDone:1,embedIndexTotal:1}，1 个 chunk 的测试夹具决定的）—
+    // —按次数算：6 次落地是"守卫生效"，7 次是"那条过时写入也混进去了"。
+    const embedCalls = updateRepoSpy.mock.calls.filter(
+      ([, fields]) => "embedIndexStatus" in fields || "embedIndexDone" in fields || "embedIndexTotal" in fields,
+    );
+    expect(embedCalls).toHaveLength(6);
+    expect(embedCalls.filter(([, fields]) => "embedIndexStatus" in fields && fields.embedIndexStatus === "failed")).toHaveLength(0);
+
+    const finalRepo = await client.getRepoAdmin(repoId);
+    expect(finalRepo?.embed_index_status).toBe("ready");
+    expect(finalRepo?.embed_index_done).toBe(finalRepo?.embed_index_total);
+  });
+
   it("configureIndexing 传入 db 后，repositories.embed_index_status/done/total 会随构建推进落库，最终为 ready（2026-07-15）", async () => {
     const dims = 4;
     configureIndexing(makeEmbeddingSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) }), client);
