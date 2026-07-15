@@ -508,9 +508,22 @@ async function openSession(sessionId) {
     if (data.session && data.session.resolved_at) appendResolvedNotice();
     renderLinkedIssuesBanner(data.issue_submissions);
 
+    // The session we just switched TO may itself be streaming in the
+    // background (e.g. switching away and back) — the real live bubble is
+    // still being written to by that other sendMessage() call, but it's a
+    // detached DOM node from before messagesDiv got wiped above, and
+    // re-attaching it here would duplicate whatever's already persisted
+    // for this in-flight turn's earlier tool-call rounds (rendered above
+    // from data.messages). A generic placeholder is enough to answer "is
+    // something happening" — sendMessage's own completion handler swaps it
+    // for the real thing once the stream actually finishes while this
+    // session is the one on screen.
+    if (streamingSessions.has(sessionId)) {
+        appendAssistantBubble();
+    }
     // Reflects whether the session we just switched TO is itself streaming
-    // in the background (e.g. switching away and back) — independent of
-    // whatever else may be streaming elsewhere.
+    // in the background — independent of whatever else may be streaming
+    // elsewhere.
     syncSendButtonToViewingStream();
     loadSessions(); // refresh active highlight
 }
@@ -862,6 +875,15 @@ async function sendMessage() {
     // for whatever session the user has since switched to.
     if (viewingStreamKey === myKey) {
         setSendButtonState("send");
+        // bubble is only still attached to the document if the user never
+        // navigated away from this exact view while it streamed — if they
+        // did (then came back), openSession left a generic placeholder
+        // bubble in its place instead of this real one. Swap it for the
+        // actual finished reply now instead of leaving the placeholder
+        // spinning forever.
+        if (!bubble.isConnected) {
+            openSession(myKey);
+        }
     }
     loadSessions();
 }
