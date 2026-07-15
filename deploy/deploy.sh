@@ -45,6 +45,23 @@ if [ ! -s "$MY_AGENT_DATA_DIR/env" ]; then
   echo "   Create it once (ANTHROPIC_API_KEY=..., etc. — see .env.example) before redeploying." >&2
   exit 1
 fi
+# 2026-07-15, production incident found while setting this whole rewrite up:
+# ./env is mounted :ro into the container as engine/.env, read by the app
+# process AFTER docker-entrypoint.sh has already dropped root and execve'd
+# into uid 1000 (node) via setpriv — unlike agent_data.db/jwt_secret (chowned
+# by that entrypoint script on every start), a :ro bind mount can't be
+# chowned from inside the container at all (the read-only mount flag blocks
+# metadata writes too, root or not). A file created here with the host's
+# default umask (or an explicit root-only chmod, which is exactly what
+# happened seeding this the first time) is silently unreadable by uid 1000
+# — dotenv.config() then finds nothing, ANTHROPIC_API_KEY is empty, and
+# main.ts's own loud check for that (2026-07-14 P0 fix, same failure mode
+# as this) is the only reason it didn't fail silently a second time. Forcing
+# ownership/mode here on every deploy is idempotent and makes this the one
+# place that can regress it, not "whatever chmod the file happened to get
+# when someone last touched it by hand".
+chown 1000:1000 "$MY_AGENT_DATA_DIR/env"
+chmod 600 "$MY_AGENT_DATA_DIR/env"
 
 # So the running site can show which commit it's actually serving (see
 # app.ts's readGitSha comment) — the container has no .git of its own
