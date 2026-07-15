@@ -31,9 +31,12 @@ const DRAFT_ISSUE_DESCRIPTION =
   "Generate an issue draft with title, expected_behavior, body (markdown), and labels. This creates " +
   "a preview for the user to confirm before submission. Call this tool directly using the investigation " +
   "and conclusions you ALREADY established earlier in this conversation — do NOT call semantic_search/" +
-  "code_search/file_reader/list_directory again first just to re-confirm what you already found; only " +
-  "investigate further if the user's latest message raises something genuinely not yet covered. Redoing " +
-  "an investigation that already reached a clear conclusion just delays the draft for no benefit. " +
+  "code_search/file_reader/list_directory again first just to re-confirm what you already found; call " +
+  "any of those four again only if the user's latest message raises something genuinely not yet covered. " +
+  "Redoing an investigation that already reached a clear conclusion just delays the draft for no benefit. " +
+  "The conditional analogous-site code_search described below, and search_repo_issues's own stale-premise " +
+  "check further down, are both separate from this rule — each has its own trigger condition and doesn't " +
+  "require new information from the user. " +
   "That said, 'already established' means grounded in code you actually read THIS conversation, not an " +
   "assumption carried over from earlier chat history or the user's phrasing — if the draft hinges on a " +
   "specific method/function/file still behaving a certain way, make sure your own investigation actually " +
@@ -43,17 +46,48 @@ const DRAFT_ISSUE_DESCRIPTION =
   "file name is worth the one extra tool call — mention what you find in the body (e.g. 'relates to #12, " +
   "which removed this method — confirm the request below still applies') rather than drafting past it " +
   "silently. Not required for routine issues with no such signal — use judgment, don't search reflexively. " +
+  "After the root cause is confirmed, reuse any equivalent repository-wide code_search results already " +
+  "obtained in THIS conversation. Otherwise, make exactly ONE additional repository-wide code_search for " +
+  "analogous sites, and only when the confirmed root cause itself is a repeatable call or implementation " +
+  "pattern with a concrete reason to expect it recurs elsewhere — e.g. the same function used through the " +
+  "same incorrect calling convention in multiple places, or the same faulty logic copied across files. " +
+  "Do not run this scan for an isolated configuration error, a typo, a bad literal, or any other one-off " +
+  "mistake, and do not treat the mere existence of multiple callers as evidence of a pattern by itself. " +
+  "For a call-pattern issue, search the shared symbol name; for duplicated logic, use one distinctive " +
+  "shared literal. Do not retry with alternate queries or run a second code_search solely to widen impact " +
+  "scope. search_repo_issues stays a separate tracker-history check for a stale premise — do not use it " +
+  "for this code scan, and do not trigger it merely because this scan ran. " +
+  "Use that single result set for both the analogous-issue and candidate-impact reporting — do not search " +
+  "twice for two purposes. If the scan ran, add a 同类问题排查 section to body and split its entries into " +
+  "已确认同类问题 (only when code you actually read THIS conversation shows the same failure pattern, not " +
+  "just a text match) and 疑似同类问题 (a plausible match the available evidence doesn't establish — write " +
+  "these using '推测：...，请确认'). Add a separate 候选影响范围/关联调用 section for other results from " +
+  "that same search — other call sites of the shared symbol, or other locations containing the shared " +
+  "literal — whose read context shows they do NOT reproduce the bug — keep the three buckets mutually " +
+  "exclusive, never promote a bare text/symbol-name hit to 已确认. That section must " +
+  "include, verbatim: '这是基于文本搜索的候选清单，不是完整调用图，不能当作详尽的影响分析。' If a bucket " +
+  "is empty, say only that the returned results contained no such hit — never claim none exists in the " +
+  "repository. If the scan wasn't warranted, omit both sections entirely rather than searching just to " +
+  "fill them. " +
   "expected_behavior is a separate REQUIRED field, " +
   "not a section inside body — the confirmation card renders it as its own highlighted block above the " +
   "rest so the user can catch a wrong assumption before submitting, instead of it being buried inside a " +
   "long technical body. State plainly what the correct/expected behavior should be; if you're inferring " +
   "it rather than restating something the user said explicitly, say so (e.g. '推测：...，请确认') so the " +
-  "user knows to double-check it rather than rubber-stamp it. Structure body (markdown) for the " +
-  "development team with these sections: 问题描述 (what is wrong and how it manifests — the actual/current " +
+  "user knows to double-check it rather than rubber-stamp it. " +
+  "This same rule applies to every material claim about code or repository behavior anywhere in body — " +
+  "current behavior, code location, root cause, analogous occurrences, affected call sites. State it as " +
+  "established only when it's backed by something a tool actually returned THIS conversation (cite the " +
+  "file/function/line, and a short excerpt of the key line when useful); otherwise write it as " +
+  "'推测：...，请确认' rather than in a confident tone. User-provided reproduction details (工单号, steps " +
+  "they described) may be recorded as-is as what the user reported — that's not a code claim and doesn't " +
+  "need this treatment. Structure body (markdown) for the " +
+  "development team with these core sections: 问题描述 (what is wrong and how it manifests — the actual/current " +
   "behavior), 复现步骤 (preconditions/data state + steps + any具体单号 the user mentioned — include them " +
   "verbatim), 代码位置 (the specific file/function/line, from your investigation), 影响 (who/what is " +
   "affected), and 修复建议 (a concrete suggested fix — you already did the root-cause analysis, so state " +
-  "where and how to change it in words or a few illustrative lines, never a full rewritten file). " +
+  "where and how to change it in words or a few illustrative lines, never a full rewritten file), plus " +
+  "同类问题排查 and 候选影响范围/关联调用 when the conditional scan above ran. " +
   "labels must come from the project's EXISTING label vocabulary — pick one type:: label (type::bug / " +
   "type::feature / type::requirement) plus one module:: label (e.g. module::MES, module::APS, module::质量), " +
   "optionally priority::P0-P4. Never invent new labels: anything outside the project vocabulary is " +

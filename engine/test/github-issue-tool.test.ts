@@ -347,3 +347,68 @@ describe("searchIssuesTool (name search_repo_issues)", () => {
     expect(mockedSearchRepoIssues).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }), "collectChunks", 3);
   });
 });
+
+// Pure regression coverage for DRAFT_ISSUE_DESCRIPTION's text (execute()
+// itself doesn't branch on any of this — it's LLM-facing guidance, not
+// runtime logic) — guards against a future edit silently dropping the
+// 2026-07-15 additions (conditional analogous-site scan, candidate-impact
+// disclaimer, whole-body evidence/inference labeling) while editing
+// something else in the same string.
+describe("draftIssueTool.description — 举一反三扫描/候选影响范围/证据标注", () => {
+  const description = draftIssueTool.description;
+
+  it("states the negative trigger conditions so the scan doesn't fire on one-off mistakes", () => {
+    expect(description).toContain("isolated configuration error");
+    expect(description).toContain("do not treat the mere existence of multiple callers as evidence of a pattern");
+  });
+
+  it("caps the scan at exactly one additional code_search, not a retry loop", () => {
+    expect(description).toContain("exactly ONE additional repository-wide code_search");
+    expect(description).toContain("Do not retry with alternate queries or run a second code_search");
+  });
+
+  it("defines the three mutually-exclusive result buckets", () => {
+    expect(description).toContain("同类问题排查");
+    expect(description).toContain("已确认同类问题");
+    expect(description).toContain("疑似同类问题");
+    expect(description).toContain("候选影响范围/关联调用");
+    expect(description).toContain("keep the three buckets mutually exclusive");
+    expect(description).toContain("never promote a bare text/symbol-name hit to 已确认");
+  });
+
+  it("covers both scan modes (shared symbol / shared literal) in the candidate-impact bucket, not just symbol call sites", () => {
+    expect(description).toContain("For a call-pattern issue, search the shared symbol name; for duplicated logic, use one distinctive");
+    expect(description).toContain("other call sites of the shared symbol, or other locations containing the shared");
+  });
+
+  it("scopes the 'no re-investigation' rule to the 4 named tools, leaving the analogous-site scan and search_repo_issues as independent exceptions", () => {
+    expect(description).toContain("call any of those four again only if the user's latest message raises something genuinely not yet covered");
+    expect(description).toContain(
+      "The conditional analogous-site code_search described below, and search_repo_issues's own stale-premise",
+    );
+    expect(description).toContain("search_repo_issues stays a separate tracker-history check for a stale premise");
+  });
+
+  it("requires the candidate-impact disclaimer verbatim", () => {
+    expect(description).toContain("这是基于文本搜索的候选清单，不是完整调用图，不能当作详尽的影响分析。");
+  });
+
+  it("requires the two conditional sections to be omitted, not left empty, when the scan wasn't warranted", () => {
+    expect(description).toContain("omit both sections entirely rather than searching just to fill them");
+  });
+
+  it("extends the 推测：请确认 inference-labeling rule from expected_behavior to the whole body", () => {
+    expect(description).toContain("This same rule applies to every material claim about code or repository behavior anywhere in body");
+    expect(description).toContain("backed by something a tool actually returned THIS conversation");
+  });
+
+  it("exempts user-reported repro details (工单号/steps) from the evidence rule", () => {
+    expect(description).toContain("User-provided reproduction details (工单号, steps");
+    expect(description).toContain("that's not a code claim and doesn't need this treatment");
+  });
+
+  it("keeps the original 5 sections as core and lists the 2 conditional ones separately", () => {
+    expect(description).toContain("these core sections");
+    expect(description).toContain("plus 同类问题排查 and 候选影响范围/关联调用 when the conditional scan above ran");
+  });
+});
