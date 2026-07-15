@@ -228,6 +228,7 @@ async function doEmbedAndSave(
   key: string,
   signal: AbortSignal,
   isStillLatest: () => boolean,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<boolean> {
   const hashes = chunks.map((c) => chunkHash(c));
   const dims = settings.embeddingDimensions;
@@ -275,6 +276,14 @@ async function doEmbedAndSave(
   // rebuild has since started for this repo.
   if (!isStillLatest()) return false;
 
+  // Reported against the FULL chunk count, not just `todo` — a rebuild that
+  // reuses most vectors by hash (the common case, see `reusable` above)
+  // should read as already near-done, not restart from 0/todo.length; a
+  // genuinely cold build (nothing cached) has done===0 here and climbs
+  // exactly like todo.length would.
+  let done = chunks.length - todo.length;
+  onProgress?.(done, chunks.length);
+
   if (todo.length > 0) {
     const batches: number[][] = [];
     for (let s = 0; s < todo.length; s += EMBED_BATCH) {
@@ -303,7 +312,9 @@ async function doEmbedAndSave(
         for (let k = 0; k < batchIndices.length; k++) {
           vectors[batchIndices[k]] = embs[k];
         }
+        done += batchIndices.length;
       }
+      onProgress?.(done, chunks.length);
     }
   }
 
@@ -350,6 +361,11 @@ export async function embedAndSaveIndex(
   // concerns) don't need to be touched — only repo-sync.ts's periodic
   // rebuild path passes a real generation check.
   isStillLatest: () => boolean = () => true,
+  // 2026-07-15: optional for the same reason as isStillLatest above — most
+  // callers (tests, one-shot use) don't care to observe progress, only
+  // repo-sync.ts's runIndexBuild passes a real callback to publish
+  // embed_index_done/total as the build advances.
+  onProgress?: (done: number, total: number) => void,
 ): Promise<boolean> {
   const key = embeddingKeyOrFallback(settings);
   if (!key || chunks.length === 0) return false;
@@ -358,7 +374,7 @@ export async function embedAndSaveIndex(
   const timer = setTimeout(() => controller.abort(), BUILD_TIMEOUT_MS);
   timer.unref?.();
   try {
-    return await doEmbedAndSave(repoPath, chunks, settings, key, controller.signal, isStillLatest);
+    return await doEmbedAndSave(repoPath, chunks, settings, key, controller.signal, isStillLatest, onProgress);
   } catch {
     return false;
   } finally {

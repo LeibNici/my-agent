@@ -156,6 +156,93 @@ describe("semantic_search — 没有任何索引", () => {
 });
 
 // ---------------------------------------------------------------------------
+// no index yet, but repo-sync.ts's embed_index_status/done/total say WHY —
+// 2026-07-15: this used to be the same one static "not built yet" string
+// regardless of "never started" vs. "5% into a 30-minute cold build" vs.
+// "build failed outright". buildNoIndexMessage reads that state (via
+// ctx.db.getRepoAdmin, matched back from allowedRepoPaths through
+// ctx.grantedRepos) and reports something the caller can act on.
+// ---------------------------------------------------------------------------
+
+describe("semantic_search — 索引构建中/失败时的动态提示", () => {
+  function makeStatusDb(repoRow: Record<string, unknown> | null): DbClient {
+    return { getRepoAdmin: vi.fn(async () => repoRow) } as unknown as DbClient;
+  }
+
+  it("状态为 building 且有 done/total -> 提示里带具体进度和百分比", async () => {
+    vi.stubGlobal("fetch", makeQueryFetchMock([1, 0]));
+    const db = makeStatusDb({
+      id: 1,
+      local_path: repo1,
+      embed_index_status: "building",
+      embed_index_done: 1200,
+      embed_index_total: 20000,
+    });
+    const ctx = makeCtx({
+      allowedRepoPaths: [repo1],
+      db,
+      grantedRepos: [{ id: 1, name: "r1", localPath: repo1 }],
+    });
+    const result = await runSemanticSearch({ query: "任意查询" }, ctx, makeSettings());
+    expect(result).toBe("语义索引构建中（已处理 1200/20000，约 6%），请先用 code_search / find_symbol，稍后再试。");
+  });
+
+  it("状态为 building 但 done/total 缺失（刚起步）-> 不编造百分比", async () => {
+    vi.stubGlobal("fetch", makeQueryFetchMock([1, 0]));
+    const db = makeStatusDb({
+      id: 1,
+      local_path: repo1,
+      embed_index_status: "building",
+      embed_index_done: null,
+      embed_index_total: null,
+    });
+    const ctx = makeCtx({
+      allowedRepoPaths: [repo1],
+      db,
+      grantedRepos: [{ id: 1, name: "r1", localPath: repo1 }],
+    });
+    const result = await runSemanticSearch({ query: "任意查询" }, ctx, makeSettings());
+    expect(result).toBe("语义索引构建中，请先用 code_search / find_symbol，稍后再试。");
+  });
+
+  it("状态为 failed -> 提示上次构建失败，不是笼统的\"尚未构建\"", async () => {
+    vi.stubGlobal("fetch", makeQueryFetchMock([1, 0]));
+    const db = makeStatusDb({ id: 1, local_path: repo1, embed_index_status: "failed" });
+    const ctx = makeCtx({
+      allowedRepoPaths: [repo1],
+      db,
+      grantedRepos: [{ id: 1, name: "r1", localPath: repo1 }],
+    });
+    const result = await runSemanticSearch({ query: "任意查询" }, ctx, makeSettings());
+    expect(result).toBe("语义索引上次构建失败，会在下次仓库同步时自动重试。请先用 code_search / find_symbol。");
+  });
+
+  it("db/grantedRepos 都有，但该仓库从未开始构建（状态为 null）-> 退回原静态文案", async () => {
+    vi.stubGlobal("fetch", makeQueryFetchMock([1, 0]));
+    const db = makeStatusDb({ id: 1, local_path: repo1, embed_index_status: null });
+    const ctx = makeCtx({
+      allowedRepoPaths: [repo1],
+      db,
+      grantedRepos: [{ id: 1, name: "r1", localPath: repo1 }],
+    });
+    const result = await runSemanticSearch({ query: "任意查询" }, ctx, makeSettings());
+    expect(result).toBe(
+      "语义索引尚未构建（仓库同步后会在后台自动构建，首次需要几分钟）。请先用 code_search / find_symbol。",
+    );
+  });
+
+  it("grantedRepos 缺省（ctx.db 有但没给 grantedRepos）-> 退回原静态文案，不报错", async () => {
+    vi.stubGlobal("fetch", makeQueryFetchMock([1, 0]));
+    const db = makeStatusDb({ id: 1, local_path: repo1, embed_index_status: "building" });
+    const ctx = makeCtx({ allowedRepoPaths: [repo1], db }); // no grantedRepos
+    const result = await runSemanticSearch({ query: "任意查询" }, ctx, makeSettings());
+    expect(result).toBe(
+      "语义索引尚未构建（仓库同步后会在后台自动构建，首次需要几分钟）。请先用 code_search / find_symbol。",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // index exists but zero hits — v1 degradation message #3, byte-exact
 // ---------------------------------------------------------------------------
 

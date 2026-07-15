@@ -49,6 +49,7 @@
 // exception, no log line, so "semantic search doesn't work" had nothing an
 // operator could grep for. configureSemanticSearch is that missing hook,
 // called from main.ts right next to configureIndexing.
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef, type ToolContext } from "./registry.js";
@@ -87,6 +88,60 @@ const NO_INDEX_ANYWHERE_MESSAGE =
 
 function apiUnavailableMessage(status: number): string {
   return `语义检索暂不可用（embedding API ${status}）。请改用 code_search / find_symbol。`;
+}
+
+// 2026-07-15: the "no index" degradation used to be one static string
+// regardless of whether the build had never started, was 5% through a
+// 30-minute cold build, or had already finished and failed — repo-sync.ts's
+// embed_index_status/done/total (see schema.ts) now exist specifically so
+// this can say something the caller can act on ("try again in a bit" vs.
+// "this repo's build failed, an admin should look"). Matches allowedPaths
+// back to a repo id via ctx.grantedRepos' localPath, realpath'd the same
+// way getAllowedPaths does — this tool only ever sees repos the current
+// turn already has permission for, so no extra access check is needed here.
+// Degrades to the old static message if ctx.db/grantedRepos are absent
+// (existing tests, or a caller that never wired them up) or nothing in the
+// DB says otherwise (repo row missing, or a build that finished cleanly but
+// still left an empty index — see the caller's own comment on that case).
+async function buildNoIndexMessage(ctx: ToolContext, allowedPaths: string[]): Promise<string> {
+  if (!ctx.db || !ctx.grantedRepos) return NO_INDEX_ANYWHERE_MESSAGE;
+
+  const repoIdByRealPath = new Map<string, number>();
+  for (const g of ctx.grantedRepos) {
+    if (!g.localPath) continue;
+    let real: string;
+    try {
+      real = fs.realpathSync(g.localPath);
+    } catch {
+      real = path.resolve(g.localPath);
+    }
+    repoIdByRealPath.set(real, g.id);
+  }
+
+  let building: { done: number | null; total: number | null } | null = null;
+  let anyFailed = false;
+  for (const repoPath of allowedPaths) {
+    const id = repoIdByRealPath.get(repoPath);
+    if (id === undefined) continue;
+    const repo = await ctx.db.getRepoAdmin(id);
+    if (!repo) continue;
+    if (repo.embed_index_status === "building") {
+      building = { done: repo.embed_index_done, total: repo.embed_index_total };
+      break; // most specific/actionable state — stop looking
+    }
+    if (repo.embed_index_status === "failed") anyFailed = true;
+  }
+
+  if (building) {
+    const pct =
+      building.done != null && building.total ? Math.round((building.done / building.total) * 100) : null;
+    const progress = pct !== null ? `（已处理 ${building.done}/${building.total}，约 ${pct}%）` : "";
+    return `语义索引构建中${progress}，请先用 code_search / find_symbol，稍后再试。`;
+  }
+  if (anyFailed) {
+    return "语义索引上次构建失败，会在下次仓库同步时自动重试。请先用 code_search / find_symbol。";
+  }
+  return NO_INDEX_ANYWHERE_MESSAGE;
 }
 
 function zeroHitsMessage(query: string): string {
@@ -268,7 +323,7 @@ async function runSemanticSearch(
   }
 
   if (!anyIndex) {
-    return NO_INDEX_ANYWHERE_MESSAGE;
+    return await buildNoIndexMessage(ctx, allowedPaths);
   }
 
   hits.sort((a, b) => b.score - a.score);

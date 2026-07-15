@@ -556,9 +556,16 @@ async function syncAndPersistImpl(
 // deployment with no embedding config) -> the embed phase is skipped, same
 // as "no embedding key configured", not an error.
 let indexingSettings: Settings | undefined;
+// 2026-07-15: db handle for publishing embed_index_status/done/total as the
+// slow embedding phase runs — same injection shape/reasoning as
+// indexingSettings above (this file's other functions don't otherwise need
+// a DbClient), added alongside it rather than as a separate configure call
+// so there's only one thing for main.ts to remember to wire up.
+let indexingDb: DbClient | undefined;
 
-export function configureIndexing(settings: Settings): void {
+export function configureIndexing(settings: Settings, db: DbClient): void {
   indexingSettings = settings;
+  indexingDb = db;
 }
 
 // Codex full-repo review (2026-07-14, Warning): embedAndSaveIndex's publish
@@ -622,9 +629,38 @@ async function runIndexBuild(repoId: number, localPath: string): Promise<void> {
     return ok ? collectChunks(localPath) : [];
   });
   if (chunks.length === 0 || !indexingSettings) return;
-  await embedAndSaveIndex(localPath, chunks, indexingSettings, () =>
-    isLatestIndexBuild(repoId, generation)
+
+  // 2026-07-15: best-effort progress publishing — semantic_search used to
+  // have no way to tell a caller "still building, X/Y done" vs. "hasn't
+  // started" vs. "ready", just one static message regardless of actual
+  // state. A stale generation's write racing a newer build's is harmless
+  // (isLatestIndexBuild below already gates the actual publish step; a
+  // losing generation's status row just gets overwritten again once the
+  // winner reports its own progress) and a DB hiccup here must never fail
+  // the embedding build itself — every write is try/catch'd on its own.
+  const db = indexingDb;
+  const publishProgress = async (fields: UpdateRepoFields) => {
+    if (!db) return;
+    try {
+      await db.updateRepo(repoId, fields);
+    } catch {
+      // best-effort — a failed status write must not affect the build itself
+    }
+  };
+
+  await publishProgress({ embedIndexStatus: "building", embedIndexDone: 0, embedIndexTotal: chunks.length });
+
+  const ok = await embedAndSaveIndex(
+    localPath,
+    chunks,
+    indexingSettings,
+    () => isLatestIndexBuild(repoId, generation),
+    (done, total) => void publishProgress({ embedIndexDone: done, embedIndexTotal: total }),
   );
+
+  if (isLatestIndexBuild(repoId, generation)) {
+    await publishProgress({ embedIndexStatus: ok ? "ready" : "failed" });
+  }
 }
 
 export async function syncAndPersist(

@@ -71,9 +71,23 @@ export function initSchema(dbPath: string): void {
       last_sync_status TEXT,
       last_sync_message TEXT,
       index_status TEXT,
-      last_sync_sha TEXT
+      last_sync_sha TEXT,
+      embed_index_status TEXT,
+      embed_index_done INTEGER,
+      embed_index_total INTEGER
     )
   `);
+  // 2026-07-15: index_status (above) is ctags/symbol-index only — semantic
+  // search's embedding index is a separate, much slower background build
+  // with no status of its own, so a query mid-build had nothing to say
+  // beyond a static "not ready yet, try later" with no indication of
+  // progress or whether it had even started. embedAndSaveIndex already
+  // tracks processed/total per wave internally; these just give it
+  // somewhere to publish that instead of discarding it when the function
+  // returns.
+  ensureColumn(db, "repositories", "embed_index_status", "embed_index_status TEXT");
+  ensureColumn(db, "repositories", "embed_index_done", "embed_index_done INTEGER");
+  ensureColumn(db, "repositories", "embed_index_total", "embed_index_total INTEGER");
 
   // Permissions (user ↔ repo)
   db.exec(`

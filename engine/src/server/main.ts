@@ -250,7 +250,7 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   // its embedding-build phase but doesn't import the config singleton itself
   // (see configureIndexing's doc comment) — must run before the startup sync
   // below, which is the first thing that can trigger onSyncSuccess.
-  configureIndexing(settings);
+  configureIndexing(settings, db);
   // 2026-07-15 production bug fix: semantic-search.ts computed its own
   // Settings at module-import time (before the DB llm_config merge above
   // even ran) and never got a chance to see this one — same "assembled

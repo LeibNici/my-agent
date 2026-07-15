@@ -94,6 +94,9 @@ export type UpdateRepoFields = Partial<{
   lastSyncMessage: string;
   indexStatus: string;
   lastSyncSha: string | null;
+  embedIndexStatus: string | null;
+  embedIndexDone: number | null;
+  embedIndexTotal: number | null;
 }>;
 
 // Admin-only full row — v1's get_repo (`SELECT *` from repositories).
@@ -112,6 +115,9 @@ export type FullRepoRow = RepoRow & {
   last_sync_message: string | null;
   index_status: string | null;
   last_sync_sha: string | null;
+  embed_index_status: string | null;
+  embed_index_done: number | null;
+  embed_index_total: number | null;
 };
 
 // Phase 4b Task 4: semantic_search's best-effort recall-quality log row —
@@ -1231,6 +1237,9 @@ export function openStorage(dbPath: string): Storage {
       if (fields.lastSyncMessage !== undefined) set("last_sync_message", fields.lastSyncMessage);
       if (fields.indexStatus !== undefined) set("index_status", fields.indexStatus);
       if (fields.lastSyncSha !== undefined) set("last_sync_sha", fields.lastSyncSha);
+      if (fields.embedIndexStatus !== undefined) set("embed_index_status", fields.embedIndexStatus);
+      if (fields.embedIndexDone !== undefined) set("embed_index_done", fields.embedIndexDone);
+      if (fields.embedIndexTotal !== undefined) set("embed_index_total", fields.embedIndexTotal);
 
       if (setClauses.length === 0) return;
       values.push(repoId);

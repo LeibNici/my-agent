@@ -257,6 +257,80 @@ describe("embedAndSaveIndex — fresh build", () => {
 });
 
 // ---------------------------------------------------------------------------
+// embedAndSaveIndex — onProgress (2026-07-15: repo-sync.ts publishes this as
+// repositories.embed_index_done/total so semantic_search can report real
+// progress instead of one static "not ready yet" string regardless of how
+// far a build has actually gotten)
+// ---------------------------------------------------------------------------
+
+describe("embedAndSaveIndex — onProgress", () => {
+  it("reports (0, total) before the first wave, then cumulative done after each wave, ending at (total, total)", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // 45 new chunks, EMBED_BATCH=10 -> 5 batches (10×4 + 5), CONCURRENCY=4 ->
+    // wave 1 is batches 1-4 (40 chunks), wave 2 is batch 5 (5 chunks) — two
+    // waves is the minimum needed to distinguish "cumulative" from
+    // "per-wave" reporting.
+    const chunks = Array.from({ length: 45 }, (_, i) => makeChunk(`f${i}.ts`, `fn${i}`, `function fn${i}() {}`));
+
+    const calls: Array<[number, number]> = [];
+    const ok = await embedAndSaveIndex(repo, chunks, settings, undefined, (done, total) =>
+      calls.push([done, total]),
+    );
+    expect(ok).toBe(true);
+
+    expect(calls).toEqual([
+      [0, 45],
+      [40, 45],
+      [45, 45],
+    ]);
+  });
+
+  it("counts hash-reused chunks toward done from the very first call — a mostly-cached rebuild doesn't read as starting from 0", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+
+    const cached = makeChunk("a.ts", "foo", "function foo() { return 1; }");
+    writeEmbeddingIndex(repo, {
+      dims,
+      vectors: [new Float32Array([0.5, 0.5, 0.5, 0.5])],
+      meta: [{ path: "a.ts", start: 1, end: 1, name: "foo", hash: chunkHash(cached) }],
+    });
+    __internal.writeModelFingerprint(repo, __internal.currentModelFingerprint(settings));
+
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const freshChunk = makeChunk("b.ts", "bar", "function bar() { return 2; }");
+    const calls: Array<[number, number]> = [];
+    const ok = await embedAndSaveIndex(repo, [cached, freshChunk], settings, undefined, (done, total) =>
+      calls.push([done, total]),
+    );
+    expect(ok).toBe(true);
+
+    // First call reports the 1 reused chunk as already done, not 0 — then
+    // climbs to 2/2 once the 1 genuinely new chunk is embedded.
+    expect(calls).toEqual([
+      [1, 2],
+      [2, 2],
+    ]);
+  });
+
+  it("never calls onProgress when there's nothing to embed (no key / empty chunks)", async () => {
+    const settings = makeSettings({ ANTHROPIC_API_KEY: "", APP_EMBEDDING_API_KEY: "" });
+    const calls: Array<[number, number]> = [];
+    const ok = await embedAndSaveIndex(repo, [makeChunk("a.ts", "foo", "x")], settings, undefined, (done, total) =>
+      calls.push([done, total]),
+    );
+    expect(ok).toBe(false);
+    expect(calls).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // embedAndSaveIndex — incremental hash-diff reuse
 // ---------------------------------------------------------------------------
 

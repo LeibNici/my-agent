@@ -857,6 +857,37 @@ describe("两阶段索引构建 —— chunk 收集 + embedding（Phase 4b Task 
     const localPath = getRepoLocalPath(reposDir, repoId);
     expect(readEmbeddingIndex(localPath)).not.toBeNull();
   });
+
+  it("configureIndexing 传入 db 后，repositories.embed_index_status/done/total 会随构建推进落库，最终为 ready（2026-07-15）", async () => {
+    const dims = 4;
+    configureIndexing(makeEmbeddingSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) }), client);
+    const fetchMock = makeEmbeddingFetchMock(dims);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await __internal.defaultOnSyncSuccessUnvalidated(client, {
+      repoId,
+      url: originDir,
+      reposDir,
+    });
+    expect(result.ok).toBe(true);
+
+    const localPath = getRepoLocalPath(reposDir, repoId);
+    await waitFor(() => readEmbeddingIndex(localPath) !== null);
+    // The "ready" status write happens right after the index file itself is
+    // published (both in the same async chain past that same await point),
+    // but isn't guaranteed to have landed in this exact microtask — poll for
+    // it rather than asserting immediately after the file appears. waitFor
+    // itself only supports a sync predicate, so this loop is inlined.
+    let repo = await client.getRepoAdmin(repoId);
+    const deadline = Date.now() + 2000;
+    while (repo?.embed_index_status !== "ready" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+      repo = await client.getRepoAdmin(repoId);
+    }
+    expect(repo?.embed_index_status).toBe("ready");
+    expect(repo?.embed_index_total).toBeGreaterThan(0);
+    expect(repo?.embed_index_done).toBe(repo?.embed_index_total);
+  });
 });
 
 describe("索引构建 generation 守卫 —— beginIndexBuild / isLatestIndexBuild（Codex 全仓库审查，2026-07-14，Warning）", () => {

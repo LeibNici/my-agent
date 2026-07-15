@@ -149,7 +149,30 @@ function syncStatusCell(r) {
         ? ` <code style="font-family:var(--font-mono);font-size:11.5px;color:var(--mute);background:var(--ink-850);padding:1px 5px;border-radius:4px" title="当前检出的 commit">${esc(r.last_sync_sha)}</code>`
         : '';
     const idxMap = { ready: '', building: ' <span style="color:var(--amber)" title="符号索引重建中">索引构建中</span>', failed: ' <span style="color:var(--rust)" title="ctags 索引构建失败，符号搜索可能过期">索引失败</span>' };
-    return sync + sha + (idxMap[r.index_status] ?? '');
+    return sync + sha + (idxMap[r.index_status] ?? '') + embedIndexBadge(r);
+}
+
+// 2026-07-15: repositories.embed_index_status/done/total (separate from
+// index_status above, which is ctags/symbol search only) — the SLOW
+// background build (minutes, not the git-sync/ctags phases syncStatusCell
+// already covers) had no visibility at all before this: semantic_search
+// just returned one static "not built yet" string with no way for anyone —
+// admin or end user — to tell "hasn't started" from "80% through a cold
+// build" from "failed outright". This is that missing visibility on the
+// admin side; semantic-search.ts's own tool-result message covers the
+// chat-facing side of the same underlying fields.
+function embedIndexBadge(r) {
+    if (r.embed_index_status === 'building') {
+        const pct = r.embed_index_done != null && r.embed_index_total
+            ? Math.round((r.embed_index_done / r.embed_index_total) * 100)
+            : null;
+        const progress = pct !== null ? `${r.embed_index_done}/${r.embed_index_total}，约 ${pct}%` : '刚开始';
+        return ` <span style="color:var(--amber)" title="语义检索的 embedding 索引，通常需要几分钟">语义索引构建中(${progress})</span>`;
+    }
+    if (r.embed_index_status === 'failed') {
+        return ' <span style="color:var(--rust)" title="下次仓库同步会自动重试">语义索引构建失败</span>';
+    }
+    return '';
 }
 
 // 生产 QA 复测（2026-07-14）：create/manual-sync 路由不再等 clone/pull 跑完
@@ -162,6 +185,7 @@ function syncStatusCell(r) {
 // 还没完成也不当错误处理——只是提示"仍在进行"，不是失败。
 async function pollRepoSyncStatus(repoId, maxWaitMs = 150000, intervalMs = 2000) {
     const start = Date.now();
+    let syncMessageShown = false;
     for (;;) {
         let r;
         try {
@@ -172,13 +196,26 @@ async function pollRepoSyncStatus(repoId, maxWaitMs = 150000, intervalMs = 2000)
             return; // 网络错误——安静退出，不让轮询本身变成一个新的报错来源
         }
         loadRepos();
-        if (r.last_sync_status !== 'syncing') {
+        if (r.last_sync_status !== 'syncing' && !syncMessageShown) {
+            // 2026-07-15: git 同步一结束就报一次结果，但不在这里 return 了——
+            // embedding 索引构建是紧接着 git 同步之后、同一次触发链路里的
+            // 后台阶段（见 repo-sync.ts runIndexBuild），继续轮询才能让上面
+            // embedIndexBadge 那行进度数字跟着往前走，而不是同步一结束这里
+            // 就退出、界面停在"语义索引构建中(刚开始)"再也不刷新。
+            syncMessageShown = true;
             if (r.last_sync_status === 'ok') showMsg(`仓库 ${r.name} 同步成功：${r.last_sync_message || ''}`);
             else if (r.last_sync_status === 'error') showMsg(`仓库 ${r.name} 同步失败：${r.last_sync_message || ''}`, false);
+        }
+        if (syncMessageShown && r.embed_index_status !== 'building') {
             return;
         }
         if (Date.now() - start > maxWaitMs) {
-            showMsg(`仓库 ${r.name} 仍在同步中，请稍后刷新查看结果`, false);
+            showMsg(
+                syncMessageShown
+                    ? `仓库 ${r.name} 语义索引仍在构建中，请稍后刷新查看结果`
+                    : `仓库 ${r.name} 仍在同步中，请稍后刷新查看结果`,
+                false,
+            );
             return;
         }
         await new Promise(res => setTimeout(res, intervalMs));
