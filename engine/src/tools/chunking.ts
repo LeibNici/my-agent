@@ -267,14 +267,28 @@ export function collectChunks(repoPath: string, maxTotalChunks: number = MAX_TOT
     }
   }
 
+  // 2026-07-15: MyBatis mapper XML scanned FIRST, symbol chunks second — the
+  // truncation slice below is a flat prefix cut, and XML used to be
+  // appended last. On any repo whose symbol chunks alone already exceed
+  // maxTotalChunks (confirmed in production: a 30586-chunk repo against the
+  // 20000 cap), every single XML chunk was silently dropped — not some of
+  // them, all of them, since none survive past the cutoff. That's the SQL
+  // this module's own docstring calls out as the thing ctags can't parse
+  // and semantic search exists to cover; losing 100% of it to make room for
+  // more class/method chunks (which code_search/find_symbol can already
+  // reach via exact-text/symbol lookup) inverts the actual value of what's
+  // being cut. XML mapper files are also typically a small fraction of a
+  // codebase's total chunk count, so putting them first costs little
+  // symbol-chunk headroom in the common case while making the worst case
+  // (repo over the cap) fail gracefully instead of totally.
   const chunks: Chunk[] = [];
+  scanMapperXml(repoPath, repoPath, chunks);
+
   for (const [relPath, fileTags] of byFile) {
     if (relPath) {
       chunks.push(...chunkFileBySymbols(repoPath, relPath, fileTags));
     }
   }
-
-  scanMapperXml(repoPath, repoPath, chunks);
 
   if (chunks.length > maxTotalChunks) {
     console.warn(

@@ -240,6 +240,39 @@ describe("collectChunks — total-chunk ceiling", () => {
     const chunks = collectChunks(repo, 1);
     expect(chunks).toHaveLength(1);
   });
+
+  // 2026-07-15 production bug: XML used to be appended AFTER symbol chunks,
+  // so a repo whose symbol chunks alone exceed the cap lost 100% of its
+  // mapper XML SQL coverage to the flat prefix-slice truncation below — not
+  // some of it, all of it, every single time. Confirmed in production (a
+  // real repo: 30586 chunks against the 20000 cap). Mixed fixture here
+  // (unlike the XML-only fixture above) is the only way to catch a
+  // symbols-vs-XML ordering regression — an XML-only fixture can't tell
+  // "XML first" apart from "XML last".
+  it("keeps every mapper XML chunk even when symbol chunks alone exceed the cap", async () => {
+    const funcs = Array.from({ length: 6 }, (_, i) => `export function f${i}(): number {\n  return ${i};\n}`).join(
+      "\n\n",
+    );
+    fs.writeFileSync(path.join(repo, "many.ts"), funcs + "\n");
+
+    const mapperDir = path.join(repo, "resources", "mapper");
+    fs.mkdirSync(mapperDir, { recursive: true });
+    fs.writeFileSync(path.join(mapperDir, "M1.xml"), "<!-- mapper 1 -->\n");
+    fs.writeFileSync(path.join(mapperDir, "M2.xml"), "<!-- mapper 2 -->\n");
+    await buildIndex(repo);
+
+    const uncapped = collectChunks(repo);
+    const uncappedXml = uncapped.filter((c) => c.path.endsWith(".xml"));
+    const uncappedSymbols = uncapped.filter((c) => !c.path.endsWith(".xml"));
+    expect(uncappedXml).toHaveLength(2);
+    expect(uncappedSymbols.length).toBeGreaterThanOrEqual(6);
+
+    // Cap smaller than the symbol-chunk count alone, but big enough to fit
+    // both XML chunks plus at least one symbol chunk.
+    const capped = collectChunks(repo, 3);
+    expect(capped).toHaveLength(3);
+    expect(capped.filter((c) => c.path.endsWith(".xml"))).toHaveLength(2);
+  });
 });
 
 // ---------------------------------------------------------------------------
