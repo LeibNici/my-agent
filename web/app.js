@@ -493,17 +493,45 @@ async function openSession(sessionId) {
     });
 
     const feedbackMap = data.feedback || {}; // {message_id: rating} for me
+
+    // Persisted history keeps a separate assistant DB row per tool-exchange
+    // round (sse.ts writes one after each tool call resolves, not once at
+    // the end of the turn) — replaying rows 1:1 used to render one bubble
+    // per round, each internally grouped correctly (see appendAssistantMessage's
+    // own tool-grouping fix) but still visibly split into several stacked
+    // bubbles for what was ONE turn while it was actually streaming live.
+    // QA-reported (2026-07-15): switching away mid-turn and back, or just
+    // reopening any completed multi-round turn, showed 2-3 separate tool
+    // groups instead of the one the live view always collapsed everything
+    // into. Buffer every assistant row between two real user messages and
+    // render them as a single merged bubble, matching the live shape.
+    let turnBlocks = [];
+    let turnFinalMessageId = null; // id of the row that was the plain-string final answer, if any — feedback only ever attaches to that one
+    const flushAssistantTurn = () => {
+        if (turnBlocks.length === 0) return;
+        appendAssistantMessage(turnBlocks, toolResults, submissionsById, submissionsByTitle,
+                               actionsById, turnFinalMessageId, turnFinalMessageId ? feedbackMap[turnFinalMessageId] : null);
+        turnBlocks = [];
+        turnFinalMessageId = null;
+    };
+
     data.messages.forEach(msg => {
         if (msg.role === "user") {
             // Pure tool-result relay messages have no standalone bubble —
             // they're shown via the paired tool_use block above.
             if (Array.isArray(msg.content) && msg.content.length && msg.content.every(b => b.type === "tool_result")) return;
+            flushAssistantTurn();
             appendUserMessage(msg.content);
         } else if (msg.role === "assistant") {
-            appendAssistantMessage(msg.content, toolResults, submissionsById, submissionsByTitle,
-                                   actionsById, msg.id, feedbackMap[msg.id]);
+            if (typeof msg.content === "string") {
+                turnBlocks.push({ type: "text", text: msg.content });
+                turnFinalMessageId = msg.id;
+            } else if (Array.isArray(msg.content)) {
+                turnBlocks.push(...msg.content);
+            }
         }
     });
+    flushAssistantTurn();
 
     if (data.session && data.session.resolved_at) appendResolvedNotice();
     renderLinkedIssuesBanner(data.issue_submissions);
@@ -1073,6 +1101,11 @@ function hideThinking(container) {
     if (typing) typing.remove();
 }
 
+// content is always an array of blocks representing one whole turn — a
+// single message row's content array (already that shape), or several
+// rows' content arrays merged by openSession's flushAssistantTurn (2026-07-15
+// — see its own comment for why several DB rows need merging into one call
+// here at all).
 function appendAssistantMessage(content, toolResults = {}, submissionsById = {}, submissionsByTitle = {}, actionsById = {}, messageId = null, myRating = null) {
     const messagesDiv = document.getElementById("messages");
     const div = document.createElement("div");
@@ -1081,76 +1114,76 @@ function appendAssistantMessage(content, toolResults = {}, submissionsById = {},
     const contentEl = document.createElement("div");
     contentEl.className = "message-content";
 
-    if (typeof content === "string") {
-        contentEl.innerHTML = renderMarkdown(content);
-    } else if (Array.isArray(content)) {
-        // Grouped the same way the live-streaming path does (createToolGroup/
-        // messageToolGroup in sendMessage) — every tool call in this message
-        // collapses into ONE group pinned at the end, instead of each
-        // rendering as its own standalone block in the middle of the reply.
-        // 2026-07-15: this used to call appendToolBlock straight into
-        // contentEl per tool_use block, so any historical message with more
-        // than one tool call displayed as a scattered list of separate boxes
-        // — visibly different from how the SAME message looked seconds
-        // earlier while it was still streaming. Reopening a session mid-turn
-        // (the background-stream reattachment feature) made this common
-        // enough to notice, but it affects every completed multi-tool-call
-        // message, not just that case.
-        let messageToolGroup = null;
-        content.forEach(block => {
-            if (block.type === "text") {
-                // A dedicated child per text run, never `contentEl.innerHTML +=`:
-                // that reflows the whole subtree, and appendToolBlock's
-                // toolHeader.onclick (a JS property, set below) doesn't survive
-                // being serialized to a string and reparsed — same reasoning as
-                // the live-streaming path's textRuns (see that code's comment).
-                const textEl = document.createElement("div");
-                textEl.innerHTML = renderMarkdown(block.text || "");
-                // Keep text ahead of the (single) tool group, same as the
-                // live path — the log stays pinned at the end no matter how
-                // many tool calls this message contains.
-                if (messageToolGroup) {
-                    contentEl.insertBefore(textEl, messageToolGroup.el);
-                } else {
-                    contentEl.appendChild(textEl);
-                }
-            } else if (block.type === "tool_use") {
-                if (!messageToolGroup) messageToolGroup = createToolGroup(contentEl);
-                const result = toolResults[block.id];
-                const resolvedResult = result !== undefined ? result : "completed";
-                appendToolBlock(messageToolGroup.bodyEl, block.name, block.input, resolvedResult);
-                messageToolGroup.total++;
-                messageToolGroup.done++;
-                messageToolGroup.counts[block.name] = (messageToolGroup.counts[block.name] || 0) + 1;
-                updateToolGroupSummary(messageToolGroup);
-                if (block.name === "draft_issue" && result !== undefined) {
-                    try {
-                        const draft = JSON.parse(result);
-                        if (draft.type === "issue_draft") {
-                            const submission = submissionsById[block.id] || submissionsByTitle[draft.title] || null;
-                            appendIssueCard(contentEl, draft, submission, block.id);
-                        }
-                    } catch {}
-                } else if (block.name === "manage_issue" && result !== undefined) {
-                    try {
-                        const draft = JSON.parse(result);
-                        if (draft.type === "issue_action_draft") {
-                            appendIssueActionCard(contentEl, draft, actionsById[block.id] || null, block.id);
-                        }
-                    } catch {}
-                }
+    // Grouped the same way the live-streaming path does (createToolGroup/
+    // messageToolGroup in sendMessage) — every tool call across the whole
+    // turn collapses into ONE group pinned at the end, instead of each
+    // rendering as its own standalone block in the middle of the reply.
+    // 2026-07-15: this used to call appendToolBlock straight into contentEl
+    // per tool_use block, so any historical message with more than one tool
+    // call displayed as a scattered list of separate boxes — visibly
+    // different from how the SAME turn looked seconds earlier while it was
+    // still streaming. Reopening a session mid-turn (the background-stream
+    // reattachment feature) made this common enough to notice, but it
+    // affects every completed multi-tool-call turn, not just that case.
+    let messageToolGroup = null;
+    content.forEach(block => {
+        if (block.type === "text") {
+            // A dedicated child per text run, never `contentEl.innerHTML +=`:
+            // that reflows the whole subtree, and appendToolBlock's
+            // toolHeader.onclick (a JS property, set below) doesn't survive
+            // being serialized to a string and reparsed — same reasoning as
+            // the live-streaming path's textRuns (see that code's comment).
+            const textEl = document.createElement("div");
+            textEl.innerHTML = renderMarkdown(block.text || "");
+            // Keep text ahead of the (single) tool group, same as the
+            // live path — the log stays pinned at the end no matter how
+            // many tool calls this turn contains.
+            if (messageToolGroup) {
+                contentEl.insertBefore(textEl, messageToolGroup.el);
+            } else {
+                contentEl.appendChild(textEl);
             }
-        });
-    }
+        } else if (block.type === "tool_use") {
+            if (!messageToolGroup) messageToolGroup = createToolGroup(contentEl);
+            const result = toolResults[block.id];
+            const resolvedResult = result !== undefined ? result : "completed";
+            appendToolBlock(messageToolGroup.bodyEl, block.name, block.input, resolvedResult);
+            messageToolGroup.total++;
+            messageToolGroup.done++;
+            messageToolGroup.counts[block.name] = (messageToolGroup.counts[block.name] || 0) + 1;
+            updateToolGroupSummary(messageToolGroup);
+            if (block.name === "draft_issue" && result !== undefined) {
+                try {
+                    const draft = JSON.parse(result);
+                    if (draft.type === "issue_draft") {
+                        const submission = submissionsById[block.id] || submissionsByTitle[draft.title] || null;
+                        appendIssueCard(contentEl, draft, submission, block.id);
+                    }
+                } catch {}
+            } else if (block.name === "manage_issue" && result !== undefined) {
+                try {
+                    const draft = JSON.parse(result);
+                    if (draft.type === "issue_action_draft") {
+                        appendIssueActionCard(contentEl, draft, actionsById[block.id] || null, block.id);
+                    }
+                } catch {}
+            }
+        }
+    });
 
     div.innerHTML = `<div class="message-header">Agent</div>`;
     div.appendChild(contentEl);
     messagesDiv.appendChild(div);
     highlightCode(contentEl);
     linkifyCodeRefs(contentEl);
-    // Final answers are persisted as plain strings; tool exchanges as arrays.
-    // Feedback attaches to answers only.
-    if (typeof content === "string" && messageId) {
+    // 2026-07-15: content is always an array now (openSession merges every
+    // assistant row in a turn into one call before this ever runs — see its
+    // own comment), so this used to gate on `typeof content === "string"`
+    // to mean "this call represents the turn's final answer, not just one
+    // tool-exchange round" — messageId itself carries that meaning now
+    // (the caller only passes one when the turn's last row was the
+    // plain-string final answer), so the type check is redundant.
+    if (messageId) {
         appendFeedbackBar(div, messageId, myRating);
     }
     scrollToBottom();
