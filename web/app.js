@@ -390,10 +390,22 @@ function renderSessions() {
             container.appendChild(label);
         }
         const item = document.createElement("div");
+        // 2026-07-15: .resolved's ✓ checkmark (style.css) was built for
+        // exactly this ("an issue was filed from them" — its own comment)
+        // but only ever checked resolved_at, which no code path actually
+        // sets (see SessionRow's doc comment) — the marker existed but
+        // never once fired. has_issue is the real "was an issue actually
+        // filed" signal, sourced independently from issue_submissions;
+        // resolved_at is kept in the OR for forward-compat in case it ever
+        // does get wired up, but isn't the thing driving this today.
         item.className = "session-item"
             + (s.id === currentSessionId ? " active" : "")
-            + (s.resolved_at ? " resolved" : "");
-        if (s.resolved_at) item.title = "已提交 issue，本会话已完结";
+            + ((s.has_issue || s.resolved_at) ? " resolved" : "");
+        if (s.resolved_at) {
+            item.title = "已提交 issue，本会话已完结";
+        } else if (s.has_issue) {
+            item.title = "已提交 issue";
+        }
 
         const info = document.createElement("div");
         info.className = "session-info";

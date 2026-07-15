@@ -328,6 +328,57 @@ describe("createSession / listSessions / getSession / deleteSession（v1 databas
     expect(ids).toContain("s1"); // fixture seed row
   });
 
+  // 2026-07-15: has_issue — sidebar "已提交" marker. Deliberately sourced
+  // from issue_submissions.issue_number IS NOT NULL, NOT from resolved_at
+  // (see SessionRow's own doc comment for why those two must stay separate
+  // — resolved_at gates real behavior in sse.ts and nothing sets it today).
+  describe("has_issue（listSessions / getSession 共用的 issue_submissions EXISTS 子查询）", () => {
+    it("没有任何提报 ⇒ 0（both listSessions and getSession)", () => {
+      const uid = seedUser("alice");
+      const id = storage.createSession("chat", uid);
+      expect(storage.getSession(id)!.has_issue).toBe(0);
+      expect(storage.listSessions(uid).find((r) => r.id === id)!.has_issue).toBe(0);
+    });
+
+    it("只有一条草稿（claimDraftSubmission，issue_number 尚为 NULL）⇒ 仍是 0，未真正提交", () => {
+      const uid = seedUser("alice");
+      const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+      const id = storage.createSession("chat", uid);
+      storage.claimDraftSubmission({
+        sessionId: id, repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_has_issue_1",
+      });
+      expect(storage.getSession(id)!.has_issue).toBe(0);
+      expect(storage.listSessions(uid).find((r) => r.id === id)!.has_issue).toBe(0);
+    });
+
+    it("finalizeIssueSubmission 落上真实 issue_number 之后 ⇒ 变成 1", () => {
+      const uid = seedUser("alice");
+      const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+      const id = storage.createSession("chat", uid);
+      const claim = storage.claimDraftSubmission({
+        sessionId: id, repoId, userId: uid, title: "t", body: "b", labels: [], draftToolUseId: "tu_has_issue_2",
+      });
+      if (!claim.claimed) throw new Error("unreachable");
+      storage.finalizeIssueSubmission(claim.id, { issueNumber: 99, issueUrl: "https://x/99", body: "final body" });
+
+      expect(storage.getSession(id)!.has_issue).toBe(1);
+      expect(storage.listSessions(uid).find((r) => r.id === id)!.has_issue).toBe(1);
+    });
+
+    it("别的 session 有提报，不会污染这个 session 的 has_issue", () => {
+      const uid = seedUser("alice");
+      const repoId = storage.createRepo({ name: "demo-repo", url: "https://example.com/demo.git" });
+      const withIssue = storage.createSession("has-one", uid);
+      const withoutIssue = storage.createSession("has-none", uid);
+      storage.recordIssueSubmission({
+        sessionId: withIssue, repoId, userId: uid,
+        title: "t", body: "b", labels: [], issueNumber: 5, issueUrl: "https://x/5",
+      });
+      expect(storage.getSession(withIssue)!.has_issue).toBe(1);
+      expect(storage.getSession(withoutIssue)!.has_issue).toBe(0);
+    });
+  });
+
   it("deleteSession 级联删除 messages（显式两条 DELETE），会话本身也消失", () => {
     const uid = seedUser("alice");
     const id = storage.createSession("to-delete", uid);

@@ -48,6 +48,16 @@ export type SessionRow = {
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
+  // 2026-07-15: whether this session has at least one SUCCESSFULLY
+  // submitted issue (issue_number IS NOT NULL — a draft that was shown but
+  // never confirmed doesn't count) — purely informational for the sidebar
+  // history list ("已提交" marker), deliberately NOT the same signal as
+  // resolved_at. resolved_at gates real behavior (sse.ts silently redirects
+  // any further message in a resolved session into a brand-new one — see
+  // its own comment on the 2026-07-13 regression that caused), and nothing
+  // currently sets it; conflating the two would either reintroduce that
+  // regression or make the badge depend on a field that's always null.
+  has_issue: number;
 };
 
 // Client-safe repo fields only (id/name/url/description/branch) — matches
@@ -1065,9 +1075,11 @@ export function openStorage(dbPath: string): Storage {
 
     listSessions(ownerId: number | null): SessionRow[] {
       const sql =
-        "SELECT id, title, owner_id, created_at, updated_at, resolved_at FROM sessions " +
-        (ownerId !== null ? "WHERE owner_id = ? " : "") +
-        "ORDER BY updated_at DESC";
+        "SELECT s.id, s.title, s.owner_id, s.created_at, s.updated_at, s.resolved_at, " +
+        "EXISTS(SELECT 1 FROM issue_submissions i WHERE i.session_id = s.id AND i.issue_number IS NOT NULL) AS has_issue " +
+        "FROM sessions s " +
+        (ownerId !== null ? "WHERE s.owner_id = ? " : "") +
+        "ORDER BY s.updated_at DESC";
       const rows = ownerId !== null ? db.prepare(sql).all(ownerId) : db.prepare(sql).all();
       return rows as SessionRow[];
     },
@@ -1075,7 +1087,9 @@ export function openStorage(dbPath: string): Storage {
     getSession(sessionId: string): SessionRow | null {
       const row = db
         .prepare(
-          "SELECT id, title, owner_id, created_at, updated_at, resolved_at FROM sessions WHERE id = ?"
+          "SELECT s.id, s.title, s.owner_id, s.created_at, s.updated_at, s.resolved_at, " +
+            "EXISTS(SELECT 1 FROM issue_submissions i WHERE i.session_id = s.id AND i.issue_number IS NOT NULL) AS has_issue " +
+            "FROM sessions s WHERE s.id = ?"
         )
         .get(sessionId) as SessionRow | undefined;
       return row ?? null;
