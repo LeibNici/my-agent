@@ -18,7 +18,7 @@
 import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef, type ToolContext } from "./registry.js";
 import { getActiveRepo } from "./access.js";
-import { getRepoLabels, normalizeLabels } from "./issue-tracker-client.js";
+import { getRepoLabels, normalizeLabels, searchRepoIssues } from "./issue-tracker-client.js";
 
 const DraftIssueParams = Type.Object({
   title: Type.String(),
@@ -34,6 +34,15 @@ const DRAFT_ISSUE_DESCRIPTION =
   "code_search/file_reader/list_directory again first just to re-confirm what you already found; only " +
   "investigate further if the user's latest message raises something genuinely not yet covered. Redoing " +
   "an investigation that already reached a clear conclusion just delays the draft for no benefit. " +
+  "That said, 'already established' means grounded in code you actually read THIS conversation, not an " +
+  "assumption carried over from earlier chat history or the user's phrasing — if the draft hinges on a " +
+  "specific method/function/file still behaving a certain way, make sure your own investigation actually " +
+  "confirmed it's still there and still does that, since another change could have already altered or " +
+  "removed it. When the target method/file plausibly has related history (recently touched, or the user's " +
+  "description sounds like it follows on from other work), a quick search_repo_issues call for that method/" +
+  "file name is worth the one extra tool call — mention what you find in the body (e.g. 'relates to #12, " +
+  "which removed this method — confirm the request below still applies') rather than drafting past it " +
+  "silently. Not required for routine issues with no such signal — use judgment, don't search reflexively. " +
   "expected_behavior is a separate REQUIRED field, " +
   "not a section inside body — the confirmation card renders it as its own highlighted block above the " +
   "rest so the user can catch a wrong assumption before submitting, instead of it being buried inside a " +
@@ -137,7 +146,7 @@ const MANAGE_ISSUE_DESCRIPTION =
   "was wrong, not just something the LLM misread) or turns out invalid/already-resolved — NOT for " +
   "reporting a new problem, that's draft_issue. Creates a preview card for the user to confirm before " +
   "anything is actually posted to the tracker. issue_number is the tracker's issue number (the user " +
-  "usually has it — ask them for it if not, there is no issue-search tool available). action is 'comment' (add a note, issue stays " +
+  "usually has it — if not, try search_repo_issues by title first before asking them). action is 'comment' (add a note, issue stays " +
   "open — for a clarification/correction that doesn't change the outcome), 'close' (add the comment then " +
   "close — for invalid/wontfix/already-fixed-elsewhere), or 'reopen' (for a previously-closed issue that " +
   "needs revisiting). comment is REQUIRED for all three: always state plainly why — what was previously " +
@@ -193,5 +202,62 @@ export const manageIssueTool: ToolDef<typeof ManageIssueParams> = {
   execute: manageIssueExecute,
 };
 
+// 2026-07-15: searchRepoIssues (issue-tracker-client.ts) already existed —
+// title/keyword search against the tracker's own search API — but only the
+// frontend's pre-submit duplicate-check UI could call it (POST
+// /api/issues/check-duplicates), purely for a human to eyeball. The agent
+// itself had no way to check for a related/conflicting issue before
+// drafting a new one (see draft_issue's own doc comment on the scenario
+// this closes: issue A removes a method, issue B — drafted after, with no
+// visibility into A — assumes it still exists). Exposing the same search
+// as a real tool lets the agent do that check itself when it judges it's
+// worth one extra call, rather than only ever happening after the fact in
+// a UI panel the agent never sees the result of.
+const SearchIssuesParams = Type.Object({
+  query: Type.String(),
+  limit: Type.Optional(Type.Integer({ default: 10 })),
+});
+
+const SEARCH_ISSUES_DESCRIPTION =
+  "Search the active repo's issue tracker by title keywords — use before draft_issue when the target " +
+  "method/file plausibly has related history (recently changed, or the request sounds like a follow-on to " +
+  "other work), to check for an issue that already touched the same area and might make your current " +
+  "premise stale (e.g. a method your draft assumes exists was removed by another issue). Also useful for " +
+  "manage_issue when the user doesn't have the issue number handy. Title/keyword matching only, not " +
+  "semantic — search short, distinctive terms (a method/file name, not a full sentence). Not required for " +
+  "routine issues with no such signal; skip it rather than searching reflexively on every draft.";
+
+async function searchIssuesExecute(
+  input: Static<typeof SearchIssuesParams>,
+  ctx: ToolContext,
+): Promise<string> {
+  const activeRepo = getActiveRepo(ctx);
+  if (!activeRepo) {
+    return "Error: 无法确定目标仓库：当前可见多个仓库且本轮未选择工作空间。请提醒用户先在左侧 Workspace 中选择目标仓库。";
+  }
+  if (!ctx.db) {
+    return "Error: 当前上下文没有可用的数据库连接，无法查询仓库凭证。";
+  }
+  const repo = await ctx.db.getRepoAdmin(activeRepo.id);
+  if (!repo) {
+    return "Error: 找不到仓库配置。";
+  }
+
+  const limit = input.limit ?? 10;
+  const hits = await searchRepoIssues(repo, input.query, limit);
+  if (hits.length === 0) {
+    return `没有找到与"${input.query}"相关的 issue。`;
+  }
+  return hits.map((h) => `#${h.number} [${h.state}] ${h.title}\n${h.url}`).join("\n\n");
+}
+
+export const searchIssuesTool: ToolDef<typeof SearchIssuesParams> = {
+  name: "search_repo_issues",
+  description: SEARCH_ISSUES_DESCRIPTION,
+  schema: SearchIssuesParams,
+  execute: searchIssuesExecute,
+};
+
 registerTool(draftIssueTool);
 registerTool(manageIssueTool);
+registerTool(searchIssuesTool);

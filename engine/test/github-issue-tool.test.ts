@@ -14,22 +14,24 @@
 // implementation proves the integration rather than asserting against a
 // hand-rolled stub of it.
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { draftIssueTool, manageIssueTool } from "../src/tools/github-issue.js";
+import { draftIssueTool, manageIssueTool, searchIssuesTool } from "../src/tools/github-issue.js";
 import type { ToolContext } from "../src/tools/registry.js";
 import type { DbClient } from "../src/db/client.js";
 import * as issueTrackerClient from "../src/tools/issue-tracker-client.js";
 
 vi.mock("../src/tools/issue-tracker-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/tools/issue-tracker-client.js")>();
-  return { ...actual, getRepoLabels: vi.fn() };
+  return { ...actual, getRepoLabels: vi.fn(), searchRepoIssues: vi.fn() };
 });
 const mockedGetRepoLabels = vi.mocked(issueTrackerClient.getRepoLabels);
+const mockedSearchRepoIssues = vi.mocked(issueTrackerClient.searchRepoIssues);
 
 beforeEach(() => {
   // vitest doesn't auto-reset mocks between tests (no clearMocks/mockReset in
   // vitest.config.ts) — each test sets its own resolved/rejected value, so a
   // stale implementation from a previous test must not leak forward.
   mockedGetRepoLabels.mockReset();
+  mockedSearchRepoIssues.mockReset();
 });
 
 const repoA = { id: 1, name: "repo-a", localPath: "/repos/repo-a" };
@@ -273,4 +275,75 @@ describe("manageIssueTool (name manage_issue)", () => {
       });
     },
   );
+});
+
+// 2026-07-15: search_repo_issues — makes the same title/keyword search the
+// frontend's pre-submit duplicate-check UI already called (POST
+// /api/issues/check-duplicates) available to the agent itself, so it can
+// check for a related/conflicting issue before drafting instead of that
+// only ever surfacing to a human after the fact.
+describe("searchIssuesTool (name search_repo_issues)", () => {
+  const activeCtx = makeCtx({ grantedRepos: [repoA], db: makeDb() });
+  const noRepoCtx = makeCtx({ grantedRepos: [] });
+  const ambiguousRepoCtx = makeCtx({ grantedRepos: [repoA, repoB] });
+
+  it("is registered under the name search_repo_issues", () => {
+    expect(searchIssuesTool.name).toBe("search_repo_issues");
+  });
+
+  it("0 granted repos -> workspace-selection error, never calls searchRepoIssues", async () => {
+    const result = await searchIssuesTool.execute({ query: "collectChunks" }, noRepoCtx);
+    expect(result).toContain("无法确定目标仓库");
+    expect(mockedSearchRepoIssues).not.toHaveBeenCalled();
+  });
+
+  it("2+ granted repos (ambiguous) -> the same workspace-selection error", async () => {
+    const result = await searchIssuesTool.execute({ query: "collectChunks" }, ambiguousRepoCtx);
+    expect(result).toContain("无法确定目标仓库");
+    expect(mockedSearchRepoIssues).not.toHaveBeenCalled();
+  });
+
+  it("ctx.db absent entirely -> its own error, never calls searchRepoIssues", async () => {
+    const result = await searchIssuesTool.execute(
+      { query: "collectChunks" },
+      makeCtx({ grantedRepos: [repoA] }), // no db field
+    );
+    expect(result).toContain("没有可用的数据库连接");
+    expect(mockedSearchRepoIssues).not.toHaveBeenCalled();
+  });
+
+  it("ctx.db.getRepoAdmin resolves null (repo row missing) -> its own error", async () => {
+    const db = { getRepoAdmin: vi.fn().mockResolvedValue(null) } as unknown as DbClient;
+    const result = await searchIssuesTool.execute({ query: "collectChunks" }, makeCtx({ grantedRepos: [repoA], db }));
+    expect(result).toContain("找不到仓库配置");
+    expect(mockedSearchRepoIssues).not.toHaveBeenCalled();
+  });
+
+  it("no hits -> a plain 'not found' message mentioning the query, not an empty string", async () => {
+    mockedSearchRepoIssues.mockResolvedValue([]);
+    const result = await searchIssuesTool.execute({ query: "不存在的东西" }, activeCtx);
+    expect(result).toBe('没有找到与"不存在的东西"相关的 issue。');
+  });
+
+  it("hits -> each formatted as '#number [state] title' + url, in the order returned", async () => {
+    mockedSearchRepoIssues.mockResolvedValue([
+      { number: 12, title: "删除 collectChunks 里的旧截断逻辑", url: "https://example.com/issues/12", state: "closed" },
+      { number: 34, title: "collectChunks 支持按类型配额", url: "https://example.com/issues/34", state: "open" },
+    ]);
+    const result = await searchIssuesTool.execute({ query: "collectChunks" }, activeCtx);
+    expect(result).toBe(
+      "#12 [closed] 删除 collectChunks 里的旧截断逻辑\nhttps://example.com/issues/12\n\n" +
+        "#34 [open] collectChunks 支持按类型配额\nhttps://example.com/issues/34",
+    );
+  });
+
+  it("passes query/limit through to searchRepoIssues, defaulting limit to 10 when omitted", async () => {
+    mockedSearchRepoIssues.mockResolvedValue([]);
+    await searchIssuesTool.execute({ query: "collectChunks" }, activeCtx);
+    expect(mockedSearchRepoIssues).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }), "collectChunks", 10);
+
+    mockedSearchRepoIssues.mockClear();
+    await searchIssuesTool.execute({ query: "collectChunks", limit: 3 }, activeCtx);
+    expect(mockedSearchRepoIssues).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }), "collectChunks", 3);
+  });
 });
