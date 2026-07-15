@@ -26,9 +26,34 @@ function logout() {
 let currentSessionId = null;
 let activeSkills = [];
 let selectedRepoId = null;
-let isStreaming = false;
-let currentAbortController = null;
 let pendingImages = []; // { mediaType, data (base64, no prefix), previewUrl (data URL) }
+
+// Multiple sessions can stream concurrently — switching which one is
+// displayed must never cancel the others. (2026-07-15 fix: this used to be
+// a single global AbortController + isStreaming flag, so opening ANY other
+// session — even just to look at an already-finished one — silently
+// aborted whatever was still generating, because there was only ever one
+// slot to hold "the" in-flight request regardless of which session it
+// belonged to.) Keyed by session id once known; a brand-new chat has no
+// session id yet when the send starts, so it's tracked under a temporary
+// local key until the "session" SSE event reveals the real id — see
+// sendMessage's streamKey/myKey.
+const streamingSessions = new Map(); // key -> AbortController
+
+// The stream key backing whatever's currently on screen — a real session
+// id, a still-pending temp key for an unsent-id new chat, or null when
+// viewing a non-streaming session / empty new-chat state. The send button,
+// input-disable state, and Escape-to-cancel all act on THIS stream only;
+// they must never reach into streamingSessions for a DIFFERENT key.
+let viewingStreamKey = null;
+
+function isViewingStreamActive() {
+    return viewingStreamKey != null && streamingSessions.has(viewingStreamKey);
+}
+
+function syncSendButtonToViewingStream() {
+    setSendButtonState(isViewingStreamActive() ? "stop" : "send");
+}
 
 // Fallback defaults, used until loadConfig() below overwrites them with the
 // server's real values — kept in sync via /api/config instead of two
@@ -109,8 +134,8 @@ document.addEventListener("keydown", (e) => {
         closeMyIssues();
         return;
     }
-    if (isStreaming && currentAbortController) {
-        currentAbortController.abort();
+    if (isViewingStreamActive()) {
+        streamingSessions.get(viewingStreamKey).abort();
     }
     closeSidebar(); // close mobile sidebar
 });
@@ -406,13 +431,13 @@ function renderSessions() {
 }
 
 async function openSession(sessionId) {
-    // Abort any ongoing stream before switching
-    if (currentAbortController) {
-        currentAbortController.abort();
-    }
+    // Switching which session is displayed must NOT touch any other
+    // session's in-flight stream — see streamingSessions' doc comment. Only
+    // reassigns which key the send button/Escape shortcut act on.
     closeSidebar(); // close mobile sidebar
 
     currentSessionId = sessionId;
+    viewingStreamKey = sessionId;
     const resp = await authFetch(`/api/sessions/${sessionId}`);
     const data = await resp.json();
 
@@ -483,6 +508,10 @@ async function openSession(sessionId) {
     if (data.session && data.session.resolved_at) appendResolvedNotice();
     renderLinkedIssuesBanner(data.issue_submissions);
 
+    // Reflects whether the session we just switched TO is itself streaming
+    // in the background (e.g. switching away and back) — independent of
+    // whatever else may be streaming elsewhere.
+    syncSendButtonToViewingStream();
     loadSessions(); // refresh active highlight
 }
 
@@ -502,21 +531,30 @@ const WELCOME_HTML = `
 `;
 
 async function deleteSession(sessionId) {
+    // Unlike merely switching away, deleting the session out from under a
+    // still-running stream really does need to stop it — there's nothing
+    // left for it to persist into.
+    if (streamingSessions.has(sessionId)) {
+        streamingSessions.get(sessionId).abort();
+    }
     await authFetch(`/api/sessions/${sessionId}`, { method: "DELETE" });
     if (currentSessionId === sessionId) {
         currentSessionId = null;
+        viewingStreamKey = null;
         document.getElementById("messages").innerHTML = WELCOME_HTML;
+        syncSendButtonToViewingStream();
     }
     loadSessions();
 }
 
 function newChat() {
-    if (currentAbortController) {
-        currentAbortController.abort();
-    }
+    // Same as openSession — starting a new chat is navigating away from
+    // whatever was on screen, not cancelling it.
     closeSidebar(); // close mobile sidebar
     currentSessionId = null;
+    viewingStreamKey = null;
     document.getElementById("messages").innerHTML = WELCOME_HTML;
+    syncSendButtonToViewingStream();
     loadSessions();
 }
 
@@ -543,7 +581,7 @@ function fillExample(btn) {
 async function sendMessage() {
     const input = document.getElementById("message-input");
     const text = input.value.trim();
-    if ((!text && pendingImages.length === 0) || isStreaming) return;
+    if ((!text && pendingImages.length === 0) || isViewingStreamActive()) return;
 
     // Enter-to-send bypasses the disabled send-btn state (the input field
     // itself stays enabled so the user can still type while nudged to pick
@@ -579,9 +617,17 @@ async function sendMessage() {
     input.style.height = "auto";
     clearPendingImages();
 
-    // Send
-    isStreaming = true;
-    currentAbortController = new AbortController();
+    // Send. A brand-new chat has no real session id yet — tracked under a
+    // throwaway local key until the "session" SSE event below reveals the
+    // real one, at which point this stream's entry gets re-keyed to it
+    // (see myKey reassignment further down). The user is, by definition,
+    // looking at whatever they just hit send on, so this becomes the
+    // viewing key too.
+    const streamKey = sessionIdAtStart ?? `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    let myKey = streamKey;
+    viewingStreamKey = streamKey;
+    const controller = new AbortController();
+    streamingSessions.set(streamKey, controller);
     setSendButtonState("stop");
 
     // Create assistant bubble
@@ -592,13 +638,13 @@ async function sendMessage() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                session_id: currentSessionId,
+                session_id: sessionIdAtStart,
                 message: text,
                 active_skills: activeSkills,
                 repo_id: selectedRepoId,
                 images: imagesToSend,
             }),
-            signal: currentAbortController.signal,
+            signal: controller.signal,
         });
 
         // Check HTTP status before reading SSE
@@ -665,7 +711,21 @@ async function sendMessage() {
                                 (data.reason === "resolved" || data.reason === "not_found")) {
                                 insertSessionSwitchNotice(userMsgEl, sessionIdAtStart, data.reason);
                             }
-                            currentSessionId = data.session_id;
+                            // Re-key this stream's map entry to the real session id
+                            // (was the temp pending-* key for a brand-new chat, or
+                            // could legitimately differ from sessionIdAtStart per the
+                            // resolved/not_found cases above). Only follow along with
+                            // viewingStreamKey/currentSessionId if the user is still
+                            // looking at whatever they sent this from — if they've
+                            // already navigated elsewhere, this stream keeps running
+                            // under its new key in the background, untouched.
+                            if (myKey !== data.session_id) {
+                                streamingSessions.delete(myKey);
+                                streamingSessions.set(data.session_id, controller);
+                                if (viewingStreamKey === myKey) viewingStreamKey = data.session_id;
+                                myKey = data.session_id;
+                            }
+                            if (viewingStreamKey === myKey) currentSessionId = data.session_id;
                         }
                     } else if (eventType === "text") {
                         if (!activeRun) {
@@ -728,7 +788,18 @@ async function sendMessage() {
                         showThinking(contentEl);
                         scrollToBottom();
                     } else if (eventType === "done") {
-                        if (data.session_id) {
+                        // Belt-and-suspenders re-key, same guard as the "session"
+                        // handler above — the id shouldn't actually change between
+                        // the two events, but this must never assign to the global
+                        // currentSessionId on behalf of a session the user has
+                        // since navigated away from.
+                        if (data.session_id && myKey !== data.session_id) {
+                            streamingSessions.delete(myKey);
+                            streamingSessions.set(data.session_id, controller);
+                            if (viewingStreamKey === myKey) viewingStreamKey = data.session_id;
+                            myKey = data.session_id;
+                        }
+                        if (data.session_id && viewingStreamKey === myKey) {
                             currentSessionId = data.session_id;
                         }
                         hideThinking(contentEl);
@@ -785,9 +856,13 @@ async function sendMessage() {
         }
     }
 
-    isStreaming = false;
-    currentAbortController = null;
-    setSendButtonState("send");
+    streamingSessions.delete(myKey);
+    // Only touch the send button if this stream is the one currently on
+    // screen — a background stream finishing must not re-enable sending
+    // for whatever session the user has since switched to.
+    if (viewingStreamKey === myKey) {
+        setSendButtonState("send");
+    }
     loadSessions();
 }
 
@@ -807,8 +882,8 @@ function setSendButtonState(state) {
 }
 
 function stopStreaming() {
-    if (currentAbortController) {
-        currentAbortController.abort();
+    if (isViewingStreamActive()) {
+        streamingSessions.get(viewingStreamKey).abort();
     }
 }
 
@@ -1346,7 +1421,7 @@ function appendBudgetExhaustedNotice() {
     const btn = document.createElement("button");
     btn.textContent = "继续调查";
     btn.onclick = () => {
-        if (isStreaming) return;
+        if (isViewingStreamActive()) return;
         btn.disabled = true;
         const input = document.getElementById("message-input");
         input.value = CONTINUE_INVESTIGATION_PROMPT;
