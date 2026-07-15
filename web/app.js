@@ -1431,11 +1431,20 @@ function renderLinkedIssuesBanner(submissions) {
 // never a locally-patched guess. Safe to call whenever there's an open
 // session; a no-op otherwise.
 async function refreshLinkedIssuesBanner() {
-    if (!currentSessionId) return;
-    const sessResp = await authFetch(`/api/sessions/${currentSessionId}`);
-    if (sessResp.ok) {
+    const sessionId = currentSessionId;
+    if (!sessionId) return;
+    const sessResp = await authFetch(`/api/sessions/${sessionId}`);
+    // The 20s poll/focus-triggered refresh below can still be in flight when
+    // the user navigates away (new chat, another session) — this fetch was
+    // captured for whatever session was current when it STARTED, so a late
+    // response landing after that navigation must not render into whatever
+    // is on screen now. Without this guard, "新建会话" while a refresh is
+    // in flight showed the OLD session's issue banner sitting above the
+    // fresh welcome screen once the stale response arrived (QA-reported,
+    // 2026-07-15).
+    if (sessResp.ok && currentSessionId === sessionId) {
         const sessData = await sessResp.json();
-        renderLinkedIssuesBanner(sessData.issue_submissions);
+        if (currentSessionId === sessionId) renderLinkedIssuesBanner(sessData.issue_submissions);
     }
 }
 
