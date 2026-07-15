@@ -511,6 +511,105 @@ describe("pollTrackedIssues", () => {
     expect(raw.remote_state).toBe("opened");
   });
 
+  // 2026-07-15, Codex review follow-up (post-fc64ff40): Timeline API 返回
+  // 非 200/404（这里用 429 模拟限流）以前会被 fetchGithubTimelineReopens
+  // 悄悄降级成 0，调用方把这个 0 当权威值用——一个真实被重开、目前仍是
+  // reopened 状态的 issue，只要这一轮恰好撞上限流，reopen_count 就会被
+  // 写回 0、track_status 跟着从 reopened 倒退回 submitted，还会把之前埋的
+  // track_error 一并清空，整个过程看起来像"轮询正常完成"而不是"数据不完
+  // 整"。这条测试证明修复后：reopen_count 沿用上一次的值（1，不是 0），
+  // status 不倒退，track_error 换成明确指出本轮部分数据没拿到的信息，而
+  // 不是被 clearError 抹掉；同时 remote_state/remote_labels/closed_at 这些
+  // 快照本身成功拿到的数据仍然正常更新，不因为 timeline 那一路失败就整轮
+  // 作废。
+  it("Timeline API 本轮返回 429（限流）-> reopen_count 沿用上次结果，不倒退回 0/submitted，track_error 说明本轮部分数据缺失而不是被清空", async () => {
+    const settings = makeSettings();
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://github.com/acme/widgets.git",
+      credToken: "repo-own-github-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 42,
+      issueUrl: "https://github.com/acme/widgets/issues/42",
+    });
+    // 上一轮已经确认过这个 issue 被重开过一次。
+    await client.updateIssueTracking(
+      subId,
+      { trackStatus: "reopened", remoteState: "opened", reopenCount: 1 },
+      await client.beginPoll(subId),
+    );
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/timeline")) {
+        return { status: 429, json: async () => ({ message: "rate limited" }) } as unknown as Response;
+      }
+      // issue 快照本身这一轮成功拿到了新数据（labels 变了），证明快照更新
+      // 不应该被 timeline 那一路的失败拖累。
+      return {
+        status: 200,
+        json: async () => ({ state: "open", labels: ["type::bug"], closed_at: null }),
+      } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollSubmissionById(client, subId, settings);
+
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.reopen_count).toBe(1); // 沿用上次的值，没有被 429 悄悄改成 0
+    expect(raw.track_status).toBe("reopened"); // 没有从 reopened 倒退回 submitted
+    expect(raw.remote_state).toBe("opened"); // 快照本身的数据仍然正常更新
+    expect(JSON.parse(raw.remote_labels)).toEqual(["type::bug"]);
+    expect(raw.track_error).toContain("重开事件数据本轮获取失败"); // 不是被 clearError 悄悄抹掉
+  });
+
+  // Timeline API 返回 404（这个 repo/issue 真的没有 timeline，理论上 GitHub
+  // 上极少见，但跟 GitLab 那边"老版本没有 resource_state_events 端点"保持
+  // 对称处理）—— 这是一个永久性的"这个功能不存在"信号，跟 429 那种瞬时失败
+  // 不是一回事，应该继续按"确认为 0"降级，而不是也被当成"未知"。
+  it("Timeline API 返回 404 -> 视为确认没有重开事件（0），跟 429 的'未知'区分开，不产生 track_error", async () => {
+    const settings = makeSettings();
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://github.com/acme/widgets.git",
+      credToken: "repo-own-github-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 42,
+      issueUrl: "https://github.com/acme/widgets/issues/42",
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/timeline")) {
+        return { status: 404, json: async () => ({}) } as unknown as Response;
+      }
+      return {
+        status: 200,
+        json: async () => ({ state: "open", labels: [], closed_at: null }),
+      } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollSubmissionById(client, subId, settings);
+
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.reopen_count).toBe(0);
+    expect(raw.track_status).toBe("submitted");
+    expect(raw.track_error).toBeNull();
+  });
+
   // 生产 QA 复测（2026-07-14）：一个真实 GitLab 仓库的修复 bot 已经在留
   // codex-report/v1 完成报告，但 fetchAndStoreReports 从功能上线起就只接
   // 在 GitLab 轮询路径里——GitHub 从来没有等价实现，Admin 工单页的已验证
@@ -733,6 +832,110 @@ describe("pollTrackedIssues", () => {
     expect(mine!.commit_sha).toBe("abcd1234");
     expect(mine!.issue_url).toBe("https://gitlab.example.com/group/proj/-/issues/7");
     expect(mine!.repo_id).toBe(repoId);
+  });
+
+  // 2026-07-15, Codex review follow-up (post-fc64ff40) — GitLab 版本的同一
+  // 个修复，跟上面 GitHub Timeline 429 那条测试对称：resource_state_events
+  // 本轮返回 429，不应该把 reopen_count 悄悄写回 0、也不应该把 trackStatus
+  // 从 reopened 拉回别的状态，更不应该用 clearError 把这次数据不完整的事实
+  // 抹掉。
+  it("resource_state_events 本轮返回 429（限流）-> reopen_count 沿用上次结果，不倒退，track_error 说明本轮部分数据缺失", async () => {
+    const settings = makeSettings({ APP_ISSUE_FIX_BOT_USERNAME: "codex-fleet-bot" });
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://gitlab.example.com/group/proj.git",
+      credToken: "gitlab-secret-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 7,
+      issueUrl: "https://gitlab.example.com/group/proj/-/issues/7",
+    });
+    await client.updateIssueTracking(
+      subId,
+      { trackStatus: "reopened", remoteState: "opened", reopenCount: 1 },
+      await client.beginPoll(subId),
+    );
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/resource_state_events")) {
+        return { status: 429, json: async () => ({ message: "rate limited" }) } as unknown as Response;
+      }
+      if (url.includes("/notes")) {
+        // status 仍然算出 reopened（沿用上次的 reopenCount=1），会照常触发
+        // fetchAndStoreReports 的 notes 拉取——跟这条测试要证明的东西无关，
+        // 给个空列表即可。
+        return { status: 200, json: async () => [] } as unknown as Response;
+      }
+      if (/\/issues\/7(\?|$)/.test(url)) {
+        return {
+          status: 200,
+          json: async () => ({ state: "opened", labels: ["type::bug"], closed_at: null }),
+        } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch url in test: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const count = await pollTrackedIssues(client, settings);
+    expect(count).toBe(1);
+
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.reopen_count).toBe(1); // 沿用上次的值，没有被 429 悄悄改成 0
+    expect(raw.track_status).toBe("reopened"); // 没有倒退
+    expect(raw.remote_state).toBe("opened"); // 快照本身的数据仍然正常更新
+    expect(JSON.parse(raw.remote_labels)).toEqual(["type::bug"]);
+    expect(raw.track_error).toContain("重开事件数据本轮获取失败");
+  });
+
+  // resource_state_events 返回 404（老版本 GitLab 没有这个端点）—— 永久性
+  // 的"这个功能不存在"信号，跟 429 的瞬时失败要区分开，继续按"确认为 0"
+  // 降级，不产生 track_error（否则老版本 GitLab 的仓库会永远显示一个错误
+  // 标记，而这其实是正常、预期内的行为）。
+  it("resource_state_events 返回 404 -> 视为确认没有重开事件（0），跟 429 的'未知'区分开，不产生 track_error", async () => {
+    const settings = makeSettings({ APP_ISSUE_FIX_BOT_USERNAME: "codex-fleet-bot" });
+    const repoId = await client.createRepo({
+      name: "proj",
+      url: "https://gitlab.example.com/group/proj.git",
+      credToken: "gitlab-secret-token",
+    });
+    const subId = await client.recordIssueSubmission({
+      sessionId: "s1",
+      repoId,
+      userId: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      issueNumber: 7,
+      issueUrl: "https://gitlab.example.com/group/proj/-/issues/7",
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/resource_state_events")) {
+        return { status: 404, json: async () => ({}) } as unknown as Response;
+      }
+      if (/\/issues\/7(\?|$)/.test(url)) {
+        return {
+          status: 200,
+          json: async () => ({ state: "opened", labels: [], closed_at: null }),
+        } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch url in test: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const count = await pollTrackedIssues(client, settings);
+    expect(count).toBe(1);
+
+    const raw = readSubmissionRaw(dbPath, subId);
+    expect(raw.reopen_count).toBe(0);
+    expect(raw.track_status).toBe("submitted");
+    expect(raw.track_error).toBeNull();
   });
 
   // Codex full-repo review (2026-07-14, Warning): codex-report/v1 used to be

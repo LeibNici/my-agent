@@ -125,12 +125,27 @@ async function parseIssueApiBase(issueUrl: string): Promise<{ error: string | nu
  * permanent here. GitLab versions disagree on the reopen event's `state`
  * value ("reopened" vs "opened"); both are accepted — safe because issue
  * CREATION never emits a state event, so any opened/reopened event in this
- * stream is a genuine reopen. */
+ * stream is a genuine reopen.
+ *
+ * reopenCount is `null`, not `0`, when the event stream couldn't actually
+ * be read — 2026-07-15, Codex review (post-fc64ff40 follow-up): the caller
+ * used to get a bare `number` and treat it as authoritative regardless of
+ * WHY the loop stopped early, so a transient 429/5xx on this endpoint
+ * looked identical to "genuinely zero reopens" — deriveStatus could then
+ * regress an actually-reopened issue back to submitted/claimed/merged, and
+ * the caller's `clearError: true` would erase any trace that the data was
+ * incomplete. 404 is kept as a confirmed `0` (not `null`): it means this
+ * GitLab instance doesn't have the endpoint at all, a permanent condition
+ * worth degrading gracefully for, not a transient failure worth flagging
+ * every single poll forever. Any other non-200 (429/403/5xx/network
+ * hiccup surfaced as a completed-but-failed response) is `null` — "we
+ * don't actually know" — so the caller can fall back to the submission's
+ * last-known reopen_count instead of silently overwriting it with 0. */
 async function fetchGitlabStateEvents(
   apiBase: string,
   issueNumber: number,
   token: string,
-): Promise<{ reopenCount: number; lastClosedAt: string | null }> {
+): Promise<{ reopenCount: number | null; lastClosedAt: string | null }> {
   let reopens = 0;
   let lastClosedAt: string | null = null;
   for (let page = 1; page <= EVENTS_MAX_PAGES; page++) {
@@ -139,7 +154,8 @@ async function fetchGitlabStateEvents(
       { headers: { "PRIVATE-TOKEN": token } },
       POLL_TIMEOUT_MS,
     );
-    if (resp.status !== 200) break; // older GitLab without this API -> degrade to snapshot-only
+    if (resp.status === 404) break; // older GitLab without this API -> confirmed 0, degrade to snapshot-only
+    if (resp.status !== 200) return { reopenCount: null, lastClosedAt: null }; // transient failure — unknown, not zero
     const events = (await resp.json()) as Array<{ state?: string; created_at?: string }>;
     for (const ev of events) {
       if (ev.state === "reopened" || ev.state === "opened") reopens++;
@@ -158,12 +174,19 @@ async function fetchGitlabStateEvents(
 // 类型为 "reopened" 的条目就是每一次重新打开——镜像
 // fetchGitlabStateEvents 的分页/计数写法，让 GitHub 也有真实的重开计数，
 // 而不是永远停在初始值。
+//
+// null vs 0 (2026-07-15, Codex review follow-up): same fix and same
+// rationale as fetchGitlabStateEvents above — a 404 (repo/issue genuinely
+// has no timeline, essentially never happens for GitHub but kept for
+// symmetry) degrades to a confirmed 0; any other non-200 (429 rate limit
+// being the realistic case here) returns null so the caller doesn't treat
+// an unreadable timeline as "confirmed zero reopens".
 async function fetchGithubTimelineReopens(
   owner: string,
   repoName: string,
   issueNumber: number,
   token: string,
-): Promise<number> {
+): Promise<number | null> {
   let reopens = 0;
   for (let page = 1; page <= EVENTS_MAX_PAGES; page++) {
     const resp = await fetchWithTimeout(
@@ -171,7 +194,8 @@ async function fetchGithubTimelineReopens(
       { headers: githubHeaders(token) },
       POLL_TIMEOUT_MS,
     );
-    if (resp.status !== 200) break; // degrade to snapshot-only, same posture as the GitLab path
+    if (resp.status === 404) break; // repo/issue has no timeline -> confirmed 0, degrade to snapshot-only
+    if (resp.status !== 200) return null; // transient failure — unknown, not zero
     const events = (await resp.json()) as Array<{ event?: string }>;
     for (const ev of events) {
       if (ev.event === "reopened") reopens++;
@@ -459,7 +483,12 @@ async function pollGithub(
   );
 
   const reopenCount = await fetchGithubTimelineReopens(owner, repoName, sub.issue_number, token);
-  const status = deriveStatus(remoteState, labels, reopenCount);
+  // 2026-07-15, Codex review follow-up: same fix as pollOne's GitLab
+  // branch — null means the timeline couldn't be read this round, fall
+  // back to the submission's last-known reopen_count for status instead
+  // of treating "unknown" as "confirmed zero".
+  const reopenCountKnown = reopenCount !== null;
+  const status = deriveStatus(remoteState, labels, reopenCountKnown ? reopenCount : sub.reopen_count);
 
   await db.updateIssueTracking(
     sub.id,
@@ -467,9 +496,11 @@ async function pollGithub(
       trackStatus: status,
       remoteState,
       remoteLabels: JSON.stringify(labels),
-      reopenCount,
+      ...(reopenCountKnown ? { reopenCount } : {}),
       closedAt: data.closed_at || undefined,
-      clearError: true,
+      ...(reopenCountKnown
+        ? { clearError: true }
+        : { trackError: "重开事件数据本轮获取失败（GitHub API 非 200），其余状态已更新，reopen 计数沿用上次结果" }),
     },
     generation,
   );
@@ -569,7 +600,14 @@ export async function pollOne(
 
   const { reopenCount, lastClosedAt } = await fetchGitlabStateEvents(base, sub.issue_number, token);
   const closedAt = data.closed_at || lastClosedAt || undefined;
-  const status = deriveStatus(remoteState, labels, reopenCount);
+  // 2026-07-15, Codex review follow-up: reopenCount === null means the
+  // event stream couldn't be read this round (see fetchGitlabStateEvents's
+  // doc comment) — fall back to the submission's own last-known
+  // reopen_count instead of treating "unknown" as "confirmed zero", which
+  // used to be able to regress an actually-reopened issue's status back to
+  // submitted/claimed/merged on a single transient 429/5xx.
+  const reopenCountKnown = reopenCount !== null;
+  const status = deriveStatus(remoteState, labels, reopenCountKnown ? reopenCount : sub.reopen_count);
 
   // Completion reports only exist once fix activity has happened — an
   // untouched open issue skips the notes round-trip entirely.
@@ -583,9 +621,14 @@ export async function pollOne(
       trackStatus: status,
       remoteState,
       remoteLabels: JSON.stringify(labels),
-      reopenCount,
+      // Omitted (not overwritten with a stale 0) when unknown — leaves the
+      // column at its current value, same as reopenCountKnown's fallback
+      // above already assumed for this round's status.
+      ...(reopenCountKnown ? { reopenCount } : {}),
       closedAt,
-      clearError: true,
+      ...(reopenCountKnown
+        ? { clearError: true }
+        : { trackError: "重开事件数据本轮获取失败（GitLab API 非 200），其余状态已更新，reopen 计数沿用上次结果" }),
     },
     generation,
   );

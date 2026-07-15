@@ -433,6 +433,12 @@ body {
     color: var(--faint);
     cursor: copy;
     white-space: nowrap;
+    /* 2026-07-15: .session-info 是 flex column，默认 align-items:stretch
+       会把这个 span 的可点击热区拉伸到跟整行一样宽（可见文字只有几个
+       字符），导致"点击复制 ID"(它自己的 onclick + stopPropagation)吃掉了
+       本该属于"点击切换会话"(.session-item 的 onclick)的大片区域。收窄
+       到内容宽度，热区就跟可见文字对齐了。 */
+    align-self: flex-start;
 }
 .session-id::before { content: "◆ "; font-size: 9px; }
 .session-id:hover { color: var(--moss); }
