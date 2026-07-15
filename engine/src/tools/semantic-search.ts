@@ -24,15 +24,31 @@
 // registered ToolDef's `execute(input, ctx)` signature has no slot for it.
 // This mirrors v1's own resolution: `from app.config import settings,
 // app_settings` imports module-level singletons, instantiated once when
-// the module first loads. The direct Node parity is SETTINGS below,
-// loaded once at this module's import time — same pattern symbol-index.ts
-// (CTAGS_BIN) and code-search.ts (RG_BIN) already use for their own
-// load-once-at-import externalities. Tests never exercise the real
-// singleton for behavior assertions: runSemanticSearch takes `settings`
-// as an explicit parameter (like embeddingKeyOrFallback/embedAndSaveIndex),
-// so tests inject a controlled Settings object directly, the same
-// `__internal`-style escape hatch symbol-index.ts's buildIndexWithBin uses
-// to let tests inject a fake ctagsBin instead of depending on PATH.
+// the module first loads. Tests never exercise the real singleton for
+// behavior assertions: runSemanticSearch takes `settings` as an explicit
+// parameter (like embeddingKeyOrFallback/embedAndSaveIndex), so tests
+// inject a controlled Settings object directly, the same `__internal`-style
+// escape hatch symbol-index.ts's buildIndexWithBin uses to let tests inject
+// a fake ctagsBin instead of depending on PATH.
+//
+// 2026-07-15 production bug: SETTINGS below used to be loaded ONCE at
+// import time and never touched again — treated the same as symbol-index.ts's
+// CTAGS_BIN/code-search.ts's RG_BIN, which really are static externalities
+// that can't change after process start. Settings isn't one of those:
+// main.ts merges an admin-configured DB llm_config (Admin → LLM 配置) into
+// its own Settings object AFTER this module has already loaded and computed
+// its own separate loadSettings() from just .env — a real config change
+// (moving ANTHROPIC_* off .env onto that DB config) landed without this
+// module getting a way to see it. repo-sync.ts's indexing path has the same
+// "Settings assembled after module load" problem and already solved it
+// (configureIndexing, called from main.ts once the DB merge is done) — that
+// export function ran, so index BUILDING picked up the DB key and worked
+// fine. This module had no equivalent hook, so semanticSearchExecute kept
+// calling runSemanticSearch with an apiKey-less Settings forever, which
+// silently returns the "语义检索未启用" no-key message (see below) — no
+// exception, no log line, so "semantic search doesn't work" had nothing an
+// operator could grep for. configureSemanticSearch is that missing hook,
+// called from main.ts right next to configureIndexing.
 import * as path from "node:path";
 import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef, type ToolContext } from "./registry.js";
@@ -296,10 +312,17 @@ async function runSemanticSearch(
 // registration
 // ---------------------------------------------------------------------------
 
-// Loaded once at module-import time — see the top-of-file comment for why
-// this mirrors v1's module-singleton `settings`/`app_settings` instead of
-// taking Settings as an execute() parameter (no slot for it in ToolDef).
-const SETTINGS: Settings = loadSettings();
+// Defaults to a bare loadSettings() so an import that never goes through
+// main.ts (existing tests, anything else that only touches the tool
+// registry) still gets a value — main.ts overwrites this via
+// configureSemanticSearch once its own Settings has the DB llm_config
+// merged in. See the top-of-file 2026-07-15 comment for why this needs to
+// be mutable rather than the `const` it used to be.
+let SETTINGS: Settings = loadSettings();
+
+export function configureSemanticSearch(settings: Settings): void {
+  SETTINGS = settings;
+}
 
 async function semanticSearchExecute(
   input: Static<typeof SemanticSearchParams>,

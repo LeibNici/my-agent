@@ -40,6 +40,7 @@ import {
   type RepoSyncDescriptor,
 } from "../repo-sync.js";
 import { periodicTrackingLoop } from "../issue-tracker.js";
+import { configureSemanticSearch } from "../tools/semantic-search.js";
 import { buildApp } from "./app.js";
 
 // listReposFull() returns the admin/internal full row shape (snake_case,
@@ -250,6 +251,14 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   // (see configureIndexing's doc comment) — must run before the startup sync
   // below, which is the first thing that can trigger onSyncSuccess.
   configureIndexing(settings);
+  // 2026-07-15 production bug fix: semantic-search.ts computed its own
+  // Settings at module-import time (before the DB llm_config merge above
+  // even ran) and never got a chance to see this one — same "assembled
+  // after module load" problem configureIndexing exists for, just missing
+  // its own hook until now. Without this, semantic_search silently returned
+  // "语义检索未启用" for every query even when index BUILDING (which does
+  // go through configureIndexing) worked fine and produced a real index.
+  configureSemanticSearch(settings);
 
   // Repo sync — v1's lifespan (app/main.py, ~line 124-138) awaits
   // sync_all_repos(repos) on startup BEFORE the app starts serving requests,
