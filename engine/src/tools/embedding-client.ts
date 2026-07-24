@@ -194,6 +194,56 @@ async function embedBatch(
 }
 
 // ---------------------------------------------------------------------------
+// embedTexts — plain-text batch embedding, shared by anything that isn't
+// the repo code index (issue_embeddings sync). embedBatch itself already
+// takes `texts: string[]` (the chunk->text conversion happens in
+// embedInput, outside embedBatch), so the only real orchestration worth
+// pulling out is the >EMBED_BATCH batching + CONCURRENCY-wave loop that
+// otherwise only lives inside doEmbedAndSave, tangled with chunk-hash-reuse-
+// cache and isStillLatest staleness checks this caller doesn't need.
+//
+// Deliberately per-item-tolerant (a batch failure nulls out just that
+// batch's slots and the loop keeps going) rather than doEmbedAndSave's
+// fail-the-whole-build-on-first-error contract — an issue sync pass embeds
+// up to a whole repo's tracker history in one tick; one bad batch shouldn't
+// null out everything else that already succeeded. Callers write only the
+// non-null entries and let the next sync tick retry the rest (a null result
+// leaves that issue's content_hash unwritten, so it's picked up again next
+// pass instead of being marked done with a missing vector).
+// ---------------------------------------------------------------------------
+
+export async function embedTexts(texts: string[], settings: Settings): Promise<(Float32Array | null)[]> {
+  const out: (Float32Array | null)[] = new Array(texts.length).fill(null);
+  const key = embeddingKeyOrFallback(settings);
+  if (!key || texts.length === 0) return out;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), BUILD_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const batches: number[][] = [];
+    for (let s = 0; s < texts.length; s += EMBED_BATCH) {
+      batches.push(Array.from({ length: Math.min(EMBED_BATCH, texts.length - s) }, (_, k) => s + k));
+    }
+    for (let waveStart = 0; waveStart < batches.length; waveStart += CONCURRENCY) {
+      const wave = batches.slice(waveStart, waveStart + CONCURRENCY);
+      const results = await Promise.all(
+        wave.map((indices) => embedBatch(indices.map((i) => texts[i]), settings, key, controller.signal)),
+      );
+      for (let w = 0; w < wave.length; w++) {
+        const embs = results[w];
+        if (embs === null) continue; // this batch failed — leave its slots null, other batches still land
+        const indices = wave[w];
+        for (let k = 0; k < indices.length; k++) out[indices[k]] = embs[k];
+      }
+    }
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // L2 normalization — write-time port of v1's
 // `norms[norms == 0] = 1.0; vectors = vectors / norms`
 //

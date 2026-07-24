@@ -286,6 +286,17 @@ parentPort.on("message", (req: Request) => {
         reply({ id, ok: true, result: storage.upsertFixReport(fields) });
         break;
       }
+      case "upsertIssueEmbeddings": {
+        const [rows] = args as [Parameters<typeof storage.upsertIssueEmbeddings>[0]];
+        storage.upsertIssueEmbeddings(rows);
+        reply({ id, ok: true, result: undefined });
+        break;
+      }
+      case "getIssueEmbeddings": {
+        const [repoId] = args as [Parameters<typeof storage.getIssueEmbeddings>[0]];
+        reply({ id, ok: true, result: storage.getIssueEmbeddings(repoId) });
+        break;
+      }
       case "getUnverifiedFixReports": {
         reply({ id, ok: true, result: storage.getUnverifiedFixReports() });
         break;

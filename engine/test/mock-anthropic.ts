@@ -145,6 +145,56 @@ export function textThenToolTurn(
 }
 
 /**
+ * A single assistant turn carrying TWO tool_use content blocks (no text),
+ * both in the same message — used to prove a beforeToolCall gate that scans
+ * for a COMPLETED ToolResultMessage (not an AssistantMessage's toolCall
+ * block) can't be satisfied by a model requesting both tools "in the same
+ * breath": pi pushes the whole assistant message onto shared context before
+ * executing anything in the batch, and even under toolExecution:"sequential"
+ * each call's result is only flushed to shared context after the ENTIRE
+ * batch finishes — so the second tool's beforeToolCall still can't see the
+ * first tool's result yet, regardless of within-batch order.
+ */
+export function twoToolTurn(
+  name1: string,
+  input1: object,
+  id1: string,
+  name2: string,
+  input2: object,
+  id2: string,
+): SseEvent[] {
+  return [
+    {
+      type: "message_start",
+      message: {
+        id: "m1",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: "mock",
+        usage: { input_tokens: 10, output_tokens: 0 },
+      },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: id1, name: name1, input: {} } },
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input1) },
+    },
+    { type: "content_block_stop", index: 0 },
+    { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: id2, name: name2, input: {} } },
+    {
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input2) },
+    },
+    { type: "content_block_stop", index: 1 },
+    { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } },
+    { type: "message_stop" },
+  ];
+}
+
+/**
  * Starts a scripted mock Anthropic Messages server: request N gets
  * `turns[N]`'s SSE events (0-indexed); once the script is exhausted it keeps
  * replying with a text turn so a run doesn't hang mid-loop. Every request

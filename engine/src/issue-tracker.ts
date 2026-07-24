@@ -16,15 +16,19 @@
 // Every repo lookup goes through db.getRepoAdmin/listReposFull (the full
 // row, cred_token included) — never db.getRepo/listRepos — matching every
 // other tracker-facing file in this phase.
+import { createHash } from "node:crypto";
 import type { DbClient } from "./db/client.js";
 import type { Settings } from "./config.js";
 import type { FullRepoRow, TrackableSubmissionRow, IssueTrackingOverviewRow } from "./db/storage.js";
 import { validateUrl } from "./repo-sync.js";
-import { fetchWithTimeout, githubHeaders } from "./tools/issue-tracker-client.js";
+import { fetchWithTimeout, githubHeaders, listRepoIssues } from "./tools/issue-tracker-client.js";
+import { embedTexts, l2Normalize } from "./tools/embedding-client.js";
 
 const EVENTS_MAX_PAGES = 5; // 100/page; >500 state events on one issue isn't a real case
 const NOTES_MAX_PAGES = 5;
 const POLL_TIMEOUT_MS = 20_000; // v1's httpx timeout=20, uniform across every call in this file
+const ISSUE_EMBED_PAGE_SIZE = 100;
+const ISSUE_EMBED_MAX_PAGES = 20; // bounds worst-case per-repo work per tick, same spirit as EVENTS_MAX_PAGES above
 
 // The fleet's finish-issue tool embeds this machine-readable marker in its
 // completion comment (see deploy/codex-issue). Parsed as an event stream —
@@ -660,6 +664,84 @@ export async function pollSubmissionById(
 /** One reconciliation round over every due submission. Returns how many
  * were polled. Per-issue failures are recorded on that row (track_error)
  * and never abort the round. */
+function issueContentHash(title: string, description: string): string {
+  return createHash("sha256").update(`${title}\n${description}`).digest("hex");
+}
+
+/** Keeps issue_embeddings current for every repo, independent of whether
+ * any CodeAxis-filed submission is due for a tracking re-check — this is
+ * deliberately its OWN unconditional step (called next to
+ * verifyPendingFixReports below, not nested inside the `if (subs.length >
+ * 0)` block above) for the exact reason documented on that block: a repo's
+ * tracker can gain new issues on any tick regardless of whether CodeAxis
+ * currently has anything of its own pending re-check, and nesting this
+ * inside that guard would silently stop indexing new issues the moment
+ * every tracked submission goes quiet.
+ *
+ * Full re-list every tick (not an incremental updated_after fetch) —
+ * content-hash diffing decides what actually needs re-embedding, so a
+ * steady-state repo with no tracker changes costs a few list calls plus
+ * zero embedding calls. Page count per repo is capped
+ * (ISSUE_EMBED_MAX_PAGES) so one very large tracker can't stall the whole
+ * tick indefinitely; the next tick picks up wherever this one left off
+ * (issues beyond the cap simply keep their existing stored embedding, or
+ * stay unindexed, until a future tick's re-list reaches them again — no
+ * pagination cursor is persisted between ticks). Best-effort throughout:
+ * per-repo failures are caught and logged, never abort the round for
+ * other repos. */
+async function syncIssueEmbeddings(db: DbClient, settings: Settings): Promise<void> {
+  const repos = await db.listReposFull();
+  for (const repo of repos) {
+    try {
+      const existing = await db.getIssueEmbeddings(repo.id);
+      const existingHashes = new Map(existing.map((r) => [r.issueNumber, r.contentHash]));
+
+      const stale: { number: number; title: string; description: string; state: string; url: string; hash: string }[] =
+        [];
+      for (let page = 1; page <= ISSUE_EMBED_MAX_PAGES; page++) {
+        const items = await listRepoIssues(repo, page, ISSUE_EMBED_PAGE_SIZE);
+        if (items.length === 0) break;
+        for (const item of items) {
+          const hash = issueContentHash(item.title, item.description);
+          if (existingHashes.get(item.number) !== hash) {
+            stale.push({
+              number: item.number,
+              title: item.title,
+              description: item.description,
+              state: item.state,
+              url: item.url,
+              hash,
+            });
+          }
+        }
+        if (items.length < ISSUE_EMBED_PAGE_SIZE) break; // last page
+      }
+      if (stale.length === 0) continue;
+
+      const vectors = await embedTexts(
+        stale.map((s) => `${s.title}\n\n${s.description}`),
+        settings,
+      );
+      const rows = stale
+        .map((s, i) => ({ item: s, vec: vectors[i] }))
+        .filter((r): r is { item: (typeof stale)[number]; vec: Float32Array } => r.vec !== null)
+        .map(({ item, vec }) => ({
+          repoId: repo.id,
+          issueNumber: item.number,
+          title: item.title,
+          state: item.state,
+          url: item.url,
+          contentHash: item.hash,
+          embedding: l2Normalize(vec),
+        }));
+      if (rows.length > 0) await db.upsertIssueEmbeddings(rows);
+    } catch (e) {
+      const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
+      console.log(`  ⚠️  issue embedding sync failed for repo ${repo.id}: ${label}`);
+    }
+  }
+}
+
 export async function pollTrackedIssues(db: DbClient, settings: Settings): Promise<number> {
   const subs = await db.getTrackableSubmissions();
 
@@ -718,6 +800,16 @@ export async function pollTrackedIssues(db: DbClient, settings: Settings): Promi
   } catch (e) {
     const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
     console.log(`  ❌ fix-report verification failed: ${label}`);
+  }
+
+  // Unconditional, same reasoning as verifyPendingFixReports above — a
+  // repo's tracker can have new/changed issues on any tick regardless of
+  // whether `subs` is empty this round.
+  try {
+    await syncIssueEmbeddings(db, settings);
+  } catch (e) {
+    const label = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
+    console.log(`  ❌ issue embedding sync failed: ${label}`);
   }
 
   return subs.length;

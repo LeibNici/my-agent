@@ -188,6 +188,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
       repo_id?: unknown;
       title?: unknown;
       expected_behavior?: unknown;
+      pending_confirmations?: unknown;
       body?: unknown;
       labels?: unknown;
       session_id?: unknown;
@@ -198,6 +199,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     if (typeof body.title !== "string" || !body.title) return c.json({ detail: "title is required" }, 422);
     if (typeof body.body !== "string" || !body.body) return c.json({ detail: "body is required" }, 422);
     const expectedBehavior = typeof body.expected_behavior === "string" ? body.expected_behavior : "";
+    const pendingConfirmations = typeof body.pending_confirmations === "string" ? body.pending_confirmations : "";
     let labels = Array.isArray(body.labels)
       ? body.labels.filter((l): l is string => typeof l === "string")
       : [];
@@ -243,6 +245,16 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     // owner of the stored API token, not the platform user who confirmed
     // submission — so stamp the actual reporter into the body too.
     const expectedSection = expectedBehavior.trim() ? `## 期望行为\n\n${expectedBehavior}\n\n` : "";
+    // Same fold-into-body treatment as expectedSection above, right after
+    // it — but only when the model actually found something to flag; "无"/
+    // "无待确认事项" (draft_issue's own instructed empty-case wording) means
+    // the confirmation-card block was empty on purpose, not a value worth
+    // posting to the tracker.
+    const pendingTrimmed = pendingConfirmations.trim();
+    const pendingSection =
+      pendingTrimmed && pendingTrimmed !== "无" && pendingTrimmed !== "无待确认事项"
+        ? `## 待确认事项\n\n${pendingTrimmed}\n\n`
+        : "";
     const reporterStamp = `\n\n---\n\n**提报人**: ${user.username}（经内部代码助手确认后提交）`;
 
     // Codex full-repo review (2026-07-14, Warning): a real draftToolUseId is
@@ -285,7 +297,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
         repoId: body.repo_id,
         userId: user.id,
         title: body.title,
-        body: `${expectedSection}${body.body}${reporterStamp}`,
+        body: `${expectedSection}${pendingSection}${body.body}${reporterStamp}`,
         labels,
         draftToolUseId: effectiveDraftKey,
       });
@@ -328,7 +340,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
       buildSessionFileEvidence(sessionId, deps.db),
       uploadSessionScreenshots(repo, sessionId, deps.db),
     ]);
-    const fullBody = `${expectedSection}${body.body}${fileEvidenceSection}${screenshotsSection}${reporterStamp}`;
+    const fullBody = `${expectedSection}${pendingSection}${body.body}${fileEvidenceSection}${screenshotsSection}${reporterStamp}`;
 
     // Submits against the stored repo URL/credentials (not client-supplied).
     const result = await submitRepoIssue(repo, body.title, fullBody, labels);

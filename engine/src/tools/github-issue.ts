@@ -19,24 +19,30 @@ import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef, type ToolContext } from "./registry.js";
 import { getActiveRepo } from "./access.js";
 import { getRepoLabels, normalizeLabels, searchRepoIssues } from "./issue-tracker-client.js";
+import { embedTexts, l2Normalize } from "./embedding-client.js";
+import { loadSettings, type Settings } from "../config.js";
 
 const DraftIssueParams = Type.Object({
   title: Type.String(),
   expected_behavior: Type.String(),
+  pending_confirmations: Type.String(),
   body: Type.String(),
   labels: Type.Optional(Type.Array(Type.String(), { default: ["bug"] })),
 });
 
 const DRAFT_ISSUE_DESCRIPTION =
-  "Generate an issue draft with title, expected_behavior, body (markdown), and labels. This creates " +
-  "a preview for the user to confirm before submission. Call this tool directly using the investigation " +
-  "and conclusions you ALREADY established earlier in this conversation — do NOT call semantic_search/" +
-  "code_search/file_reader/list_directory again first just to re-confirm what you already found; call " +
-  "any of those four again only if the user's latest message raises something genuinely not yet covered. " +
-  "Redoing an investigation that already reached a clear conclusion just delays the draft for no benefit. " +
-  "The conditional analogous-site code_search described below, and search_repo_issues's own stale-premise " +
-  "check further down, are both separate from this rule — each has its own trigger condition and doesn't " +
-  "require new information from the user. " +
+  "Generate an issue draft with title, expected_behavior, pending_confirmations, body (markdown), and " +
+  "labels. This creates a preview for the user to confirm before submission. Call this tool directly using " +
+  "the investigation and conclusions you ALREADY established earlier in this conversation — do NOT call " +
+  "semantic_search/code_search/file_reader/list_directory again first just to re-confirm what you already " +
+  "found; call any of those four again only if the user's latest message raises something genuinely not " +
+  "yet covered. Redoing an investigation that already reached a clear conclusion just delays the draft for " +
+  "no benefit. The conditional analogous-site code_search described below, and search_repo_issues's own " +
+  "stale-premise check further down, are both separate from this rule — each has its own trigger condition " +
+  "and doesn't require new information from the user. search_related_issues (described further down) is " +
+  "different again: it is NOT judgment-gated like those two — draft_issue refuses to run until " +
+  "search_related_issues has been called at least once in this conversation, regardless of how confident " +
+  "the investigation already is. " +
   "That said, 'already established' means grounded in code you actually read THIS conversation, not an " +
   "assumption carried over from earlier chat history or the user's phrasing — if the draft hinges on a " +
   "specific method/function/file still behaving a certain way, make sure your own investigation actually " +
@@ -46,6 +52,10 @@ const DRAFT_ISSUE_DESCRIPTION =
   "file name is worth the one extra tool call — mention what you find in the body (e.g. 'relates to #12, " +
   "which removed this method — confirm the request below still applies') rather than drafting past it " +
   "silently. Not required for routine issues with no such signal — use judgment, don't search reflexively. " +
+  "search_repo_issues is a narrow, optional, title-keyword check for ONE thing: whether the code your " +
+  "draft depends on was already touched by another issue (a stale premise). It does NOT satisfy the " +
+  "separate, mandatory search_related_issues requirement described further down — the two check different " +
+  "things and calling one never substitutes for the other. " +
   "After the root cause is confirmed, reuse any equivalent repository-wide code_search results already " +
   "obtained in THIS conversation. Otherwise, make exactly ONE additional repository-wide code_search for " +
   "analogous sites, and only when the confirmed root cause itself is a repeatable call or implementation " +
@@ -68,13 +78,38 @@ const DRAFT_ISSUE_DESCRIPTION =
   "include, verbatim: '这是基于文本搜索的候选清单，不是完整调用图，不能当作详尽的影响分析。' If a bucket " +
   "is empty, say only that the returned results contained no such hit — never claim none exists in the " +
   "repository. If the scan wasn't warranted, omit both sections entirely rather than searching just to " +
-  "fill them. " +
+  "fill them. This 同类问题排查/候选影响范围 pair is about CODE patterns (other call sites of the same " +
+  "bug) — the separate 关联 issue section below is about TRACKER issues (other filed issues that duplicate " +
+  "or depend on this one); the two are fed by different tools and never merge into each other. " +
+  "search_related_issues must be called before draft_issue — once is enough unless the user's request " +
+  "changes topic mid-conversation — passing a query built from the title and expected_behavior you're " +
+  "about to draft. Read every candidate it returns and classify each one yourself; the tool only ranks by " +
+  "text similarity, it does not know which relationship (if any) actually applies. Add a 关联 issue section " +
+  "to body with three buckets: 重复/同类 (the same underlying problem, already filed — say so plainly, " +
+  "this draft may be redundant), 前后依赖 (part of the same feature/change — an actual sequencing " +
+  "relationship, e.g. a natural follow-up to or prerequisite of an already-filed issue, not just " +
+  "topically similar), and 无关 (candidates the search returned that you read and determined are " +
+  "unrelated — list briefly so a reviewer can see the check actually ran, not just that it found nothing). " +
+  "If search_related_issues returned zero candidates, say so in one line instead of omitting the section. " +
   "expected_behavior is a separate REQUIRED field, " +
   "not a section inside body — the confirmation card renders it as its own highlighted block above the " +
   "rest so the user can catch a wrong assumption before submitting, instead of it being buried inside a " +
   "long technical body. State plainly what the correct/expected behavior should be; if you're inferring " +
   "it rather than restating something the user said explicitly, say so (e.g. '推测：...，请确认') so the " +
   "user knows to double-check it rather than rubber-stamp it. " +
+  "pending_confirmations is likewise a separate REQUIRED field, same treatment — its own highlighted " +
+  "block, not buried in body. It is NOT for things the user could just tell you if you asked — resolve " +
+  "ordinary ambiguity in THIS conversation before drafting, the same way you always would. It is " +
+  "specifically for business/product judgment calls that implementing this request correctly genuinely " +
+  "requires, that nobody has stated, and that the reporting user likely cannot answer either — unit/" +
+  "precision choices, historical-data migration or compatibility strategy, whether a field's meaning " +
+  "extends beyond what's visible in this codebase into downstream business logic, and similar. These are " +
+  "for whoever with product/business authority reads the tracker later, not for the person you're " +
+  "chatting with now. For each: state the open question, then a recommended safe default — a concrete, " +
+  "conservative choice that lets implementation proceed even if nobody answers — written as '问题 — 推荐" +
+  "默认: ...'. If the request genuinely raises no such judgment call, write exactly '无待确认事项'; do " +
+  "not invent one to fill the field, and do not duplicate something that belongs in expected_behavior or " +
+  "an ordinary clarifying question instead. " +
   "This same rule applies to every material claim about code or repository behavior anywhere in body — " +
   "current behavior, code location, root cause, analogous occurrences, affected call sites. State it as " +
   "established only when it's backed by something a tool actually returned THIS conversation (cite the " +
@@ -87,7 +122,8 @@ const DRAFT_ISSUE_DESCRIPTION =
   "verbatim), 代码位置 (the specific file/function/line, from your investigation), 影响 (who/what is " +
   "affected), and 修复建议 (a concrete suggested fix — you already did the root-cause analysis, so state " +
   "where and how to change it in words or a few illustrative lines, never a full rewritten file), plus " +
-  "同类问题排查 and 候选影响范围/关联调用 when the conditional scan above ran. " +
+  "关联 issue (always — see above), and 同类问题排查/候选影响范围/关联调用 when the conditional code_search " +
+  "scan above ran. " +
   "labels must come from the project's EXISTING label vocabulary — prefer simple, common names " +
   "(e.g. bug, feature, enhancement, docs, question) that match what the project actually has configured. " +
   "Never invent new labels: anything outside the project vocabulary is dropped automatically (the result " +
@@ -147,6 +183,7 @@ async function draftIssueExecute(
     type: "issue_draft",
     title: input.title,
     expected_behavior: input.expected_behavior,
+    pending_confirmations: input.pending_confirmations,
     body: input.body,
     labels: labelList,
     repo_id: activeRepo.id,
@@ -259,7 +296,10 @@ const SEARCH_ISSUES_DESCRIPTION =
   "premise stale (e.g. a method your draft assumes exists was removed by another issue). Also useful for " +
   "manage_issue when the user doesn't have the issue number handy. Title/keyword matching only, not " +
   "semantic — search short, distinctive terms (a method/file name, not a full sentence). Not required for " +
-  "routine issues with no such signal; skip it rather than searching reflexively on every draft.";
+  "routine issues with no such signal; skip it rather than searching reflexively on every draft. This is " +
+  "a different, narrower check than search_related_issues (semantic, mandatory before every draft_issue " +
+  "call, looks for duplicate/dependent issues rather than a stale premise) — the two don't substitute for " +
+  "each other.";
 
 async function searchIssuesExecute(
   input: Static<typeof SearchIssuesParams>,
@@ -292,6 +332,89 @@ export const searchIssuesTool: ToolDef<typeof SearchIssuesParams> = {
   execute: searchIssuesExecute,
 };
 
+// search_related_issues — semantic sibling of search_repo_issues, built for
+// the duplicate/dependency check draft_issue is structurally required to
+// run first (see turn.ts's beforeToolCall gate). Needs Settings for
+// embedTexts, which ToolContext doesn't carry (same problem semantic-
+// search.ts solved first — see that file's own header comment on why a
+// module-level Settings singleton is needed: real runtime Settings is only
+// final AFTER the DB llm_config merge, which happens after this module has
+// already loaded and computed a bare loadSettings() from just .env).
+// configureIssueSearch is the same reconfigure-after-merge hook,
+// main.ts calls it right next to configureSemanticSearch.
+let SETTINGS: Settings = loadSettings();
+
+export function configureIssueSearch(settings: Settings): void {
+  SETTINGS = settings;
+}
+
+const SearchRelatedIssuesParams = Type.Object({
+  query: Type.String(),
+  limit: Type.Optional(Type.Integer({ default: 8 })),
+});
+
+const SEARCH_RELATED_ISSUES_DESCRIPTION =
+  "Semantic search over the active repo's FULL tracker issue history (not just titles/keywords) for " +
+  "issues that might duplicate or depend on the one you're about to draft. MANDATORY before draft_issue — " +
+  "draft_issue refuses to run until this has returned a result at least once in this conversation. Pass a " +
+  "query built from the title and expected_behavior you're about to draft, not a short keyword (unlike " +
+  "search_repo_issues, this ranks by meaning, not literal text match). Results are ranked candidates only — " +
+  "you must read each one and judge the actual relationship yourself (duplicate, dependency/follow-on, or " +
+  "unrelated); the tool has no way to know which. Returns an empty result on a repo with no indexed " +
+  "issues yet (a fresh sync hasn't run) — that is not an error, proceed with drafting and note in the " +
+  "关联 issue section that no candidates were available to check.";
+
+async function searchRelatedIssuesExecute(
+  input: Static<typeof SearchRelatedIssuesParams>,
+  ctx: ToolContext,
+): Promise<string> {
+  const activeRepo = getActiveRepo(ctx);
+  if (!activeRepo) {
+    return "Error: 无法确定目标仓库：当前可见多个仓库且本轮未选择工作空间。请提醒用户先在左侧 Workspace 中选择目标仓库。";
+  }
+  if (!ctx.db) {
+    return "Error: 当前上下文没有可用的数据库连接，无法查询 issue 索引。";
+  }
+
+  const rows = await ctx.db.getIssueEmbeddings(activeRepo.id);
+  if (rows.length === 0) {
+    return "该仓库暂无已建索引的 issue（可能是首次同步还未完成）。没有可比对的候选，继续起草即可。";
+  }
+
+  const [queryVec] = await embedTexts([input.query], SETTINGS);
+  if (!queryVec) {
+    return "Error: 查询向量生成失败（embedding 服务不可用），无法进行语义检索。请稍后重试，或在正文中注明未能完成关联 issue 检查。";
+  }
+  const normalizedQuery = l2Normalize(queryVec);
+
+  // Stored vectors are already L2-normalized at sync-write time
+  // (issue-tracker.ts's syncIssueEmbeddings) — a plain dot product against
+  // them IS cosine similarity, no second normalization needed here.
+  const scored = rows.map((r) => {
+    let dot = 0;
+    for (let i = 0; i < normalizedQuery.length; i++) dot += normalizedQuery[i] * r.embedding[i];
+    return { row: r, score: dot };
+  });
+  scored.sort((a, b) => b.score - a.score);
+
+  const limit = input.limit ?? 8;
+  const top = scored.slice(0, limit);
+  return top
+    .map(
+      ({ row, score }) =>
+        `#${row.issueNumber} [${row.state}] ${row.title}\n${row.url}\nsimilarity: ${score.toFixed(3)}`,
+    )
+    .join("\n\n");
+}
+
+export const searchRelatedIssuesTool: ToolDef<typeof SearchRelatedIssuesParams> = {
+  name: "search_related_issues",
+  description: SEARCH_RELATED_ISSUES_DESCRIPTION,
+  schema: SearchRelatedIssuesParams,
+  execute: searchRelatedIssuesExecute,
+};
+
 registerTool(draftIssueTool);
 registerTool(manageIssueTool);
 registerTool(searchIssuesTool);
+registerTool(searchRelatedIssuesTool);

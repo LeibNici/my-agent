@@ -276,6 +276,34 @@ export type UpsertFixReportFields = {
   reportedAt: string | null;
 };
 
+// issue_embeddings upsert fields — vector arrives as a plain Float32Array
+// (worker-thread postMessage preserves TypedArray-ness fine); storage.ts's
+// own implementation is what must convert it to a real Buffer before
+// binding, since better-sqlite3's native binder only accepts
+// numbers/strings/bigints/Buffers/null.
+export type UpsertIssueEmbeddingFields = {
+  repoId: number;
+  issueNumber: number;
+  title: string;
+  state: string;
+  url: string;
+  contentHash: string;
+  embedding: Float32Array;
+};
+
+// A stored issue embedding row, read back with `embedding` already
+// converted from the raw BLOB back into a Float32Array — callers (the
+// search_related_issues tool) never touch a Buffer directly.
+export type IssueEmbeddingRow = {
+  repoId: number;
+  issueNumber: number;
+  title: string;
+  state: string;
+  url: string;
+  contentHash: string;
+  embedding: Float32Array;
+};
+
 // get_unverified_fix_reports' row (database.py:788).
 export type UnverifiedFixReportRow = {
   id: number;
@@ -563,6 +591,8 @@ export type Storage = {
   beginPoll(submissionId: number): number;
   updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields, generation: number): void;
   upsertFixReport(fields: UpsertFixReportFields): number;
+  upsertIssueEmbeddings(rows: UpsertIssueEmbeddingFields[]): void;
+  getIssueEmbeddings(repoId: number): IssueEmbeddingRow[];
   getUnverifiedFixReports(): UnverifiedFixReportRow[];
   setFixReportVerified(reportId: number, verified: boolean): void;
   getMyIssueSubmissions(userId: number, limit?: number): MyIssueSubmissionRow[];
@@ -1655,6 +1685,57 @@ export function openStorage(dbPath: string): Storage {
           now
         );
       return Number(res.lastInsertRowid);
+    },
+
+    // Batched upsert for a repo's issue-embedding sync pass. Float32Array
+    // -> Buffer conversion happens here (not at the call site) since this
+    // runs in the worker thread, after postMessage has already handed the
+    // TypedArray across — better-sqlite3's native binder throws a
+    // TypeError on a raw Float32Array, it only accepts numbers/strings/
+    // bigints/Buffers/null.
+    upsertIssueEmbeddings(rows: UpsertIssueEmbeddingFields[]): void {
+      const now = pyLocalIsoNow();
+      const stmt = db.prepare(
+        "INSERT INTO issue_embeddings " +
+          "(repo_id, issue_number, title, state, url, content_hash, embedding, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT(repo_id, issue_number) DO UPDATE SET " +
+          "title = excluded.title, state = excluded.state, url = excluded.url, " +
+          "content_hash = excluded.content_hash, embedding = excluded.embedding, updated_at = excluded.updated_at"
+      );
+      const insertAll = db.transaction((items: UpsertIssueEmbeddingFields[]) => {
+        for (const row of items) {
+          const buf = Buffer.from(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength);
+          stmt.run(row.repoId, row.issueNumber, row.title, row.state, row.url, row.contentHash, buf, now);
+        }
+      });
+      insertAll(rows);
+    },
+
+    getIssueEmbeddings(repoId: number): IssueEmbeddingRow[] {
+      const rows = db
+        .prepare(
+          "SELECT repo_id, issue_number, title, state, url, content_hash, embedding " +
+            "FROM issue_embeddings WHERE repo_id = ?"
+        )
+        .all(repoId) as Array<{
+        repo_id: number;
+        issue_number: number;
+        title: string;
+        state: string;
+        url: string;
+        content_hash: string;
+        embedding: Buffer;
+      }>;
+      return rows.map((r) => ({
+        repoId: r.repo_id,
+        issueNumber: r.issue_number,
+        title: r.title,
+        state: r.state,
+        url: r.url,
+        contentHash: r.content_hash,
+        embedding: new Float32Array(r.embedding.buffer, r.embedding.byteOffset, r.embedding.byteLength / 4),
+      }));
     },
 
     // v1's get_unverified_fix_reports (database.py:788) — verified 0

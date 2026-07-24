@@ -12,9 +12,18 @@ import { describe, it, expect } from "vitest";
 import { loadSettings, type Settings } from "../src/config.js";
 import { calculatorTool } from "../src/tools/calculator.js";
 import { runTurn, buildModelSetup } from "../src/engine/turn.js";
-import { startMock, textTurn, toolTurn, textThenToolTurn, type MockServer, type SseEvent } from "./mock-anthropic.js";
+import {
+  startMock,
+  textTurn,
+  toolTurn,
+  textThenToolTurn,
+  twoToolTurn,
+  type MockServer,
+  type SseEvent,
+} from "./mock-anthropic.js";
 import type { DomainEvent } from "../src/domain.js";
 import type { ToolContext } from "../src/tools/registry.js";
+import { draftIssueTool, searchRelatedIssuesTool } from "../src/tools/github-issue.js";
 
 // This suite's tests are about budget/text/tool-call plumbing, not repo
 // permissions (Task 8 owns that — see chat-tools-integration.test.ts) —
@@ -255,6 +264,74 @@ describe("runTurn — turn engine (Task 4)", () => {
     expect(secondBody).not.toContain("第一轮问题");
     expect(secondBody).not.toContain("第一轮回复");
     expect(secondBody).toContain("第二轮问题");
+    await mock.close();
+  });
+});
+
+// Plan review finding (draft_issue 待确认事项 + 关联 issue task): the
+// beforeToolCall gate must scan for a COMPLETED search_related_issues
+// ToolResultMessage, not an AssistantMessage's toolCall content block, and
+// must let draft_issue through unconditionally once the tool-call budget is
+// already exhausted (a beforeToolCall-blocked call never reaches
+// afterToolCall, so the loop's only budget-termination mechanism would
+// never fire for a batch containing nothing but a repeatedly-blocked call).
+describe("runTurn — draft_issue beforeToolCall 门槛（待确认事项 + 关联 issue）", () => {
+  const DRAFT_ISSUE_INPUT = { title: "t", expected_behavior: "e", pending_confirmations: "无", body: "b" };
+
+  it("同一条 assistant 消息里同时发起 search_related_issues + draft_issue：draft_issue 仍被拦截（证明扫描目标是已完成的 ToolResultMessage，不是 toolCall 内容块）", async () => {
+    const mock = startMock([
+      twoToolTurn(
+        "search_related_issues",
+        { query: "q" },
+        "tu_search",
+        "draft_issue",
+        DRAFT_ISSUE_INPUT,
+        "tu_draft",
+      ),
+      textTurn("好的"),
+    ]);
+    const settings = testSettings({ baseUrl: mock.url });
+    await collect(
+      runTurn(
+        { settings, tools: [draftIssueTool, searchRelatedIssuesTool], ctx: EMPTY_CTX },
+        { sessionId: "s1", history: [], userText: "报个 bug" },
+      ),
+    );
+    // The follow-up LLM call carries draft_issue's tool result back — this
+    // exact block-reason text only appears if beforeToolCall actually
+    // refused the call; a real execution would produce completely
+    // different JSON content instead.
+    expect(mock.requests.length).toBe(2);
+    expect(JSON.stringify(mock.requests[1]?.body)).toContain("先调用 search_related_issues");
+    await mock.close();
+  });
+
+  it("预算已耗尽时发起从未搜索过的 draft_issue：门槛放行，afterToolCall 的预算终止逻辑正常触发，不会因为一直被拦截而失控重试", async () => {
+    const maxIter = 3;
+    const turns = Array.from({ length: maxIter }, (_, i) => toolTurn("draft_issue", DRAFT_ISSUE_INPUT, `tu_${i}`));
+    turns.push(textTurn("阶段性汇报"));
+    const mock = startMock(turns);
+    const settings = testSettings({ baseUrl: mock.url, maxToolIterations: maxIter });
+    const events = await collect(
+      runTurn(
+        { settings, tools: [draftIssueTool, searchRelatedIssuesTool], ctx: EMPTY_CTX },
+        { sessionId: "s1", history: [], userText: "报个 bug" },
+      ),
+    );
+    // 3 draft_issue attempts (never preceded by a search) + exactly 1
+    // separate wrap-up call. If the gate kept blocking past budget
+    // exhaustion, afterToolCall's terminate:true would never get a chance
+    // to fire (a blocked call never reaches afterToolCall) and the model
+    // would keep retrying the blocked call instead of ever reaching
+    // wrap-up — this count is what would actually catch that regression.
+    expect(mock.requests.length).toBe(maxIter + 1);
+    // Iteration 0 (callsMade===1 < maxIter===3) still went through the
+    // search gate and got blocked — proves the budget check only bypasses
+    // the gate once truly exhausted, not unconditionally.
+    expect(JSON.stringify(mock.requests[1]?.body)).toContain("先调用 search_related_issues");
+    const done = events.at(-1)!;
+    expect(done.type).toBe("done");
+    expect((done.data as { budgetExhausted: boolean }).budgetExhausted).toBe(true);
     await mock.close();
   });
 });

@@ -27,6 +27,7 @@ import {
   submitRepoIssue,
   applyRepoIssueAction,
   searchRepoIssues,
+  listRepoIssues,
   uploadGitlabAttachment,
   uploadSessionScreenshots,
   buildSessionFileEvidence,
@@ -829,6 +830,143 @@ describe("searchRepoIssues", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(searchRepoIssues(repo, "crash", 5)).resolves.toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listRepoIssues — issue_embeddings sync job's paginated full-issue-list
+// fetch. Unlike searchRepoIssues (title-only, search endpoint), this walks
+// /issues directly and needs title+description+state, so the assertions
+// below check the request params (state=all, page/per_page) AND the field
+// mapping (GitHub body->description, GitLab description passthrough), not
+// just the URL shape.
+// ---------------------------------------------------------------------------
+
+describe("listRepoIssues", () => {
+  it("GitHub: 请求参数是 state=all/page/per_page，字段用 number/body/html_url 映射到 number/description/url", async () => {
+    const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+    const fetchMock = vi.fn(async () => ({
+      status: 200,
+      json: async () => ([
+        { number: 5, title: "Crash on save", body: "Steps to repro...", html_url: "https://github.com/acme/widget/issues/5", state: "open" },
+      ]),
+    } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await listRepoIssues(repo, 2, 50);
+    expect(result).toEqual([
+      { number: 5, title: "Crash on save", description: "Steps to repro...", url: "https://github.com/acme/widget/issues/5", state: "open" },
+    ]);
+
+    const [calledUrl] = fetchMock.mock.calls[0];
+    const parsed = new URL(calledUrl);
+    expect(parsed.origin + parsed.pathname).toBe("https://api.github.com/repos/acme/widget/issues");
+    expect(parsed.searchParams.get("state")).toBe("all");
+    expect(parsed.searchParams.get("page")).toBe("2");
+    expect(parsed.searchParams.get("per_page")).toBe("50");
+  });
+
+  it("GitHub: body 为 null（issue 没有正文）-> description 是空字符串，不是 'null'", async () => {
+    const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+    const fetchMock = vi.fn(async () => ({
+      status: 200,
+      json: async () => ([{ number: 5, title: "No body", body: null, html_url: "https://github.com/acme/widget/issues/5", state: "open" }]),
+    } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await listRepoIssues(repo, 1, 50);
+    expect(result[0].description).toBe("");
+  });
+
+  it("GitHub: /issues 端点混入的 PR 被过滤掉（pull_request 字段存在即判定）", async () => {
+    const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+    const fetchMock = vi.fn(async () => ({
+      status: 200,
+      json: async () => ([
+        { number: 5, title: "Real issue", body: "x", html_url: "https://github.com/acme/widget/issues/5", state: "open" },
+        { number: 6, title: "Actually a PR", body: "x", html_url: "https://github.com/acme/widget/pull/6", state: "open", pull_request: { url: "..." } },
+      ]),
+    } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await listRepoIssues(repo, 1, 50);
+    expect(result.map((r) => r.number)).toEqual([5]);
+  });
+
+  it("GitHub: 非 200 -> []", async () => {
+    const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+    const fetchMock = vi.fn(async () => ({ status: 500, json: async () => ({}) } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await listRepoIssues(repo, 1, 50)).toEqual([]);
+  });
+
+  it("GitHub: fetch 抛异常 -> 外层 try/catch 兜住，返回 []", async () => {
+    const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listRepoIssues(repo, 1, 50)).resolves.toEqual([]);
+  });
+
+  it("GitHub: repo 没有 cred_token -> []，零请求", async () => {
+    const repo = makeRepo({ url: "https://github.com/acme/widget.git", cred_token: null });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await listRepoIssues(repo, 1, 50)).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("GitLab: 请求参数是 state=all/page/per_page/order_by=updated_at，字段用 iid/description/web_url 映射", async () => {
+    const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
+    const fetchMock = vi.fn(async () => ({
+      status: 200,
+      json: async () => ([
+        { iid: 9, title: "Crash on save", description: "steps...", web_url: "https://gitlab.example.invalid/acme/widget/-/issues/9", state: "opened" },
+      ]),
+    } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await listRepoIssues(repo, 3, 20);
+    expect(result).toEqual([
+      { number: 9, title: "Crash on save", description: "steps...", url: "https://gitlab.example.invalid/acme/widget/-/issues/9", state: "opened" },
+    ]);
+
+    const [calledUrl] = fetchMock.mock.calls[0];
+    const parsed = new URL(calledUrl);
+    expect(parsed.searchParams.get("state")).toBe("all");
+    expect(parsed.searchParams.get("page")).toBe("3");
+    expect(parsed.searchParams.get("per_page")).toBe("20");
+    expect(parsed.searchParams.get("order_by")).toBe("updated_at");
+  });
+
+  it("GitLab: description 为 null -> 空字符串", async () => {
+    const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
+    const fetchMock = vi.fn(async () => ({
+      status: 200,
+      json: async () => ([{ iid: 9, title: "No description", description: null, web_url: "https://x/9", state: "opened" }]),
+    } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await listRepoIssues(repo, 1, 20);
+    expect(result[0].description).toBe("");
+  });
+
+  it("GitLab: 非 200 -> []", async () => {
+    const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
+    const fetchMock = vi.fn(async () => ({ status: 500, json: async () => ({}) } as unknown as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await listRepoIssues(repo, 1, 20)).toEqual([]);
+  });
+
+  it("GitLab: fetch 抛异常 -> []", async () => {
+    const repo = makeRepo({ url: "https://gitlab.example.invalid/acme/widget.git", cred_token: "tok" });
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error("network down"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listRepoIssues(repo, 1, 20)).resolves.toEqual([]);
   });
 });
 

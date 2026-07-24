@@ -328,8 +328,11 @@ describe("pollTrackedIssues", () => {
     expect(raw.track_error).toBe(
       "issue 所在项目(host-b.example.com/group/proj)与仓库当前配置(host-a.example.com/group/proj)不一致，凭证不外发，暂停追踪"
     );
-    // 这条护栏在任何网络调用之前就返回了 —— 仓库的 cred_token 从未有机会外发。
-    expect(fetchMock).not.toHaveBeenCalled();
+    // 这条护栏在任何网络调用之前就返回了 —— 提交轮询自己的 cred_token 从未
+    // 有机会外发。issue_embeddings 同步任务（无条件、每轮都跑，与这条提交
+    // 轮询护栏无关）仍会对这个仓库自己当前配置发一次 state=all 的列表请求，
+    // 过滤掉它才是这条断言真正要盯住的东西。
+    expect(fetchMock.mock.calls.filter(([u]) => !String(u).includes("state=all"))).toEqual([]);
   });
 
   // Codex full-repo review (2026-07-14, Warning): 原来的护栏只比较了主机名
@@ -362,7 +365,10 @@ describe("pollTrackedIssues", () => {
     await pollTrackedIssues(client, settings);
 
     // 关键断言：即使主机相同，新 token 也绝不能被发到旧项目 team-a/project-x。
-    expect(fetchMock).not.toHaveBeenCalled();
+    // （issue_embeddings 同步任务仍会对仓库自己当前指向的 team-b/project-y
+    // 发一次 state=all 列表请求——那是仓库自己的 token 发到仓库自己当前配置，
+    // 不是这条护栏要防的事，过滤掉再断言。）
+    expect(fetchMock.mock.calls.filter(([u]) => !String(u).includes("state=all"))).toEqual([]);
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_error).toBe(
       "issue 所在项目(gitlab.example.com/team-a/project-x)与仓库当前配置(gitlab.example.com/team-b/project-y)不一致，凭证不外发，暂停追踪"
@@ -439,8 +445,11 @@ describe("pollTrackedIssues", () => {
 
     await pollTrackedIssues(client, settings);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const issueCall = fetchMock.mock.calls.find(([u]) => !String(u).includes("/timeline"))!;
+    // 3, not 2: issue_embeddings 同步任务（无条件、每轮都跑，见 issue-tracker.ts
+    // 的 syncIssueEmbeddings）也会对这个仓库发一次 state=all 的列表请求，和
+    // 这里要验证的单条 issue 详情/timeline 轮询是两回事。
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const issueCall = fetchMock.mock.calls.find(([u]) => !String(u).includes("/timeline") && !String(u).includes("state=all"))!;
     const [url, init] = issueCall as [string, RequestInit & { headers: Record<string, string> }];
     expect(url).toBe("https://api.github.com/repos/acme/widgets/issues/42");
     expect(init.headers.Authorization).toBe("token repo-own-github-token");
@@ -737,7 +746,10 @@ describe("pollTrackedIssues", () => {
 
     await pollTrackedIssues(client, settings);
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    // issue_embeddings 同步任务仍会对仓库自己当前配置的 gitlab.example.com/
+    // group/proj 发一次 state=all 列表请求——用的是仓库自己的 token 打自己
+    // 当前配置，不是这条护栏要防的"凭证发到不匹配主机"，过滤掉再断言。
+    expect(fetchMock.mock.calls.filter(([u]) => !String(u).includes("state=all"))).toEqual([]);
     const raw = readSubmissionRaw(dbPath, subId);
     expect(raw.track_error).toBe(
       "issue 所在项目(github.com/acme/widgets)与仓库当前配置(gitlab.example.com/group/proj)不一致，凭证不外发，暂停追踪"

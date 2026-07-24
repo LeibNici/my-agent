@@ -14,10 +14,17 @@
 // implementation proves the integration rather than asserting against a
 // hand-rolled stub of it.
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { draftIssueTool, manageIssueTool, searchIssuesTool } from "../src/tools/github-issue.js";
+import {
+  draftIssueTool,
+  manageIssueTool,
+  searchIssuesTool,
+  searchRelatedIssuesTool,
+} from "../src/tools/github-issue.js";
 import type { ToolContext } from "../src/tools/registry.js";
 import type { DbClient } from "../src/db/client.js";
+import type { IssueEmbeddingRow } from "../src/db/storage.js";
 import * as issueTrackerClient from "../src/tools/issue-tracker-client.js";
+import * as embeddingClient from "../src/tools/embedding-client.js";
 
 vi.mock("../src/tools/issue-tracker-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/tools/issue-tracker-client.js")>();
@@ -26,12 +33,23 @@ vi.mock("../src/tools/issue-tracker-client.js", async (importOriginal) => {
 const mockedGetRepoLabels = vi.mocked(issueTrackerClient.getRepoLabels);
 const mockedSearchRepoIssues = vi.mocked(issueTrackerClient.searchRepoIssues);
 
+// l2Normalize is kept REAL (importOriginal) — it's pure and already covered
+// elsewhere (embedding-client.test.ts); only embedTexts touches the network
+// and needs mocking. search_related_issues's ranking tests below rely on
+// the real normalization to make similarity scores meaningful.
+vi.mock("../src/tools/embedding-client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/tools/embedding-client.js")>();
+  return { ...actual, embedTexts: vi.fn() };
+});
+const mockedEmbedTexts = vi.mocked(embeddingClient.embedTexts);
+
 beforeEach(() => {
   // vitest doesn't auto-reset mocks between tests (no clearMocks/mockReset in
   // vitest.config.ts) — each test sets its own resolved/rejected value, so a
   // stale implementation from a previous test must not leak forward.
   mockedGetRepoLabels.mockReset();
   mockedSearchRepoIssues.mockReset();
+  mockedEmbedTexts.mockReset();
 });
 
 const repoA = { id: 1, name: "repo-a", localPath: "/repos/repo-a" };
@@ -58,6 +76,7 @@ describe("draftIssueTool (name draft_issue)", () => {
   const baseInput = {
     title: "MES 提交按钮点击无响应",
     expected_behavior: "点击提交后应保存工单并跳转到列表页",
+    pending_confirmations: "无待确认事项",
     body: "## 问题描述\n点击提交按钮没有任何反应，控制台报 500。",
   };
 
@@ -100,7 +119,7 @@ describe("draftIssueTool (name draft_issue)", () => {
   describe("exactly one active repo, ctx.db present, vocabulary available", () => {
     const vocabulary = ["type::bug", "type::feature", "module::MES"];
 
-    it("echoes title/expected_behavior/body verbatim, stamps repo_id/repo_name, applies accepted labels, and OMITS label_note when nothing was rejected", async () => {
+    it("echoes title/expected_behavior/pending_confirmations/body verbatim, stamps repo_id/repo_name, applies accepted labels, and OMITS label_note when nothing was rejected", async () => {
       mockedGetRepoLabels.mockResolvedValue(vocabulary);
       const result = await draftIssueTool.execute(
         { ...baseInput, labels: ["type::bug", "module::MES"] },
@@ -114,11 +133,22 @@ describe("draftIssueTool (name draft_issue)", () => {
         type: "issue_draft",
         title: baseInput.title,
         expected_behavior: baseInput.expected_behavior,
+        pending_confirmations: baseInput.pending_confirmations,
         body: baseInput.body,
         labels: ["type::bug", "module::MES"],
         repo_id: repoA.id,
         repo_name: repoA.name,
       });
+    });
+
+    it("pending_confirmations passthrough: a genuinely non-trivial value (not just the empty-case default) is echoed unchanged, independent of the labels vocabulary path", async () => {
+      mockedGetRepoLabels.mockResolvedValue(vocabulary);
+      const openQuestion = "厚度单位与精度未知 — 推荐默认: mm, DECIMAL(18,6)";
+      const result = await draftIssueTool.execute(
+        { ...baseInput, pending_confirmations: openQuestion, labels: ["type::bug"] },
+        makeCtx({ grantedRepos: [repoA], db: makeDb() }),
+      );
+      expect(JSON.parse(result).pending_confirmations).toBe(openQuestion);
     });
 
     it("rejects an unknown label and reports it by name in label_note (real normalizeLabels accept/reject logic)", async () => {
@@ -348,6 +378,99 @@ describe("searchIssuesTool (name search_repo_issues)", () => {
   });
 });
 
+// search_related_issues — semantic sibling of search_repo_issues, and the
+// tool draft_issue's beforeToolCall gate (turn.ts) structurally requires to
+// have run first. embedTexts is mocked (network); l2Normalize is real
+// (pure, already covered in embedding-client.test.ts) so the ranking math
+// below is meaningful rather than asserting against a stub.
+describe("searchRelatedIssuesTool (name search_related_issues)", () => {
+  const activeCtx = (db: DbClient) => makeCtx({ grantedRepos: [repoA], db });
+  const noRepoCtx = makeCtx({ grantedRepos: [] });
+
+  function makeIssueDb(rows: IssueEmbeddingRow[]): DbClient {
+    return { getIssueEmbeddings: vi.fn().mockResolvedValue(rows) } as unknown as DbClient;
+  }
+
+  function row(overrides: Partial<IssueEmbeddingRow>): IssueEmbeddingRow {
+    return {
+      repoId: repoA.id,
+      issueNumber: 1,
+      title: "t",
+      state: "open",
+      url: "https://example.com/issues/1",
+      contentHash: "h",
+      embedding: Float32Array.from([1, 0]),
+      ...overrides,
+    };
+  }
+
+  it("is registered under the name search_related_issues", () => {
+    expect(searchRelatedIssuesTool.name).toBe("search_related_issues");
+  });
+
+  it("0 granted repos -> workspace-selection error, never calls embedTexts", async () => {
+    const result = await searchRelatedIssuesTool.execute({ query: "q" }, noRepoCtx);
+    expect(result).toContain("无法确定目标仓库");
+    expect(mockedEmbedTexts).not.toHaveBeenCalled();
+  });
+
+  it("ctx.db absent entirely -> its own error, never calls embedTexts", async () => {
+    const result = await searchRelatedIssuesTool.execute({ query: "q" }, makeCtx({ grantedRepos: [repoA] }));
+    expect(result).toContain("没有可用的数据库连接");
+    expect(mockedEmbedTexts).not.toHaveBeenCalled();
+  });
+
+  it("仓库暂无已建索引的 issue（getIssueEmbeddings 返回空数组）-> 提示继续起草即可，不算错误，也不调用 embedTexts", async () => {
+    const result = await searchRelatedIssuesTool.execute({ query: "q" }, activeCtx(makeIssueDb([])));
+    expect(result).toContain("没有可比对的候选");
+    expect(mockedEmbedTexts).not.toHaveBeenCalled();
+  });
+
+  it("query 向量生成失败（embedTexts 返回 null）-> 明确的 Error 文本，不是静默空结果", async () => {
+    mockedEmbedTexts.mockResolvedValue([null]);
+    const result = await searchRelatedIssuesTool.execute(
+      { query: "q" },
+      activeCtx(makeIssueDb([row({})])),
+    );
+    expect(result).toContain("Error");
+    expect(result).toContain("查询向量生成失败");
+  });
+
+  it("按余弦相似度降序排序，格式为 '#number [state] title\\nurl\\nsimilarity: x.xxx'", async () => {
+    mockedEmbedTexts.mockResolvedValue([Float32Array.from([1, 0])]); // real l2Normalize leaves this unit-length as-is
+    const rows = [
+      row({ issueNumber: 20, title: "Unrelated", url: "https://example.com/issues/20", embedding: Float32Array.from([0, 1]) }), // dot 0.0
+      row({ issueNumber: 10, title: "Exact match", url: "https://example.com/issues/10", embedding: Float32Array.from([1, 0]) }), // dot 1.0
+      row({ issueNumber: 30, title: "Partial", state: "closed", url: "https://example.com/issues/30", embedding: Float32Array.from([0.6, 0.8]) }), // dot 0.6
+    ];
+    const result = await searchRelatedIssuesTool.execute({ query: "q" }, activeCtx(makeIssueDb(rows)));
+    expect(result).toBe(
+      "#10 [open] Exact match\nhttps://example.com/issues/10\nsimilarity: 1.000\n\n" +
+        "#30 [closed] Partial\nhttps://example.com/issues/30\nsimilarity: 0.600\n\n" +
+        "#20 [open] Unrelated\nhttps://example.com/issues/20\nsimilarity: 0.000",
+    );
+  });
+
+  it("limit 生效：只返回相似度最高的前 N 条", async () => {
+    mockedEmbedTexts.mockResolvedValue([Float32Array.from([1, 0])]);
+    const rows = [
+      row({ issueNumber: 20, embedding: Float32Array.from([0, 1]) }), // dot 0.0
+      row({ issueNumber: 10, embedding: Float32Array.from([1, 0]) }), // dot 1.0
+      row({ issueNumber: 30, embedding: Float32Array.from([0.6, 0.8]) }), // dot 0.6
+    ];
+    const result = await searchRelatedIssuesTool.execute({ query: "q", limit: 2 }, activeCtx(makeIssueDb(rows)));
+    expect(result).toContain("#10");
+    expect(result).toContain("#30");
+    expect(result).not.toContain("#20");
+  });
+
+  it("query 文本原样传给 embedTexts", async () => {
+    mockedEmbedTexts.mockResolvedValue([Float32Array.from([1, 0])]);
+    await searchRelatedIssuesTool.execute({ query: "登录按钮点击无响应" }, activeCtx(makeIssueDb([row({})])));
+    expect(mockedEmbedTexts).toHaveBeenCalledWith(["登录按钮点击无响应"], expect.anything());
+  });
+});
+
 // Pure regression coverage for DRAFT_ISSUE_DESCRIPTION's text (execute()
 // itself doesn't branch on any of this — it's LLM-facing guidance, not
 // runtime logic) — guards against a future edit silently dropping the
@@ -407,8 +530,8 @@ describe("draftIssueTool.description — 举一反三扫描/候选影响范围/�
     expect(description).toContain("that's not a code claim and doesn't need this treatment");
   });
 
-  it("keeps the original 5 sections as core and lists the 2 conditional ones separately", () => {
+  it("keeps the original 5 sections as core, 关联 issue as always-present, and lists the 2 code_search-conditional ones separately", () => {
     expect(description).toContain("these core sections");
-    expect(description).toContain("plus 同类问题排查 and 候选影响范围/关联调用 when the conditional scan above ran");
+    expect(description).toContain("关联 issue (always — see above), and 同类问题排查/候选影响范围/关联调用 when the conditional code_search");
   });
 });

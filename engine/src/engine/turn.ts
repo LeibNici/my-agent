@@ -455,6 +455,43 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
       budgetExhausted = true;
       return { terminate: true };
     },
+    // Structural gate: draft_issue must not run until search_related_issues
+    // has actually returned a result in this conversation (待确认事项 +
+    // 关联 issue feature) — the ONE place this feature uses a hard block
+    // instead of prompt guidance, because "was this tool called" is
+    // mechanically checkable, unlike "is the request clarified enough".
+    //
+    // Budget check comes FIRST and unconditionally overrides the search
+    // check below. A beforeToolCall-blocked call never reaches
+    // afterToolCall (pi's executeToolCallsSequential only invokes
+    // finalizeExecutedToolCall — the sole place afterToolCall fires — for
+    // the non-blocked branch), so if this kept gating draft_issue after the
+    // budget is already exhausted, the checkpoint-3 termination above would
+    // never get a chance to fire for a batch that only contains a blocked
+    // call: no other ceiling exists in this loop, so the model could retry
+    // a blocked draft_issue indefinitely.
+    beforeToolCall: async ({ toolCall, context }) => {
+      if (toolCall.name !== "draft_issue") return undefined;
+      if (callsMade >= settings.maxToolIterations) return undefined; // let afterToolCall terminate normally instead
+      // Scans for a COMPLETED ToolResultMessage, not an AssistantMessage's
+      // toolCall content block. pi pushes the whole assistant message
+      // (every toolCall block it contains) onto context.messages BEFORE
+      // executing any call in that batch — so if draft_issue and
+      // search_related_issues were both requested in the SAME assistant
+      // message, scanning for the call itself would see
+      // search_related_issues's toolCall and wave draft_issue through
+      // before the search has actually run. Scanning for its result
+      // instead means the gate only passes once the search has completed
+      // and its output has actually landed in context.
+      const alreadySearched = context.messages.some(
+        (m) => m.role === "toolResult" && m.toolName === "search_related_issues",
+      );
+      if (alreadySearched) return undefined;
+      return {
+        block: true,
+        reason: "先调用 search_related_issues 检查 tracker 里是否已有同类/关联 issue，再调用 draft_issue。",
+      };
+    },
   });
 
   const channel = makeChannel<DomainEvent>();

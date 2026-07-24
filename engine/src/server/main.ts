@@ -41,6 +41,7 @@ import {
 } from "../repo-sync.js";
 import { periodicTrackingLoop } from "../issue-tracker.js";
 import { configureSemanticSearch } from "../tools/semantic-search.js";
+import { configureIssueSearch } from "../tools/github-issue.js";
 import { buildApp } from "./app.js";
 
 // listReposFull() returns the admin/internal full row shape (snake_case,
@@ -259,6 +260,11 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Starte
   // "语义检索未启用" for every query even when index BUILDING (which does
   // go through configureIndexing) worked fine and produced a real index.
   configureSemanticSearch(settings);
+  // Same "assembled after module load" hook, for search_related_issues's
+  // own embedTexts calls — see configureIssueSearch's own comment
+  // (tools/github-issue.ts) for why this can't just read Settings off
+  // ToolContext like every other tool in this file does.
+  configureIssueSearch(settings);
 
   // Repo sync — v1's lifespan (app/main.py, ~line 124-138) awaits
   // sync_all_repos(repos) on startup BEFORE the app starts serving requests,

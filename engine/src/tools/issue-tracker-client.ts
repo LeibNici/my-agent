@@ -581,6 +581,98 @@ export async function searchRepoIssues(
   }
 }
 
+// ==================== Full issue list (issue_embeddings sync) ====================
+
+export type IssueListItem = { number: number; title: string; description: string; state: string; url: string };
+
+async function listGithubIssues(
+  repoUrl: string,
+  credToken: string | null,
+  page: number,
+  perPage: number,
+): Promise<IssueListItem[]> {
+  const token = credToken;
+  if (!token) return [];
+  const parsed = parseOwnerRepo(repoUrl);
+  if (!parsed) return [];
+  const { owner, repo } = parsed;
+
+  const params = new URLSearchParams({ state: "all", page: String(page), per_page: String(perPage) });
+  const resp = await fetchWithTimeout(
+    `https://api.github.com/repos/${owner}/${repo}/issues?${params}`,
+    { headers: githubHeaders(token) },
+    GITHUB_SEARCH_TIMEOUT_MS,
+  );
+  if (resp.status !== 200) return [];
+  const data = (await resp.json()) as Array<{
+    number: number;
+    title: string;
+    body: string | null;
+    html_url: string;
+    state: string;
+    pull_request?: unknown;
+  }>;
+  // GitHub's /issues endpoint also returns PRs — `pull_request` presence is
+  // the documented signal to filter them back out.
+  return data
+    .filter((i) => !i.pull_request)
+    .map((i) => ({ number: i.number, title: i.title, description: i.body ?? "", url: i.html_url, state: i.state }));
+}
+
+async function listGitlabIssues(
+  repoUrl: string,
+  credToken: string | null,
+  page: number,
+  perPage: number,
+): Promise<IssueListItem[]> {
+  const { error, base } = await gitlabProjectApiBaseFromRepoUrl(repoUrl, credToken);
+  if (error || !base) return [];
+
+  const params = new URLSearchParams({
+    state: "all",
+    page: String(page),
+    per_page: String(perPage),
+    order_by: "updated_at",
+  });
+  const resp = await fetchWithTimeout(
+    `${base}/issues?${params}`,
+    { headers: { "PRIVATE-TOKEN": credToken ?? "" } },
+    GITLAB_SEARCH_TIMEOUT_MS,
+  );
+  if (resp.status !== 200) return [];
+  const data = (await resp.json()) as Array<{
+    iid: number;
+    title: string;
+    description: string | null;
+    web_url: string;
+    state: string;
+  }>;
+  return data.map((i) => ({
+    number: i.iid,
+    title: i.title,
+    description: i.description ?? "",
+    url: i.web_url,
+    state: i.state,
+  }));
+}
+
+/** Paginated full-issue-list fetch (title+description+state) — used by the
+ * issue_embeddings sync job to index a repo's whole tracker history, not
+ * just what CodeAxis itself filed. Unlike searchRepoIssues (title-only,
+ * hits the tracker's own search endpoint), this walks /issues directly so
+ * the sync job can hash-diff against stored content and embed it. Requires
+ * FullRepoRow (not RepoRow) — cred_token is only on the admin-scoped type,
+ * matching every other tracker-facing call in this file. Best-effort: any
+ * tracker/API failure (including a thrown network error) returns []. */
+export async function listRepoIssues(repo: FullRepoRow, page: number, perPage: number): Promise<IssueListItem[]> {
+  try {
+    if (isGithubHosted(repo)) return await listGithubIssues(repo.url, repo.cred_token, page, perPage);
+    return await listGitlabIssues(repo.url, repo.cred_token, page, perPage);
+  } catch {
+    return [];
+  }
+}
+
 // ==================== Attachments (GitLab only) ====================
 
 export type UploadResult = { markdown: string | null } | { error: string };

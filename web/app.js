@@ -1677,12 +1677,23 @@ function appendIssueCard(container, draft, submission = null, toolUseId = null) 
         ? `<div class="issue-expected"><div class="issue-expected-label">期望行为</div>${renderMarkdown(draft.expected_behavior)}</div>`
         : "";
 
+    // Unlike expectedHtml above, this is skipped whenever the model found
+    // nothing to flag (empty, or its instructed "无"/"无待确认事项" wording
+    // for the no-open-questions case) — most routine bugs should show
+    // nothing here, only genuinely open business/product decisions should.
+    const pendingTrimmed = (draft.pending_confirmations || "").trim();
+    const pendingHtml =
+        pendingTrimmed && pendingTrimmed !== "无" && pendingTrimmed !== "无待确认事项"
+            ? `<div class="issue-pending"><div class="issue-pending-label">待确认事项</div>${renderMarkdown(pendingTrimmed)}</div>`
+            : "";
+
     card.innerHTML = `
         <div class="issue-header">
             <span class="issue-title">${escapeHtml(draft.title)}</span>
             <span class="issue-repo" title="提交目标仓库">${repoName ? "→ " + escapeHtml(repoName) : "→ 提交时选择的仓库"}</span>
         </div>
         ${expectedHtml}
+        ${pendingHtml}
         <div class="issue-body">${renderMarkdown(draft.body)}</div>
         <div class="issue-labels">${labelsHtml}</div>
         <div class="issue-actions">
@@ -1746,6 +1757,7 @@ async function submitIssue(btn) {
         repo_id: targetRepoId,
         title: draft.title,
         expected_behavior: draft.expected_behavior || "",
+        pending_confirmations: draft.pending_confirmations || "",
         body: draft.body,
         labels: draft.labels || [],
         session_id: currentSessionId,

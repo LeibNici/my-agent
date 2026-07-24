@@ -256,6 +256,28 @@ export function initSchema(dbPath: string): void {
     )
   `);
 
+  // Issue embeddings — semantic index over a repo's FULL tracker issue
+  // list (not just issues CodeAxis itself filed), used by search_related_
+  // issues to surface duplicate/dependent issues before draft_issue is
+  // allowed to run. First BLOB column in this schema — storage.ts must
+  // convert Float32Array <-> Buffer explicitly on write/read, better-
+  // sqlite3's native binder rejects a raw TypedArray.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS issue_embeddings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      state TEXT NOT NULL,
+      url TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(repo_id, issue_number),
+      FOREIGN KEY (repo_id) REFERENCES repositories(id) ON DELETE CASCADE
+    )
+  `);
+
   // Semantic search log
   db.exec(`
     CREATE TABLE IF NOT EXISTS semantic_search_log (

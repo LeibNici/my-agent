@@ -18,7 +18,7 @@ import { loadSettings, type Settings } from "../src/config.js";
 import { writeEmbeddingIndex, readEmbeddingIndex } from "../src/tools/embed-store.js";
 import type { Chunk } from "../src/tools/chunking.js";
 import { chunkHash } from "../src/tools/chunking.js";
-import { embeddingKeyOrFallback, embedAndSaveIndex, __internal } from "../src/tools/embedding-client.js";
+import { embeddingKeyOrFallback, embedAndSaveIndex, embedTexts, __internal } from "../src/tools/embedding-client.js";
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -164,6 +164,106 @@ describe("embeddingKeyOrFallback", () => {
       ANTHROPIC_API_KEY: "llm-shared-key",
     });
     expect(embeddingKeyOrFallback(settings)).toBe("llm-shared-key");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// embedTexts — plain-text batch embedding for non-code callers (issue_
+// embeddings sync). Deliberately per-item-tolerant, unlike embedAndSaveIndex/
+// doEmbedAndSave's fail-the-whole-build-on-first-error contract — the tests
+// below are specifically about proving that difference, not re-testing
+// batching/concurrency mechanics already covered for embedAndSaveIndex via
+// the shared embedBatch/makeFetchMock plumbing.
+// ---------------------------------------------------------------------------
+
+describe("embedTexts", () => {
+  it("空数组 -> 立即返回 []，不发任何请求", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const settings = makeSettings();
+    expect(await embedTexts([], settings)).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("无可用 key -> 返回等长的全 null 数组，不发任何请求", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const settings = makeSettings({
+      APP_EMBEDDING_API_KEY: "",
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com", // host mismatch -> no key
+      APP_EMBEDDING_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    });
+    const result = await embedTexts(["a", "b"], settings);
+    expect(result).toEqual([null, null]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("全部成功 -> 按输入顺序返回对应向量，不做归一化（调用方自己决定要不要 l2Normalize）", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await embedTexts(["foo text", "bar text"], settings);
+    expect(result).toHaveLength(2);
+    expect(result[0]).not.toBeNull();
+    expect(result[1]).not.toBeNull();
+    expect(Array.from(result[0]!)).toEqual(fakeEmbedding("foo text", dims));
+    expect(Array.from(result[1]!)).toEqual(fakeEmbedding("bar text", dims));
+    // Raw provider output, not unit-length — proves normalization did NOT
+    // happen inside embedTexts itself.
+    expect(magnitude(result[0]!)).not.toBeCloseTo(1, 2);
+  });
+
+  it("按条目容错：一批失败只把那一批的槽位置 null，其余批次仍然成功写入（不是 embedAndSaveIndex 式的整批失败）", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+    // 15 texts -> batches of 10 + 5 (EMBED_BATCH=10); make the SECOND batch
+    // (items 10-14, containing "item 12") fail while the first batch (0-9)
+    // succeeds.
+    const texts = Array.from({ length: 15 }, (_, i) => `item ${i}`);
+    const fetchMock = makeFetchMock({ dims, failOnBatchContaining: "item 12" });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await embedTexts(texts, settings);
+    expect(result).toHaveLength(15);
+    // First batch: all succeeded.
+    for (let i = 0; i < 10; i++) {
+      expect(result[i]).not.toBeNull();
+      expect(Array.from(result[i]!)).toEqual(fakeEmbedding(texts[i], dims));
+    }
+    // Second batch: entirely null (this codebase's embedBatch fails a whole
+    // batch on any single-request error, not per-text within it) — but
+    // crucially the FIRST batch's successful results survived rather than
+    // the whole call collapsing to all-null.
+    for (let i = 10; i < 15; i++) {
+      expect(result[i]).toBeNull();
+    }
+  });
+
+  it("fetch 抛异常（网络错误）-> 该批全部置 null，不向上抛出", async () => {
+    const settings = makeSettings();
+    const fetchMock = vi.fn(async () => {
+      throw new Error("ECONNREFUSED");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(embedTexts(["a"], settings)).resolves.toEqual([null]);
+  });
+
+  it("批次数超过 EMBED_BATCH(10) -> 多次请求，仍按原始顺序拼回", async () => {
+    const dims = 4;
+    const settings = makeSettings({ APP_EMBEDDING_DIMENSIONS: String(dims) });
+    const fetchMock = makeFetchMock({ dims });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const texts = Array.from({ length: 12 }, (_, i) => `text ${i}`);
+    const result = await embedTexts(texts, settings);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // 10 + 2
+    expect(result).toHaveLength(12);
+    result.forEach((vec, i) => {
+      expect(Array.from(vec!)).toEqual(fakeEmbedding(texts[i], dims));
+    });
   });
 });
 

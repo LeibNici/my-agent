@@ -19,6 +19,8 @@ import type {
   TrackableSubmissionRow,
   UpdateIssueTrackingFields,
   UpsertFixReportFields,
+  UpsertIssueEmbeddingFields,
+  IssueEmbeddingRow,
   UnverifiedFixReportRow,
   MyIssueSubmissionRow,
   IssueTrackingOverview,
@@ -98,6 +100,8 @@ export type DbClient = {
   beginPoll(submissionId: number): Promise<number>;
   updateIssueTracking(submissionId: number, fields: UpdateIssueTrackingFields, generation: number): Promise<void>;
   upsertFixReport(fields: UpsertFixReportFields): Promise<number>;
+  upsertIssueEmbeddings(rows: UpsertIssueEmbeddingFields[]): Promise<void>;
+  getIssueEmbeddings(repoId: number): Promise<IssueEmbeddingRow[]>;
   getUnverifiedFixReports(): Promise<UnverifiedFixReportRow[]>;
   setFixReportVerified(reportId: number, verified: boolean): Promise<void>;
   getMyIssueSubmissions(userId: number, limit?: number): Promise<MyIssueSubmissionRow[]>;
@@ -334,6 +338,8 @@ export function createDbClient(dbPath: string): DbClient {
     updateIssueTracking: (submissionId, fields, generation) =>
       call<void>("updateIssueTracking", [submissionId, fields, generation]),
     upsertFixReport: (fields) => call<number>("upsertFixReport", [fields]),
+    upsertIssueEmbeddings: (rows) => call<void>("upsertIssueEmbeddings", [rows]),
+    getIssueEmbeddings: (repoId) => call<IssueEmbeddingRow[]>("getIssueEmbeddings", [repoId]),
     getUnverifiedFixReports: () => call<UnverifiedFixReportRow[]>("getUnverifiedFixReports", []),
     setFixReportVerified: (reportId, verified) =>
       call<void>("setFixReportVerified", [reportId, verified]),
