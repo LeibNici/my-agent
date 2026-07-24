@@ -689,6 +689,91 @@ export async function uploadSessionScreenshots(
   }
 }
 
+// ==================== File-attachment evidence (from chat history) ====================
+
+// Per-file cap on how much extracted text is embedded in an ISSUE body —
+// tighter than the model-facing MAX_EXTRACTED_TEXT_CHARS (attachments.ts)
+// because a GitHub issue body is hard-capped near 65536 chars, and up to
+// MAX_FILES_PER_MESSAGE files could otherwise blow past it. The full content
+// always stays in the chat session; the issue just carries a摘录.
+const ISSUE_FILE_TEXT_CHARS = 6000;
+
+// Wraps file text in a code fence long enough that content containing its own
+// ``` runs can't break out of the block (and thus can't inject arbitrary
+// markdown/HTML into the issue body).
+function wrapInCodeFence(text: string): string {
+  let longest = 0;
+  for (const m of text.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}\n${text}\n${fence}`;
+}
+
+/** Builds a markdown "相关附件内容" section embedding the extracted TEXT of the
+ * files the user attached, ready to append to an issue body ("" if none).
+ *
+ * Two deliberate differences from uploadSessionScreenshots (grilled
+ * 2026-07-24):
+ *  - Embeds TEXT into the body rather than uploading the raw file. GitHub has
+ *    no anonymous file-upload API, so uploading would make GitHub and GitLab
+ *    behave differently; embedding the parsed text keeps them identical and
+ *    puts the failing data right in front of the developer. The original
+ *    bytes stay in the chat session for anyone who needs the real file.
+ *  - Scoped to the MOST RECENT file-bearing user message, not the whole
+ *    session — a file's relevance to the issue decays fast across a
+ *    conversation (unlike a screenshot, which is usually "this is the bug"),
+ *    so scraping every file ever attached would bloat the issue with
+ *    off-topic data.
+ *
+ * Best-effort: reads raw legacy content duck-typed (same rationale as
+ * uploadSessionScreenshots — one malformed block must not lose the rest),
+ * never throws, never blocks a submission. GitHub and GitLab alike. */
+export async function buildSessionFileEvidence(sessionId: string | null, db: DbClient): Promise<string> {
+  if (!sessionId) return "";
+  try {
+    const messages = await db.getMessages(sessionId);
+    let fileBlocks: Record<string, unknown>[] = [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+      const blocks = msg.content.filter(
+        (b): b is Record<string, unknown> => isPlainObject(b) && b.type === "file"
+      );
+      if (blocks.length > 0) {
+        fileBlocks = blocks;
+        break; // most recent file-bearing message wins; stop scanning older ones
+      }
+    }
+    if (fileBlocks.length === 0) return "";
+
+    const sections: string[] = [];
+    for (const block of fileBlocks) {
+      const filename = typeof block.filename === "string" ? block.filename : "(未命名文件)";
+      const parseError = typeof block.parse_error === "string" ? block.parse_error : null;
+      let body: string;
+      if (parseError) {
+        body = `> 该文件无法解析：${parseError}`;
+      } else {
+        const raw = typeof block.extracted_text === "string" ? block.extracted_text : "";
+        let text = raw;
+        let cutForIssue = false;
+        if (text.length > ISSUE_FILE_TEXT_CHARS) {
+          text = text.slice(0, ISSUE_FILE_TEXT_CHARS);
+          cutForIssue = true;
+        }
+        const note =
+          block.truncated === true || cutForIssue
+            ? "\n\n> 附件内容较长，此处为摘录，完整文件请在对话中查看。"
+            : "";
+        body = wrapInCodeFence(text.trim() || "（空文件或无可提取文本）") + note;
+      }
+      sections.push(`### 附件：${filename}\n\n${body}`);
+    }
+    return "\n\n## 相关附件内容\n\n" + sections.join("\n\n");
+  } catch {
+    return "";
+  }
+}
+
 // Test-only escape hatch (matches embedding-client.ts's __internal
 // pattern) — lets label-cache tests start from a clean slate instead of
 // leaking state across test cases via the module-level Map.

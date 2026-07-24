@@ -1030,6 +1030,21 @@ body {
 }
 #attach-btn:hover { border-color: var(--line); color: var(--moss); background: var(--ink-850); }
 
+#attach-file-btn {
+    flex-shrink: 0;
+    width: 38px;
+    height: 38px;
+    border-radius: 9px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--mute);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+#attach-file-btn:hover { border-color: var(--line); color: var(--wire); background: var(--ink-850); }
+
 .input-hint {
     max-width: var(--col);
     margin: 8px auto 0;
@@ -1125,6 +1140,96 @@ body {
     color: var(--rust);
     font-size: 13px;
 }
+
+/* ===== Non-image file attachments ===== */
+/* Composer preview chips (below the image strip). */
+#file-preview-strip {
+    max-width: var(--col);
+    margin: 0 auto 8px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+#file-preview-strip:empty { display: none; }
+.file-preview-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 260px;
+    padding: 6px 8px 6px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--ink-900);
+    font-size: 12.5px;
+    color: var(--mute);
+}
+.file-preview-icon { flex-shrink: 0; }
+.file-preview-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--paper);
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+.file-preview-size { flex-shrink: 0; color: var(--faint); font-family: var(--font-mono); font-size: 11px; }
+.file-preview-item .remove-btn {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: none;
+    background: var(--ink-800);
+    color: var(--mute);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.file-preview-item .remove-btn:hover { color: var(--rust); }
+
+/* A sent attachment: a passive (wire) download chip — the file is evidence to
+   pull down, not inline content, so it reuses the read-only `wire` vocabulary. */
+.msg-file-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 6px 4px 0;
+    vertical-align: middle;
+}
+.msg-file {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 280px;
+    padding: 5px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--wire);
+    background: var(--wire-dim);
+    color: var(--wire);
+    text-decoration: none;
+    font-size: 12.5px;
+}
+.msg-file:hover { filter: brightness(1.08); }
+.msg-file-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+}
+.msg-file--error { border-color: var(--rust); background: var(--rust-dim); color: var(--rust); }
+.msg-file-note {
+    font-size: 10.5px;
+    font-family: var(--font-display);
+    letter-spacing: 0.03em;
+    color: var(--amber);
+    padding: 1px 6px;
+    border: 1px solid var(--amber);
+    border-radius: 4px;
+}
+.msg-file-note--err { color: var(--rust); border-color: var(--rust); }
 
 #send-btn {
     flex-shrink: 0;

@@ -763,6 +763,121 @@ describe("POST /api/chat — image attachments", () => {
   });
 });
 
+// ==================== File attachments (2026-07-24) ====================
+// validateFiles rejects a wrong TYPE / oversize / too-many up front (like
+// images); a PARSE failure never blocks (the file still sends with a
+// placeholder). Server-side parsing turns bytes into extracted text before
+// the engine ever sees them.
+
+describe("POST /api/chat — file attachments", () => {
+  const CSV_B64 = Buffer.from("订单号,数量\nA100,3", "utf8").toString("base64");
+
+  it("不支持的文件类型 → 整条拒绝，不落库、不调用 engine", async () => {
+    const { token } = await seedUser("user", "file-type");
+    let engineCalled = false;
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: (async function* () { engineCalled = true; }) as RunTurnFn,
+    });
+    const before = await client.listSessions(null);
+    const { frames } = await postChat(app, token, {
+      message: "看这个",
+      files: [{ filename: "scan.pdf", media_type: "application/pdf", data: CSV_B64 }],
+    });
+    expect(frames.map((f) => f.event)).toEqual(["error", "done", "end"]);
+    expect(JSON.parse(frames[0].data).message).toMatch(/不支持的文件类型/);
+    expect(engineCalled).toBe(false);
+    expect(await client.listSessions(null)).toHaveLength(before.length);
+  });
+
+  it("超过数量上限 → 整条拒绝", async () => {
+    const { token } = await seedUser("user", "file-count");
+    const app = buildApp({ db: client, settings, engine: stubEngine([]) });
+    const files = Array.from({ length: 4 }, (_, i) => ({ filename: `f${i}.txt`, media_type: "text/plain", data: CSV_B64 }));
+    const { frames } = await postChat(app, token, { message: "看这些", files });
+    expect(frames.map((f) => f.event)).toEqual(["error", "done", "end"]);
+    expect(JSON.parse(frames[0].data).message).toMatch(/Too many files/);
+  });
+
+  it("合法文本文件：服务端解析出 extractedText，domain 形状传给 engine，legacy 形状落库（文件在文本前）", async () => {
+    const { token } = await seedUser("user", "file-ok");
+    let capturedFiles: any;
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: (async function* (_deps, req) {
+        capturedFiles = req.files;
+        yield { type: "done", data: { text: "ok", success: true, budgetExhausted: false } };
+      }) as RunTurnFn,
+    });
+    const { frames } = await postChat(app, token, {
+      message: "这个导入失败了",
+      files: [{ filename: "orders.csv", media_type: "text/csv", data: CSV_B64 }],
+    });
+    const sessionId = JSON.parse(frames[0].data).session_id;
+
+    // engine 收到 domain 形状，且 extractedText 是服务端真正解析出来的文本
+    expect(capturedFiles).toEqual([
+      { type: "file", filename: "orders.csv", mediaType: "text/csv", base64Data: CSV_B64, extractedText: "订单号,数量\nA100,3", truncated: false },
+    ]);
+
+    // 落库是 legacy 形状（source.* + extracted_text），文件块在文本块之前
+    const messages = await client.getMessages(sessionId);
+    const userMsg = messages.find((m) => m.role === "user")!;
+    expect(userMsg.content).toEqual([
+      { type: "file", filename: "orders.csv", source: { type: "base64", media_type: "text/csv", data: CSV_B64 }, extracted_text: "订单号,数量\nA100,3", truncated: false },
+      { type: "text", text: "这个导入失败了" },
+    ]);
+  });
+
+  it("解析失败（损坏 xlsx）不阻塞：仍落库并带 parse_error，engine 照常被调用", async () => {
+    const { token } = await seedUser("user", "file-parsefail");
+    let capturedFiles: any;
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: (async function* (_deps, req) {
+        capturedFiles = req.files;
+        yield { type: "done", data: { text: "ok", success: true, budgetExhausted: false } };
+      }) as RunTurnFn,
+    });
+    const junk = Buffer.from("this is not a real xlsx", "utf8").toString("base64");
+    const { frames } = await postChat(app, token, {
+      message: "为什么打不开",
+      files: [{ filename: "broken.xlsx", media_type: "application/octet-stream", data: junk }],
+    });
+    expect(frames.map((f) => f.event)).toContain("done");
+    expect(capturedFiles).toHaveLength(1);
+    expect(capturedFiles[0].parseError).toBeTruthy();
+    expect(capturedFiles[0].extractedText).toBe("");
+
+    const sessionId = JSON.parse(frames.find((f) => f.event === "session")!.data).session_id;
+    const messages = await client.getMessages(sessionId);
+    const userMsg = messages.find((m) => m.role === "user")!;
+    const fileBlk = (userMsg.content as any[]).find((b) => b.type === "file");
+    expect(fileBlk.parse_error).toBeTruthy();
+  });
+
+  it("图文混传：同一条消息里图片在前、文件其次、文本最后", async () => {
+    const { token } = await seedUser("user", "file-mixed");
+    const app = buildApp({
+      db: client,
+      settings,
+      engine: stubEngine([{ type: "done", data: { text: "ok", success: true, budgetExhausted: false } }]),
+    });
+    const { frames } = await postChat(app, token, {
+      message: "报错截图 + 数据",
+      images: [{ media_type: "image/png", data: PNG_MAGIC_B64 }],
+      files: [{ filename: "orders.csv", media_type: "text/csv", data: CSV_B64 }],
+    });
+    const sessionId = JSON.parse(frames[0].data).session_id;
+    const messages = await client.getMessages(sessionId);
+    const userMsg = messages.find((m) => m.role === "user")!;
+    expect((userMsg.content as any[]).map((b) => b.type)).toEqual(["image", "file", "text"]);
+  });
+});
+
 // ==================== req.linkedIssues (2026-07-13) ====================
 // Feeds turn.ts's per-turn "which issue(s) has this session already
 // touched" reminder — see buildLinkedIssueSummaries in sse.ts.
@@ -1334,7 +1449,7 @@ describe("auth middleware — must_change_password 后端强制拦截（Codex �
 // ==================== GET /api/config, /api/skills ====================
 
 describe("GET /api/config", () => {
-  it("返回 v1 main.py 的静态限额形状：max_images_per_message/max_image_bytes/repo_sync_interval_minutes，另加 git_sha", async () => {
+  it("返回静态限额形状：图片/文件 上限 + repo_sync_interval_minutes，另加 git_sha", async () => {
     const { token } = await seedUser();
     const app = buildApp({ db: client, settings, engine: stubEngine([]) });
     const resp = await authedRequest(app, token, "/api/config");
@@ -1344,6 +1459,8 @@ describe("GET /api/config", () => {
     expect(await resp.json()).toEqual({
       max_images_per_message: 5,
       max_image_bytes: 4_500_000,
+      max_files_per_message: 3,
+      max_file_bytes: 2 * 1024 * 1024,
       repo_sync_interval_minutes: settings.repoSyncIntervalMinutes,
       git_sha: expect.any(String),
     });

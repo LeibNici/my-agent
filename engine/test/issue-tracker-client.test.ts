@@ -29,6 +29,7 @@ import {
   searchRepoIssues,
   uploadGitlabAttachment,
   uploadSessionScreenshots,
+  buildSessionFileEvidence,
   fetchWithTimeout,
   __internal,
 } from "../src/tools/issue-tracker-client.js";
@@ -1056,5 +1057,76 @@ describe("fetchWithTimeout — redirect 目标重新过 SSRF 校验", () => {
     await expect(fetchWithTimeout("https://gitlab.example.invalid/api", {}, 5000)).rejects.toThrow(
       /too many redirects/
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSessionFileEvidence — embeds the latest file-bearing message's extracted
+// text into an issue body (GitHub/GitLab alike, no upload). Needs a real DbClient.
+// ---------------------------------------------------------------------------
+
+describe("buildSessionFileEvidence", () => {
+  let dir: string;
+  let db: DbClient;
+
+  beforeEach(() => {
+    const f = makeSeededDb(); // seeds session "s1"
+    dir = f.dir;
+    db = createDbClient(f.dbPath);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function fileBlock(filename: string, extractedText: string, extra: Record<string, unknown> = {}) {
+    return {
+      type: "file",
+      filename,
+      source: { type: "base64", media_type: "text/csv", data: "QUFB" },
+      extracted_text: extractedText,
+      truncated: false,
+      ...extra,
+    };
+  }
+
+  it("no session / no files -> empty string", async () => {
+    expect(await buildSessionFileEvidence(null, db)).toBe("");
+    await db.addMessage("s1", "user", [{ type: "text", text: "纯文字，无附件" }]);
+    expect(await buildSessionFileEvidence("s1", db)).toBe("");
+  });
+
+  it("embeds the extracted text under 相关附件内容 in a code fence", async () => {
+    await db.addMessage("s1", "user", [fileBlock("orders.csv", "订单号,数量\nA100,3"), { type: "text", text: "看这个" }]);
+    const md = await buildSessionFileEvidence("s1", db);
+    expect(md).toContain("## 相关附件内容");
+    expect(md).toContain("### 附件：orders.csv");
+    expect(md).toContain("```\n订单号,数量\nA100,3\n```");
+  });
+
+  it("uses ONLY the most recent file-bearing message (relevance decays)", async () => {
+    await db.addMessage("s1", "user", [fileBlock("old.csv", "旧数据")]);
+    await db.addMessage("s1", "assistant", "分析了旧数据");
+    await db.addMessage("s1", "user", [fileBlock("new.csv", "新数据")]);
+    const md = await buildSessionFileEvidence("s1", db);
+    expect(md).toContain("new.csv");
+    expect(md).toContain("新数据");
+    expect(md).not.toContain("old.csv");
+    expect(md).not.toContain("旧数据");
+  });
+
+  it("renders a parse failure as a note, never the raw bytes", async () => {
+    await db.addMessage("s1", "user", [fileBlock("broken.xlsx", "", { parse_error: "已损坏", source: { type: "base64", media_type: "x", data: "SECRETBYTES" } })]);
+    const md = await buildSessionFileEvidence("s1", db);
+    expect(md).toContain("该文件无法解析：已损坏");
+    expect(md).not.toContain("SECRETBYTES");
+  });
+
+  it("picks a code fence longer than any backtick run in the content (no breakout)", async () => {
+    await db.addMessage("s1", "user", [fileBlock("md.txt", "见 ```js\ncode\n``` 示例")]);
+    const md = await buildSessionFileEvidence("s1", db);
+    expect(md).toContain("````"); // 4-backtick fence wraps content that itself contains ```
+    expect(md).toContain("见 ```js\ncode\n``` 示例");
   });
 });

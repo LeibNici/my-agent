@@ -26,6 +26,7 @@ import {
   applyRepoIssueAction,
   searchRepoIssues,
   uploadSessionScreenshots,
+  buildSessionFileEvidence,
 } from "../tools/issue-tracker-client.js";
 import { truncateChars } from "../tools/chunking.js";
 import type { FullRepoRow } from "../db/storage.js";
@@ -317,8 +318,17 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     // (GitLab-hosted repos only) instead of leaving them stranded in chat
     // history. Deliberately AFTER the claim above (see that comment) so
     // only the winner of a race ever uploads anything.
-    const screenshotsSection = await uploadSessionScreenshots(repo, sessionId, deps.db);
-    const fullBody = `${expectedSection}${body.body}${screenshotsSection}${reporterStamp}`;
+    // Both gather evidence from the chat session for the issue body: file
+    // attachments embed their extracted TEXT inline (GitHub/GitLab alike),
+    // screenshots upload the raw image to GitLab. Independent, so run them
+    // together; both are best-effort and degrade to "" rather than failing
+    // the submission. Deliberately AFTER the claim above (see that comment)
+    // so only the winner of a race does this work.
+    const [fileEvidenceSection, screenshotsSection] = await Promise.all([
+      buildSessionFileEvidence(sessionId, deps.db),
+      uploadSessionScreenshots(repo, sessionId, deps.db),
+    ]);
+    const fullBody = `${expectedSection}${body.body}${fileEvidenceSection}${screenshotsSection}${reporterStamp}`;
 
     // Submits against the stored repo URL/credentials (not client-supplied).
     const result = await submitRepoIssue(repo, body.title, fullBody, labels);

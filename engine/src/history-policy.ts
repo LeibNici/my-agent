@@ -4,6 +4,15 @@ import { DomainMessage, DomainBlock, isToolRelay } from "./domain.js";
 export const HISTORY_IMAGE_PLACEHOLDER =
   "[历史消息中的截图已省略；如需模型重看，请让用户重新发送图片]";
 
+/** File-attachment analogue of HISTORY_IMAGE_PLACEHOLDER (2026-07-24). A file
+ * block's extracted text can be thousands of characters, so past turns fold
+ * it away exactly like an image — only the CURRENT turn's file text reaches
+ * the model (injected via the prompt in turn.ts). The filename is appended by
+ * the caller so the model still knows WHAT was attached and can ask the user
+ * to resend it. */
+export const HISTORY_FILE_PLACEHOLDER =
+  "[历史消息中的附件内容已省略；如需模型重看，请让用户重新上传文件]";
+
 /**
  * Port of app/main.py:277-348 `_prepare_model_messages`. Shape persisted
  * history into what gets SENT to the model this turn. The DB copy (the
@@ -24,9 +33,11 @@ export function prepareModelMessages(
   const msgs: DomainMessage[] = history.map((m) => {
     let content = m.content;
     if (Array.isArray(content)) {
-      content = content.map((b: DomainBlock): DomainBlock =>
-        b.type === "image" ? { type: "text", text: HISTORY_IMAGE_PLACEHOLDER } : b
-      );
+      content = content.map((b: DomainBlock): DomainBlock => {
+        if (b.type === "image") return { type: "text", text: HISTORY_IMAGE_PLACEHOLDER };
+        if (b.type === "file") return { type: "text", text: `${HISTORY_FILE_PLACEHOLDER}（${b.filename}）` };
+        return b;
+      });
     }
     return { role: m.role, content };
   });

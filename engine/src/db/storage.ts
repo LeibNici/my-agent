@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { randomUUID, randomBytes } from "node:crypto";
 import { pythonJsonDumps, pyLocalIsoNow } from "./py-compat.js";
-import { HISTORY_IMAGE_PLACEHOLDER } from "../history-policy.js";
+import { HISTORY_IMAGE_PLACEHOLDER, HISTORY_FILE_PLACEHOLDER } from "../history-policy.js";
 
 export class SchemaError extends Error {}
 
@@ -695,14 +695,22 @@ function isPlainObject(val: unknown): val is Record<string, unknown> {
 // going through codec-legacy.ts's legacyToDomain, matching
 // uploadSessionScreenshots'/verifyDraftRepoId's established rationale for
 // doing the same (see issue-tracker-client.ts) — this is a best-effort
-// "swap image blocks for the same placeholder history-policy.ts would
+// "swap image/file blocks for the same placeholder history-policy.ts would
 // produce anyway", not a validating round-trip, so a block that doesn't
-// look exactly like an image block is left untouched rather than throwing.
-function stripLegacyImageBlocks(content: unknown): unknown {
+// look exactly like an image/file block is left untouched rather than
+// throwing. File blocks carry a base64 payload up to MAX_FILE_BYTES plus a
+// potentially large extracted_text, so folding them here (during row
+// iteration) is the same peak-memory win the image folding is — see
+// getMessagesForTurn's own comment.
+function stripLegacyAttachmentBlocks(content: unknown): unknown {
   if (!Array.isArray(content)) return content;
   return content.map((block) => {
     if (isPlainObject(block) && block.type === "image") {
       return { type: "text", text: HISTORY_IMAGE_PLACEHOLDER };
+    }
+    if (isPlainObject(block) && block.type === "file") {
+      const name = typeof block.filename === "string" ? `（${block.filename}）` : "";
+      return { type: "text", text: `${HISTORY_FILE_PLACEHOLDER}${name}` };
     }
     return block;
   });
@@ -934,7 +942,7 @@ export function openStorage(dbPath: string): Storage {
         let parsedContent: string | unknown[] = row.content;
         if (typeof row.content === "string" && row.content.startsWith("[")) {
           try {
-            parsedContent = stripLegacyImageBlocks(JSON.parse(row.content)) as string | unknown[];
+            parsedContent = stripLegacyAttachmentBlocks(JSON.parse(row.content)) as string | unknown[];
           } catch {
             parsedContent = row.content;
           }

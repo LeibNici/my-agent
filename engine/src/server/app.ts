@@ -45,6 +45,7 @@ import {
   type ChatRequestBody,
   type CurrentUser,
 } from "./sse.js";
+import { MAX_FILES_PER_MESSAGE, MAX_FILE_BASE64_CHARS, MAX_FILE_BYTES } from "../attachments.js";
 import { mountAdminRoutes, type SyncAndPersistFn } from "./admin-routes.js";
 import { mountAdminDashboardRoutes } from "./admin-dashboard-routes.js";
 import { mountIssueRoutes } from "./issue-routes.js";
@@ -191,7 +192,12 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
   // smaller.
   const defaultBodyLimit = bodyLimit({ maxSize: 2 * 1024 * 1024 });
   const chatBodyLimit = bodyLimit({
-    maxSize: MAX_IMAGES_PER_MESSAGE * MAX_IMAGE_BASE64_CHARS + 1024 * 1024,
+    // Room for up to MAX_IMAGES images + MAX_FILES files (both base64-in-JSON)
+    // plus 1 MB of slack for the surrounding request envelope/text.
+    maxSize:
+      MAX_IMAGES_PER_MESSAGE * MAX_IMAGE_BASE64_CHARS +
+      MAX_FILES_PER_MESSAGE * MAX_FILE_BASE64_CHARS +
+      1024 * 1024,
   });
   app.use("/api/*", (c, next) => (c.req.path === "/api/chat" ? chatBodyLimit : defaultBodyLimit)(c, next));
 
@@ -354,6 +360,8 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
     c.json({
       max_images_per_message: MAX_IMAGES_PER_MESSAGE,
       max_image_bytes: Math.round((MAX_IMAGE_BASE64_CHARS * 3) / 4),
+      max_files_per_message: MAX_FILES_PER_MESSAGE,
+      max_file_bytes: MAX_FILE_BYTES,
       repo_sync_interval_minutes: deps.settings.repoSyncIntervalMinutes,
       git_sha: GIT_SHA,
     })

@@ -66,6 +66,29 @@ describe("domainToPi（注③）", () => {
         { type: "image", source: { type: "base64", media_type: "image/png", data: "AAA" } } ] }]);
     expect(() => domainToPi(withImage, OPTS)).toThrow(CodecError);
   });
+  it("user 消息里的 file 块 → 降级为文本块（携带 fileBlockToText，排在文本之前）", () => {
+    const withFile = legacyListToDomain([{ role: "user", content: [
+      { type: "file", filename: "orders.csv",
+        source: { type: "base64", media_type: "text/csv", data: "QUFB" },
+        extracted_text: "订单号,数量\nA100,3", truncated: false },
+      { type: "text", text: "这个导入失败了" } ] }]);
+    const pi = domainToPi(withFile, OPTS);
+    expect(pi).toEqual([{
+      role: "user",
+      content: [
+        { type: "text", text: "【附件：orders.csv】\n订单号,数量\nA100,3" },
+        { type: "text", text: "这个导入失败了" },
+      ],
+      timestamp: expect.any(Number),
+    }]);
+  });
+  it("assistant 消息里的 file 块 → CodecError（文件只属于 user 输入）", () => {
+    const badShape = legacyListToDomain([{ role: "assistant", content: [
+      { type: "file", filename: "x.txt",
+        source: { type: "base64", media_type: "text/plain", data: "AAA" },
+        extracted_text: "x", truncated: false } ] }]);
+    expect(() => domainToPi(badShape, OPTS)).toThrow(CodecError);
+  });
   it("thinking 块 + tool_use 同一 assistant 消息 → pi content 顺序原样保留（不重排）", () => {
     const withThinking = legacyListToDomain([{ role: "assistant", content: [
       { type: "thinking", thinking: "先想想", thinking_signature: "sig_1" },

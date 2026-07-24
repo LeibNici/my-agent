@@ -30,8 +30,15 @@ import type { LlmMetricsRow, IssueSubmissionRow, IssueActionRow } from "../db/st
 import type { Settings } from "../config.js";
 import type { RunTurnFn, RunTurnDeps, LinkedIssueSummary } from "../engine/turn.js";
 import type { ToolDef, ToolContext } from "../tools/registry.js";
-import type { DomainBlock, ImageBlock } from "../domain.js";
+import type { DomainBlock, ImageBlock, FileBlock } from "../domain.js";
 import { domainToLegacy } from "../codec-legacy.js";
+import {
+  MAX_FILES_PER_MESSAGE,
+  MAX_FILE_BYTES,
+  MAX_FILE_BASE64_CHARS,
+  isAllowedFilename,
+  parseAttachmentBytes,
+} from "../attachments.js";
 // stripLeakedThinkingTags is a pure string->string helper with no pi types
 // in its signature (verified: codec-pi.ts's own file header confines pi
 // TYPES to codec-pi.ts/event-adapter.ts — this function isn't one), so
@@ -72,6 +79,11 @@ function releaseSessionTurnLock(sessionId: string): void {
 }
 
 export type ChatImage = { media_type: string; data: string };
+// A non-image file attachment on the wire (base64 in JSON, same transport as
+// images — no multipart). `media_type` is the browser-supplied MIME, kept for
+// download only; the accepted TYPE is decided by the filename extension
+// (isAllowedFilename), not this field, which is often "" for logs/code.
+export type ChatFile = { filename: string; media_type: string; data: string };
 
 export type ChatRequestBody = {
   session_id?: string | null;
@@ -85,6 +97,7 @@ export type ChatRequestBody = {
   active_skills?: string[];
   repo_id?: number | null;
   images?: ChatImage[];
+  files?: ChatFile[];
 };
 
 /** v1's `_validate_images` (app/main.py:86-102) — returns an error message
@@ -120,6 +133,37 @@ function validateImages(images: ChatImage[]): string | null {
 // is equivalent and cheaper for a check that runs on every message.
 function isWellFormedBase64(s: string): boolean {
   return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(s);
+}
+
+/** File-attachment analogue of validateImages (2026-07-24). Returns an error
+ * message if the batch is invalid, else null. The type check is by filename
+ * extension (isAllowedFilename), NOT the client MIME, since logs/code files
+ * usually arrive with an empty or generic media_type. Unlike a PARSE failure
+ * (which never blocks — the file still sends with a placeholder), a wrong
+ * TYPE / oversize / malformed-base64 file is rejected up front here, matching
+ * how images reject before the turn ever starts. The same base64-well-
+ * formedness rationale as images applies: this data later reaches a
+ * client-side download built from the stored base64. */
+function validateFiles(files: ChatFile[]): string | null {
+  if (files.length > MAX_FILES_PER_MESSAGE) {
+    return `Too many files (${files.length}). Max ${MAX_FILES_PER_MESSAGE} per message.`;
+  }
+  for (const f of files) {
+    if (typeof f.filename !== "string" || !f.filename.trim()) {
+      return "File is missing a filename.";
+    }
+    if (!isAllowedFilename(f.filename)) {
+      return `不支持的文件类型：${f.filename}。仅支持文本/代码文件、Excel(.xlsx)、Word(.docx)。`;
+    }
+    if (typeof f.data !== "string" || f.data.length > MAX_FILE_BASE64_CHARS) {
+      const maxMb = Math.round((MAX_FILE_BYTES / 1_000_000) * 10) / 10;
+      return `File too large (max ~${maxMb}MB): ${f.filename}.`;
+    }
+    if (!isWellFormedBase64(f.data)) {
+      return `File data is not valid base64: ${f.filename}.`;
+    }
+  }
+  return null;
 }
 
 export type SseFrame = { event: string; data: string };
@@ -292,6 +336,16 @@ export async function* chatEventStream(
     yield* sseReject(imageError);
     return;
   }
+
+  // Validate files cheaply here (type/size/base64) — the heavier parse is
+  // deferred until after the session-turn lock below, so a slow xlsx parse
+  // can't run for a request about to be rejected as a duplicate turn.
+  const files = req.files ?? [];
+  const fileError = validateFiles(files);
+  if (fileError) {
+    yield* sseReject(fileError);
+    return;
+  }
   // Domain-shaped (mediaType/base64Data), always ordered before the text
   // block — matches v1's `user_content = [image blocks..., text]`
   // (app/main.py:413-420). Both the DB-persisted content and the fresh
@@ -357,12 +411,40 @@ export async function* chatEventStream(
   // avoids peak memory scaling with how many images a long session has
   // accumulated — see storage.ts's getMessagesForTurn doc comment.
   const history = await db.getMessagesForTurn(sessionId);
-  // v1 persists the SAME content it sends the model: images (if any) first,
-  // then the text block, only when non-blank (app/main.py:413-420) — a
-  // plain string when there's no image, matching the existing/common case.
+  // Parse non-image attachments to text server-side now. Deferred to here
+  // (after the turn lock) on purpose: parsing an xlsx/docx is the heavy step,
+  // and there's no point spending it on a request that's about to be rejected
+  // as a duplicate in-progress turn. Sequential await is fine — at most
+  // MAX_FILES_PER_MESSAGE files, and this generator already awaits DB calls.
+  // A parse failure is NON-fatal (parseAttachmentBytes returns parseError,
+  // never throws): the block still stores the raw bytes + a placeholder note,
+  // so a broken upload never blocks the message (grilled decision).
+  const domainFiles: FileBlock[] = [];
+  for (const f of files) {
+    const parsed = await parseAttachmentBytes(f.filename, Buffer.from(f.data, "base64"));
+    const block: FileBlock = {
+      type: "file",
+      filename: f.filename,
+      mediaType: f.media_type || "application/octet-stream",
+      base64Data: f.data,
+      extractedText: parsed.extractedText,
+      truncated: parsed.truncated,
+    };
+    if (parsed.parseError) block.parseError = parsed.parseError;
+    domainFiles.push(block);
+  }
+
+  // v1 persists the SAME content it sends the model: attachments first, then
+  // the text block, only when non-blank (app/main.py:413-420) — a plain
+  // string when there's no attachment, matching the existing/common case.
+  // Images precede files (both before text). The DB row keeps full fidelity
+  // (raw file bytes for replay/download AND the extracted text); the split of
+  // what the MODEL sees vs what's stored is handled downstream (files never
+  // send raw bytes to the model — codec-pi / turn.ts use fileBlockToText).
+  const attachmentBlocks: DomainBlock[] = [...domainImages, ...domainFiles];
   const userContent: string | unknown[] =
-    domainImages.length > 0
-      ? [...legacyContent(domainImages), ...(req.message ? [{ type: "text", text: req.message }] : [])]
+    attachmentBlocks.length > 0
+      ? [...legacyContent(attachmentBlocks), ...(req.message ? [{ type: "text", text: req.message }] : [])]
       : req.message;
   await db.addMessage(sessionId, "user", userContent);
 
@@ -408,6 +490,7 @@ export async function* chatEventStream(
     history,
     userText: req.message,
     images: domainImages.length > 0 ? domainImages : undefined,
+    files: domainFiles.length > 0 ? domainFiles : undefined,
     linkedIssues: linkedIssues.length > 0 ? linkedIssues : undefined,
   })[Symbol.asyncIterator]();
 
@@ -538,6 +621,8 @@ export async function* chatEventStream(
                 title = finalText.trim().slice(0, 50);
               } else if (req.images && req.images.length > 0) {
                 title = `${req.images.length} image(s)`;
+              } else if (files.length > 0) {
+                title = files.length === 1 ? files[0].filename.slice(0, 50) : `${files.length} 个附件`;
               } else {
                 title = "New Chat";
               }

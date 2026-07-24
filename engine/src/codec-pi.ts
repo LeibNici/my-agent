@@ -13,7 +13,7 @@ import type {
   ToolCall as PiToolCall,
   Usage as PiUsage,
 } from "@earendil-works/pi-ai";
-import { DomainMessage, DomainBlock, ToolUseBlock, ThinkingBlock, CodecError } from "./domain.js";
+import { DomainMessage, DomainBlock, ToolUseBlock, ThinkingBlock, CodecError, fileBlockToText } from "./domain.js";
 
 const ZERO_USAGE: PiUsage = {
   input: 0,
@@ -76,6 +76,10 @@ export function domainToPi(
             // TextContent|ThinkingContent|ToolCall), matching Anthropic
             // itself never emitting an image block in an assistant turn.
             throw new CodecError("Unexpected image block in assistant message");
+          case "file":
+            // Same rationale as the image case above: a file is user input
+            // only; an assistant turn never carries one.
+            throw new CodecError("Unexpected file block in assistant message");
           case "tool_result":
             throw new CodecError("Unexpected tool_result block in assistant message");
           default: {
@@ -151,6 +155,19 @@ export function domainToPi(
           // {type:"image",source:{type:"base64",media_type,data}} shape
           // internally (see anthropic-messages.js's convertContentBlocks).
           trailingContent.push({ type: "image", data: block.base64Data, mimeType: block.mediaType });
+          break;
+        case "file":
+          // Degrade to a plain text block carrying the extracted text (the
+          // "codec-pi 边界降级为文本块" contract, 2026-07-24). In the real
+          // pipeline this is unreachable for HISTORY — a file block from a
+          // past turn is already folded to a placeholder text block by
+          // history-policy.ts / storage.ts before domainToPi runs — and the
+          // CURRENT turn's file text is injected via the prompt string in
+          // turn.ts, never through here. Degrading rather than throwing keeps
+          // a stray un-folded block from failing the whole turn. Like an
+          // image, it accumulates into trailingContent without flipping
+          // seenText (a file never coexists with a tool_result).
+          trailingContent.push({ type: "text", text: fileBlockToText(block) });
           break;
         case "tool_use":
           throw new CodecError("Unexpected tool_use block in user message");

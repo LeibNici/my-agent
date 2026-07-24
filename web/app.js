@@ -27,6 +27,7 @@ let currentSessionId = null;
 let activeSkills = [];
 let selectedRepoId = null;
 let pendingImages = []; // { mediaType, data (base64, no prefix), previewUrl (data URL) }
+let pendingFiles = []; // { filename, mediaType, data (base64, no prefix), size }
 
 // Multiple sessions can stream concurrently — switching which one is
 // displayed must never cancel the others. (2026-07-15 fix: this used to be
@@ -62,6 +63,20 @@ let MAX_IMAGES_PER_MESSAGE = 5;
 let MAX_IMAGE_BYTES = 4_500_000;
 const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
+let MAX_FILES_PER_MESSAGE = 3;
+let MAX_FILE_BYTES = 2_000_000;
+// Client mirror of the server's accepted extensions (engine/src/attachments.ts).
+// The server is authoritative and re-rejects on mismatch — this is UX-only
+// (fast feedback + the file picker's `accept` filter), so a little drift just
+// means the server has the final say, never a security gap.
+const ALLOWED_FILE_EXTENSIONS = new Set([
+    "txt", "log", "md", "markdown", "csv", "tsv", "json", "jsonl", "ndjson", "yaml", "yml",
+    "xml", "html", "htm", "css", "scss", "less", "js", "jsx", "ts", "tsx", "mjs", "cjs", "vue", "svelte",
+    "java", "kt", "kts", "go", "rs", "c", "h", "cpp", "cc", "cxx", "hpp", "cs", "php", "rb", "swift", "m", "mm",
+    "scala", "groovy", "dart", "lua", "pl", "pm", "r", "sql", "sh", "bash", "zsh", "ps1", "bat",
+    "ini", "conf", "cfg", "toml", "properties", "env", "gradle", "diff", "patch", "tex", "xlsx", "docx",
+]);
+
 async function loadConfig() {
     try {
         const resp = await authFetch("/api/config");
@@ -69,6 +84,8 @@ async function loadConfig() {
         const config = await resp.json();
         if (config.max_images_per_message) MAX_IMAGES_PER_MESSAGE = config.max_images_per_message;
         if (config.max_image_bytes) MAX_IMAGE_BYTES = config.max_image_bytes;
+        if (config.max_files_per_message) MAX_FILES_PER_MESSAGE = config.max_files_per_message;
+        if (config.max_file_bytes) MAX_FILE_BYTES = config.max_file_bytes;
         showGitSha(config.git_sha, document.querySelector(".sidebar-header"));
     } catch {} // keep the fallback defaults above if this fails
 }
@@ -116,7 +133,15 @@ document.addEventListener("DOMContentLoaded", () => {
         inputArea.addEventListener("drop", (e) => {
             e.preventDefault();
             const files = e.dataTransfer && e.dataTransfer.files;
-            if (files) Array.from(files).filter(f => f.type.startsWith("image/")).forEach(addImageFile);
+            if (!files) return;
+            // Images take the screenshot path; other allowed types take the
+            // file-attachment path. Anything else dropped is ignored silently
+            // — the 📎 button gives a clearer per-file rejection message when
+            // the user really means to attach an unsupported type.
+            Array.from(files).forEach(f => {
+                if (f.type.startsWith("image/")) addImageFile(f);
+                else if (isAllowedAttachment(f.name)) addFile(f);
+            });
         });
     }
 });
@@ -634,7 +659,7 @@ function fillExample(btn) {
 async function sendMessage() {
     const input = document.getElementById("message-input");
     const text = input.value.trim();
-    if ((!text && pendingImages.length === 0) || isViewingStreamActive()) return;
+    if ((!text && pendingImages.length === 0 && pendingFiles.length === 0) || isViewingStreamActive()) return;
 
     // Enter-to-send bypasses the disabled send-btn state (the input field
     // itself stays enabled so the user can still type while nudged to pick
@@ -656,19 +681,25 @@ async function sendMessage() {
     if (welcome) welcome.remove();
 
     const imagesToSend = pendingImages.map(img => ({ media_type: img.mediaType, data: img.data }));
+    const filesToSend = pendingFiles.map(f => ({ filename: f.filename, media_type: f.mediaType, data: f.data }));
 
-    // Show user message (images + text, matching what's actually sent)
-    const userContent = imagesToSend.length
-        ? [
-            ...imagesToSend.map(img => ({ type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } })),
-            ...(text ? [{ type: "text", text }] : []),
-          ]
+    // Show user message (attachments + text, matching what's actually sent /
+    // persisted server-side): images first, then files, then text. The file
+    // blocks carry empty extracted_text here — the server parses them; this
+    // local echo only needs enough to render the download chip.
+    const attachmentBlocks = [
+        ...imagesToSend.map(img => ({ type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } })),
+        ...filesToSend.map(f => ({ type: "file", filename: f.filename, source: { type: "base64", media_type: f.media_type, data: f.data }, extracted_text: "", truncated: false })),
+    ];
+    const userContent = attachmentBlocks.length
+        ? [...attachmentBlocks, ...(text ? [{ type: "text", text }] : [])]
         : text;
     const userMsgEl = appendUserMessage(userContent);
     const sessionIdAtStart = currentSessionId;
     input.value = "";
     input.style.height = "auto";
     clearPendingImages();
+    clearPendingFiles();
 
     // Send. A brand-new chat has no real session id yet — tracked under a
     // throwaway local key until the "session" SSE event below reveals the
@@ -696,6 +727,7 @@ async function sendMessage() {
                 active_skills: activeSkills,
                 repo_id: selectedRepoId,
                 images: imagesToSend,
+                files: filesToSend,
             }),
             signal: controller.signal,
         });
@@ -1020,6 +1052,74 @@ function handlePaste(event) {
     if (handledImage) event.preventDefault();
 }
 
+// ===== File attachments (non-image) =====
+function fileExtension(name) {
+    const base = (name || "").toLowerCase().replace(/^.*[\\/]/, "");
+    const dot = base.lastIndexOf(".");
+    return dot > 0 ? base.slice(dot + 1) : "";
+}
+
+function isAllowedAttachment(name) {
+    return ALLOWED_FILE_EXTENSIONS.has(fileExtension(name));
+}
+
+function humanFileSize(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function addFile(file) {
+    if (!isAllowedAttachment(file.name)) {
+        showChatNotice(`不支持的文件类型：${file.name || "未知"}`);
+        return;
+    }
+    if (file.size > MAX_FILE_BYTES) {
+        showChatNotice(`文件过大（上限 ${Math.round(MAX_FILE_BYTES / 1_000_000 * 10) / 10}MB）：${file.name}`);
+        return;
+    }
+    if (pendingFiles.length >= MAX_FILES_PER_MESSAGE) {
+        showChatNotice(`每条消息最多 ${MAX_FILES_PER_MESSAGE} 个附件`);
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+        const dataUrl = reader.result;
+        const base64Data = dataUrl.slice(dataUrl.indexOf(",") + 1);
+        pendingFiles.push({ filename: file.name, mediaType: file.type || "application/octet-stream", data: base64Data, size: file.size });
+        renderFilePreviews();
+    };
+    reader.readAsDataURL(file);
+}
+
+function renderFilePreviews() {
+    const strip = document.getElementById("file-preview-strip");
+    if (!strip) return;
+    strip.innerHTML = pendingFiles.map((f, i) => `
+        <div class="file-preview-item" title="${escapeHtml(f.filename)}">
+            <span class="file-preview-icon">📎</span>
+            <span class="file-preview-name">${escapeHtml(f.filename)}</span>
+            <span class="file-preview-size">${escapeHtml(humanFileSize(f.size))}</span>
+            <button class="remove-btn" onclick="removePendingFile(${i})" title="移除">×</button>
+        </div>
+    `).join("");
+}
+
+function removePendingFile(index) {
+    pendingFiles.splice(index, 1);
+    renderFilePreviews();
+}
+
+function clearPendingFiles() {
+    pendingFiles = [];
+    renderFilePreviews();
+}
+
+function handleFilesSelected(fileList) {
+    Array.from(fileList).forEach(addFile);
+    document.getElementById("file-input").value = "";
+}
+
 // ===== DOM Helpers =====
 // Only valid base64 characters — guarantees nothing here can break out of
 // the src="..." attribute (quotes/angle-brackets aren't valid base64), and
@@ -1038,11 +1138,35 @@ function renderUserContent(content) {
                 }
                 return `<img class="msg-image" src="data:${mediaType};base64,${data}" alt="attached image">`;
             }
+            if (block.type === "file" && block.source) return renderFileChip(block);
             if (block.type === "text") return renderMarkdown(block.text || "");
             return "";
         }).join("");
     }
     return renderMarkdown(JSON.stringify(content));
+}
+
+// A non-image attachment renders as a download chip, not inline content — the
+// model saw the file's extracted TEXT (server-side), but the user gets the
+// ORIGINAL file back via a client-side download built straight from the
+// stored base64 (no server round-trip). Same base64-validity guard as the
+// image path: only real base64 can reach the href, so file content can't
+// break out of the attribute (data URIs + the download attribute force a
+// save-as, never navigation/execution). A parse failure or truncation is
+// flagged with a small tag so the user knows the model saw a degraded view.
+function renderFileChip(block) {
+    const filename = block.filename || "file";
+    const safeName = escapeHtml(filename);
+    const mediaType = block.source && block.source.media_type ? block.source.media_type : "application/octet-stream";
+    const data = block.source && block.source.data;
+    const parseError = typeof block.parse_error === "string" ? block.parse_error : null;
+    const note = parseError
+        ? `<span class="msg-file-note msg-file-note--err" title="${escapeHtml(parseError)}">解析失败</span>`
+        : (block.truncated ? `<span class="msg-file-note">已截断</span>` : "");
+    if (typeof data === "string" && BASE64_RE.test(data)) {
+        return `<span class="msg-file-wrap"><a class="msg-file" href="data:${escapeHtml(mediaType)};base64,${data}" download="${safeName}" title="下载附件：${safeName}"><span class="msg-file-icon">📎</span><span class="msg-file-name">${safeName}</span></a>${note}</span>`;
+    }
+    return `<span class="msg-file-wrap"><span class="msg-file msg-file--error"><span class="msg-file-icon">📎</span><span class="msg-file-name">${safeName}</span>（数据无效）</span>${note}</span>`;
 }
 
 function appendUserMessage(content) {

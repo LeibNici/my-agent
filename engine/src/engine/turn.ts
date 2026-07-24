@@ -37,7 +37,8 @@ import { createEventAdapter } from "../event-adapter.js";
 import { legacyListToDomain } from "../codec-legacy.js";
 import { prepareModelMessages } from "../history-policy.js";
 import { domainToPi, stripLeakedThinkingTags } from "../codec-pi.js";
-import type { DomainEvent, ImageBlock } from "../domain.js";
+import { fileBlockToText } from "../domain.js";
+import type { DomainEvent, ImageBlock, FileBlock } from "../domain.js";
 
 const PROVIDER_ID = "anthropic";
 
@@ -360,11 +361,21 @@ export type RunTurnDeps = { db?: DbClient; settings: Settings; tools: ToolDef[];
 // input, injected via Agent.prompt()'s own (text, images) overload —
 // both need to work for a conversation with an earlier image-bearing
 // turn to keep round-tripping correctly on later turns.
+// files is this turn's fresh non-image attachments (already parsed + validated
+// by sse.ts). Unlike images — which the vision model reads raw via prompt()'s
+// (text, images) overload — a file's bytes are useless to the model, so only
+// its EXTRACTED TEXT is sent, injected into the prompt string below (ahead of
+// the user's own text, matching the images-before-text ordering). The raw
+// bytes ride along in the persisted FileBlock for replay/download only, never
+// reaching the model. Like images, past-turn file blocks are folded to a
+// placeholder in `history` before it ever gets here (history-policy.ts /
+// storage.ts), so only THIS turn's file text is ever real.
 export type RunTurnRequest = {
   sessionId: string;
   history: unknown[];
   userText: string;
   images?: ImageBlock[];
+  files?: FileBlock[];
   linkedIssues?: LinkedIssueSummary[];
 };
 
@@ -451,9 +462,17 @@ export async function* runTurn(deps: RunTurnDeps, req: RunTurnRequest): AsyncGen
     for (const de of adapter.onPiEvent(e)) channel.put(de);
   });
 
+  // File attachments contribute their extracted TEXT to the model, prepended
+  // to the user's own text (files-before-text, mirroring images-before-text).
+  // fileBlockToText renders a parse-failure file as a short "couldn't read
+  // this" note rather than dropping it, so the model can still reason about
+  // "the file itself is broken" — often the very thing being reported.
+  const filePreamble = (req.files ?? []).map(fileBlockToText).join("\n\n");
+  const promptText = filePreamble ? `${filePreamble}\n\n${req.userText}` : req.userText;
+
   const run = agent
     .prompt(
-      req.userText,
+      promptText,
       req.images?.map((img) => ({ type: "image" as const, data: img.base64Data, mimeType: img.mediaType }))
     )
     .then(async () => {

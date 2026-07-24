@@ -87,9 +87,12 @@
             <div id="input-area">
                 <div id="chat-notice"></div>
                 <div id="image-preview-strip"></div>
+                <div id="file-preview-strip"></div>
                 <div class="input-wrapper">
                     <button id="attach-btn" onclick="document.getElementById('image-file-input').click()" title="添加截图" aria-label="添加截图">+</button>
                     <input type="file" id="image-file-input" accept="image/jpeg,image/png,image/gif,image/webp" multiple style="display:none" onchange="handleImageFilesSelected(this.files)">
+                    <button id="attach-file-btn" onclick="document.getElementById('file-input').click()" title="添加附件（日志 / 代码 / CSV / Excel / Word）" aria-label="添加附件">📎</button>
+                    <input type="file" id="file-input" accept=".txt,.log,.md,.markdown,.csv,.tsv,.json,.jsonl,.yaml,.yml,.xml,.html,.htm,.css,.scss,.js,.jsx,.ts,.tsx,.mjs,.cjs,.vue,.java,.kt,.go,.rs,.c,.h,.cpp,.cs,.php,.rb,.swift,.scala,.sql,.sh,.bash,.ini,.conf,.cfg,.toml,.properties,.env,.gradle,.diff,.patch,.xlsx,.docx" multiple style="display:none" onchange="handleFilesSelected(this.files)">
                     <textarea
                         id="message-input"
                         placeholder="描述问题，或直接粘贴系统截图…"
@@ -100,7 +103,7 @@
                     ></textarea>
                     <button id="send-btn" onclick="sendMessage()">发送</button>
                 </div>
-                <div class="input-hint"><kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · 支持粘贴/拖入截图</div>
+                <div class="input-hint"><kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · 支持粘贴/拖入截图 · <kbd>📎</kbd> 附件（日志/代码/CSV/Excel/Word）</div>
 
             <!-- Read-only code viewer, opened by clicking a file:line reference -->
             <div id="code-viewer" hidden>

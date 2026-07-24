@@ -3,6 +3,7 @@ import {
   DomainBlock,
   TextBlock,
   ImageBlock,
+  FileBlock,
   ToolUseBlock,
   ToolResultBlock,
   ThinkingBlock,
@@ -84,6 +85,41 @@ function convertLegacyBlockToDomain(block: unknown): DomainBlock {
         base64Data: source.data,
       } as ImageBlock;
     }
+    case "file": {
+      // Raw bytes live under the same `source` sub-object shape as an image
+      // block, with the file-specific extracted_text/truncated/parse_error
+      // alongside. Fail-loud on a malformed core (filename/source/data) the
+      // same way the image case does — but truncated/parse_error are optional
+      // (a file with neither is the common, successfully-parsed case).
+      if (typeof b.filename !== "string") {
+        throw new CodecError("File block missing 'filename'");
+      }
+      const source = b.source as Record<string, unknown>;
+      if (!isPlainObject(source)) {
+        throw new CodecError("File block missing 'source'");
+      }
+      if (typeof source.data !== "string" || typeof source.media_type !== "string") {
+        throw new CodecError("File source missing 'data' or 'media_type'");
+      }
+      if (typeof b.extracted_text !== "string") {
+        throw new CodecError("File block missing or invalid 'extracted_text'");
+      }
+      const block: FileBlock = {
+        type: "file",
+        filename: b.filename,
+        mediaType: source.media_type,
+        base64Data: source.data,
+        extractedText: b.extracted_text,
+        truncated: b.truncated === true,
+      };
+      if (b.parse_error !== undefined) {
+        if (typeof b.parse_error !== "string") {
+          throw new CodecError("File block 'parse_error' must be a string if present");
+        }
+        block.parseError = b.parse_error;
+      }
+      return block;
+    }
     case "tool_use": {
       if (typeof b.id !== "string" || typeof b.name !== "string") {
         throw new CodecError("Tool use block missing 'id' or 'name'");
@@ -156,6 +192,27 @@ function convertDomainBlockToLegacy(block: DomainBlock): Record<string, unknown>
           data: block.base64Data,
         },
       };
+    case "file": {
+      // Same `source` sub-object as an image for the raw bytes, plus the
+      // file-only fields. parse_error is omitted when absent (is_error's
+      // convention — pythonJsonDumps throws on an explicit `undefined`), so
+      // a successfully-parsed file serializes without the key at all.
+      const result: Record<string, unknown> = {
+        type: "file",
+        filename: block.filename,
+        source: {
+          type: "base64",
+          media_type: block.mediaType,
+          data: block.base64Data,
+        },
+        extracted_text: block.extractedText,
+        truncated: block.truncated,
+      };
+      if (block.parseError !== undefined) {
+        result.parse_error = block.parseError;
+      }
+      return result;
+    }
     case "tool_use":
       return {
         type: "tool_use",

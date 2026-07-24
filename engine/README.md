@@ -35,10 +35,11 @@ legacy JSON (DB / 旧前端原始 dict，snake_case，tool_use_id/is_error)
 ## 本包导出什么
 
 - `legacyToDomain` / `legacyListToDomain` / `domainToLegacy` — `src/codec-legacy.ts`
-- `prepareModelMessages` / `HISTORY_IMAGE_PLACEHOLDER` — `src/history-policy.ts`
+- `prepareModelMessages` / `HISTORY_IMAGE_PLACEHOLDER` / `HISTORY_FILE_PLACEHOLDER` — `src/history-policy.ts`
 - `domainToPi` / `piAssistantToDomain` — `src/codec-pi.ts`
 - `createEventAdapter` — `src/event-adapter.ts`
-- `DomainMessage` / `DomainBlock` / `DomainEvent` / `CodecError` / `isToolRelay` — `src/domain.ts`
+- `DomainMessage` / `DomainBlock` / `FileBlock` / `DomainEvent` / `CodecError` / `isToolRelay` / `fileBlockToText` — `src/domain.ts`
+- `parseAttachmentBytes` / `classifyFilename` / 限额常量 — `src/attachments.ts`（非 pi 的叶子模块，见下方「附件上传」）
 
 ## Phase 2 消费点（不在本 Phase 交付范围内）
 
@@ -93,6 +94,7 @@ throw。
 | 场景 | 位置 | 抛出条件 | 归属 |
 |---|---|---|---|
 | domain → pi 的 image 块（仅 assistant 消息） | `codec-pi.ts` `domainToPi` | assistant 消息里出现 `type:"image"` 的 domain 块 | pi-ai 自己的 `AssistantMessage.content` 类型结构上就不允许图片（同 Anthropic 真实 API 语义），是真实的库层约束，不是待补的功能缺口——user 消息里的图片（当前 turn 夹带的截图）已经有真实的编码路径，不再 throw；`piAssistantToDomain`（pi → domain）对 `type:"thinking"` 也已经有真实的 domain 层支持（`ThinkingBlock`），不再是这张表里的一项 |
+| domain → pi 的 file 块（仅 assistant 消息） | `codec-pi.ts` `domainToPi` | assistant 消息里出现 `type:"file"` 的 domain 块 | 同 image：文件只属于 user 输入，assistant 永不产出文件块。**user** 消息里的 file 块不 throw——降级为普通文本块（携带 `fileBlockToText` 渲染的提取文本）；实际管线里历史轮次的 file 块在到达 codec-pi 之前就已被折叠成占位符（见下方「附件上传」），这条降级是防御性的兜底 |
 
 这属于 fail-loud 而非静默丢弃——遇到这个块类型时会抛错而不是悄悄吃掉数据，
 这样任何漏配的调用方会在测试/联调阶段就发现，而不是在生产里丢数据。
@@ -304,6 +306,51 @@ ctags/分块照常跑，只是永远不会触发 embedding 请求。
 两个新增小节（`同类问题排查`/`候选影响范围/关联调用`）只在扫描触发时才
 出现在 body 里，原有五段被称为"core sections"——不触发时完全省略，而
 不是留空占位，避免模型为了"填满小节"倒逼自己去多搜索。
+
+## 附件上传（非图片文件，2026-07-24）
+
+产品经理在描述 bug/需求时上传日志、CSV、代码文件，以及**数据导入失败样例**
+（`.xlsx`）、bug 汇总（`.docx`）作为上下文。图片走既有的视觉路径（模型直接看
+原图），**文件不同**：字节对模型无意义，所以在服务端解析成文本，只有文本进模型
+/进 issue，原始字节仅用于回放与下载。
+
+**数据模型**：`FileBlock`（`domain.ts`）是 `DomainBlock` 的新成员，随消息内联存储
+（同 `ImageBlock` 的 `source` 内联方式，不新建表）——`base64Data`（原始字节，下载用）
++ `extractedText`（解析出的文本，模型/issue 用）+ `truncated` + 可选 `parseError`。
+`fileBlockToText(block)` 是"文件 → 模型/issue 文本"的唯一渲染点，被 codec-pi 降级、
+turn.ts 当前轮注入、issue 正文嵌入三处共用。
+
+**解析**（`src/attachments.ts`，纯叶子模块，不含 pi 类型）：
+- 类型：纯文本/代码（按扩展名白名单 `classifyFilename`，UTF-8 直读）+ `.xlsx`
+  （exceljs）+ `.docx`（mammoth）。白名单外的类型在 `sse.ts` 的 `validateFiles`
+  提前整条拒绝（不是解析后再报错）。
+- **编码探测**（国内产品：Excel"另存为 CSV"常是 GBK 而非 UTF-8）：BOM → UTF-8 严格
+  → chardet → **GB18030 兜底**。chardet 对短 CJK 样本会把 GBK 误判成 Shift_JIS，
+  所以除非明确是 Big5/UTF-16，一律回落 GB18030（GBK/GB2312 的超集）。
+- **zip 炸弹防护**（`.xlsx`/`.docx` 本质是 zip）：解析前先扫描 ZIP 中央目录，累加
+  声明的解压后大小，超过 `MAX_DECOMPRESSED_BYTES`（50 MiB）直接拒解析——经典
+  炸弹（诚实中央目录）在解压任何一个字节之前就被挡下。内部工具威胁模型，不做
+  宏沙箱（只读文本，永不执行宏）。
+- **解析失败不阻塞发送**：损坏/加密/二进制误传 → 返回 `parseError`（绝不 throw
+  出去），文件照样落库+可下载，模型/人只是看到"这个文件读不了"——PM 常常问的
+  正是"为什么这个文件打不开"。
+
+**限额**（`attachments.ts` 单一真相源，`/api/config` 暴露给前端）：每条消息 ≤ 3 个
+文件（`MAX_FILES_PER_MESSAGE`，比图片的 5 低——单文件文本预算冲击更大）、单文件
+原始 ≤ 2 MiB（`MAX_FILE_BYTES`，解析前资源闸）、提取文本 ≤ 20000 字符
+（`MAX_EXTRACTED_TEXT_CHARS`，独立于原始大小——压缩的 office 文件展开后文本量可
+远超自身，只卡原始大小挡不住预算冲击）。
+
+**历史折叠**：与图片一致——只有当前轮的文件文本进模型（turn.ts 把
+`fileBlockToText` 拼到 prompt 前面），历史轮次的 file 块被
+`prepareModelMessages` / `storage.ts` 折叠成 `HISTORY_FILE_PLACEHOLDER`（保留文件名
+作提示）。原始字节仍留在 DB 供 `GET /api/sessions/:id` 回放与前端下载。
+
+**Issue 正文嵌入**（`buildSessionFileEvidence`，`issue-tracker-client.ts`）：与截图
+（上传原图到 GitLab）不同，文件把**提取文本内联进 issue 正文**——GitHub 没有匿名
+上传附件的 API，内联文本让 GitHub/GitLab 体验一致，且开发者直接看到失败数据。
+只取**最近一条带文件的用户消息**（相关性衰减快，不扒整个会话），代码围栏长度按内容
+里最长的反引号串自适应（防内容里的 ``` 破坏 issue 排版）。
 
 ## 测试
 

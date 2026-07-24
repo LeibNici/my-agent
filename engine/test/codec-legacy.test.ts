@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { isToolRelay, CodecError } from "../src/domain.js";
 import { legacyToDomain, domainToLegacy, legacyListToDomain } from "../src/codec-legacy.js";
-import { legacyToolTurn, legacyImageMsg, legacyUnicodeBlocks } from "./fixtures.js";
+import { legacyToolTurn, legacyImageMsg, legacyFileMsg, legacyUnicodeBlocks } from "./fixtures.js";
 
 describe("domain guards", () => {
   it("isToolRelay: true 仅当块数组中含 tool_result", () => {
@@ -25,6 +25,29 @@ describe("codec-legacy", () => {
     const d = legacyToDomain(legacyImageMsg);
     expect((d.content as any)[0]).toEqual({ type: "image", mediaType: "image/png", base64Data: "AAA" });
     expect(domainToLegacy(d)).toEqual(legacyImageMsg);
+  });
+  it("file 块双向：source 换名 + extracted_text/truncated 保真，round-trip 恒等", () => {
+    const d = legacyToDomain(legacyFileMsg);
+    expect((d.content as any)[0]).toEqual({
+      type: "file", filename: "orders.csv", mediaType: "text/csv", base64Data: "QUFB",
+      extractedText: "订单号,数量\nA100,3", truncated: false,
+    });
+    expect(domainToLegacy(d)).toEqual(legacyFileMsg); // parse_error 未出现，回程也不多这个键
+  });
+  it("file 块 parse_error 存在时双向保真", () => {
+    const raw = { role: "user", content: [
+      { type: "file", filename: "broken.xlsx",
+        source: { type: "base64", media_type: "application/octet-stream", data: "AAA" },
+        extracted_text: "", truncated: false, parse_error: "已损坏" } ] };
+    const d = legacyToDomain(raw);
+    expect((d.content as any)[0].parseError).toBe("已损坏");
+    expect(domainToLegacy(d)).toEqual(raw);
+  });
+  it("file 块缺 filename / source / extracted_text 时 fail-loud", () => {
+    const bad = (block: unknown) => () => legacyToDomain({ role: "user", content: [block] });
+    expect(bad({ type: "file", source: { type: "base64", media_type: "t", data: "A" }, extracted_text: "" })).toThrow(CodecError);
+    expect(bad({ type: "file", filename: "a.txt", extracted_text: "" })).toThrow(CodecError);
+    expect(bad({ type: "file", filename: "a.txt", source: { type: "base64", media_type: "t", data: "A" } })).toThrow(CodecError);
   });
   it("thinking 块字段换名双向（thinkingSignature ↔ thinking_signature）", () => {
     const raw = {

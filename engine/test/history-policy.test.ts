@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { prepareModelMessages, HISTORY_IMAGE_PLACEHOLDER } from "../src/history-policy.js";
+import { prepareModelMessages, HISTORY_IMAGE_PLACEHOLDER, HISTORY_FILE_PLACEHOLDER } from "../src/history-policy.js";
 import { legacyListToDomain } from "../src/codec-legacy.js";
 
 const msg = (role: "user" | "assistant", content: any) => ({ role, content });
@@ -21,6 +21,16 @@ describe("prepareModelMessages（test_history_windowing goldens 移植）", () =
     expect((out[0].content as any)[0]).toEqual({ type: "text", text: HISTORY_IMAGE_PLACEHOLDER });
     expect((out[0].content as any)[1]).toEqual({ type: "text", text: "看这个截图" });
     expect(out[1]).toEqual({ role: "assistant", content: "看到了" });
+  });
+  it("未超限也替换 file 为占位（保留文件名）", () => {
+    const out = prepareModelMessages(D([
+      msg("user", [{ type: "file", filename: "orders.csv",
+                     source: { type: "base64", media_type: "text/csv", data: "QUFB" },
+                     extracted_text: "订单号,数量\nA100,3", truncated: false },
+                   { type: "text", text: "看这个附件" }]),
+      msg("assistant", "看到了")]), 60);
+    expect((out[0].content as any)[0]).toEqual({ type: "text", text: `${HISTORY_FILE_PLACEHOLDER}（orders.csv）` });
+    expect((out[0].content as any)[1]).toEqual({ type: "text", text: "看这个附件" });
   });
   it("过去回合压缩、当前回合整体保留", () => {
     const out = prepareModelMessages(D([...toolHeavyTurn(1), ...toolHeavyTurn(2),
