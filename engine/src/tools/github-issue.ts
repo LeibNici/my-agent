@@ -88,10 +88,10 @@ const DRAFT_ISSUE_DESCRIPTION =
   "affected), and 修复建议 (a concrete suggested fix — you already did the root-cause analysis, so state " +
   "where and how to change it in words or a few illustrative lines, never a full rewritten file), plus " +
   "同类问题排查 and 候选影响范围/关联调用 when the conditional scan above ran. " +
-  "labels must come from the project's EXISTING label vocabulary — pick one type:: label (type::bug / " +
-  "type::feature / type::requirement) plus one module:: label (e.g. module::MES, module::APS, module::质量), " +
-  "optionally priority::P0-P4. Never invent new labels: anything outside the project vocabulary is " +
-  "dropped automatically (the result will carry a label_note telling you what was rejected).";
+  "labels must come from the project's EXISTING label vocabulary — prefer simple, common names " +
+  "(e.g. bug, feature, enhancement, docs, question) that match what the project actually has configured. " +
+  "Never invent new labels: anything outside the project vocabulary is dropped automatically (the result " +
+  "will carry a label_note telling you what was rejected).";
 
 /** v1's draft_issue. Returns a JSON-encoded `issue_draft` (or `{error}`)
  * payload — execute() must return a string, but the shape underneath is
@@ -135,7 +135,7 @@ async function draftIssueExecute(
         const { accepted, rejected } = normalizeLabels(labelList, available);
         labelList = accepted;
         if (rejected.length > 0) {
-          labelNote = `以下标签不在项目标签词表中，已忽略: ${rejected.join(", ")}。如需分类请从项目现有标签中选（type::*/module::*/priority::* 等）。`;
+          labelNote = `以下标签不在项目标签词表中，已忽略: ${rejected.join(", ")}。如需分类请从项目现有标签中选。`;
         }
       }
     } catch {
