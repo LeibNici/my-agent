@@ -126,8 +126,12 @@ const DRAFT_ISSUE_DESCRIPTION =
   "scan above ran. " +
   "labels must come from the project's EXISTING label vocabulary — prefer simple, common names " +
   "(e.g. bug, feature, enhancement, docs, question) that match what the project actually has configured. " +
-  "Never invent new labels: anything outside the project vocabulary is dropped automatically (the result " +
-  "will carry a label_note telling you what was rejected).";
+  "When severity is clearly established — the user said so outright, or the confirmed root cause is " +
+  "blocking/data-affecting with no workaround rather than cosmetic — also propose a priority-style label " +
+  "if the project plausibly has one (common forms: P0-P4, priority::high, urgent); skip this rather than " +
+  "guessing a tier when severity genuinely isn't evident from the conversation. Never invent new labels: " +
+  "anything outside the project vocabulary is dropped automatically (the result will carry a label_note " +
+  "telling you what was rejected).";
 
 /** v1's draft_issue. Returns a JSON-encoded `issue_draft` (or `{error}`)
  * payload — execute() must return a string, but the shape underneath is
