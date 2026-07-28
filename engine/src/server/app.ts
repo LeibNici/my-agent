@@ -538,13 +538,33 @@ export function buildApp(deps: BuildAppDeps): Hono<Env> {
   // so the URL-space prefix must be stripped before joining against
   // WEB_ROOT (the directory itself has no `static/` subfolder).
 
+  // 2026-07-28 (生产事故): 部署完成后用户浏览器仍在跑部署前的 app.js —— 新
+  // 后端 + 旧前端，症状是卡片按钮显示内部标识符(set_priority)且请求缺字段，
+  // 看起来完全像后端 bug，实际排查掉了大半天。原因是这里既没有版本化的资源
+  // URL（index.html 里是裸的 /static/app.js），@hono/node-server 的
+  // serveStatic 又只发一个 Last-Modified：没有 Cache-Control、没有 ETag、
+  // 也不处理 If-Modified-Since。浏览器于是走启发式缓存（按 Last-Modified
+  // 的新旧估算新鲜期），一个改动前放了几天的文件可能几小时都不回源问一次,
+  // 连普通刷新都绕不过去。
+  //
+  // no-cache 不是"不缓存"，是"用之前必须回源校验"。因为 serveStatic 不做
+  // 304，每次校验都会整份重传 —— app.js ~90KB，内网工具这点带宽换"部署完
+  // 立刻生效、不用教用户硬刷新"完全值。要省这份带宽得先给资源 URL 加版本
+  // 号（改三个 HTML 入口），那是另一件事，不在这次修复范围内。
+  const noStaticCache = async (c: Context<Env>, next: () => Promise<void>): Promise<void> => {
+    await next();
+    c.header("Cache-Control", "no-cache");
+  };
+
+  app.use("/static/*", noStaticCache);
   app.use(
     "/static/*",
     serveStatic({ root: WEB_ROOT, rewriteRequestPath: (p) => p.replace(/^\/static/, "") })
   );
-  app.get("/", serveStatic({ root: WEB_ROOT, path: "index.html" }));
-  app.get("/login", serveStatic({ root: WEB_ROOT, path: "login.html" }));
-  app.get("/admin", serveStatic({ root: WEB_ROOT, path: "admin.html" }));
+  // HTML 入口同样要防陈旧：它们引用的资源路径本身可能在下个版本里变化。
+  app.get("/", noStaticCache, serveStatic({ root: WEB_ROOT, path: "index.html" }));
+  app.get("/login", noStaticCache, serveStatic({ root: WEB_ROOT, path: "login.html" }));
+  app.get("/admin", noStaticCache, serveStatic({ root: WEB_ROOT, path: "admin.html" }));
 
   return app;
 }

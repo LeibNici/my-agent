@@ -1779,12 +1779,21 @@ function appendIssueActionCard(container, draft, action = null, toolUseId = null
     if (toolUseId) card.dataset.toolUseId = toolUseId;
 
     const { repoName } = resolveIssueCardRepo(card, draft, action);
-    const actionLabel = ISSUE_ACTION_LABELS[draft.action] || draft.action;
+    // 兜底文案刻意不是 draft.action 本身。2026-07-28 线上真实发生过：新后端
+    // 配旧前端，label 表里没有 set_priority 这个键，卡片就把内部标识符原样
+    // 印给了业务人员——按钮写着"确认set_priority"，没人知道那是在改优先级。
+    // 用户看到的任何一个字都不该是代码里的枚举值；认不出来的 action 宁可说
+    // "操作 issue"（笼统但是人话），也不要泄漏标识符。
+    const actionLabel = ISSUE_ACTION_LABELS[draft.action] || "操作 issue";
 
     // 优先级卡片多一行"要改成什么"——确认按钮下面就是真写 tracker 了，
-    // 目标值必须在卡片上直接看得见，不能只藏在评论正文里。
+    // 目标值必须在卡片上直接看得见，不能只藏在评论正文里。加"目标优先级"
+    // 前缀而不是光秃秃一个 P1：业务人员未必知道 P1 是个优先级。
     const priorityRow = draft.priority
-        ? `<div class="issue-labels"><span class="issue-label issue-label-priority">${escapeHtml(draft.priority)}</span></div>`
+        ? `<div class="issue-labels">
+               <span class="issue-label-caption">目标优先级</span>
+               <span class="issue-label issue-label-priority">${escapeHtml(draft.priority)}</span>
+           </div>`
         : "";
 
     card.innerHTML = `

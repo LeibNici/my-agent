@@ -115,7 +115,17 @@ describe("e2e smoke — real server + real runTurn engine against an offline moc
     const indexResp = await fetch(`${base}/`);
     expect(indexResp.status).toBe(200);
     expect(indexResp.headers.get("content-type")).toContain("html");
+    // 2026-07-28 线上事故的回归守卫：部署后浏览器继续跑旧 app.js（新后端 +
+    // 旧前端），资源 URL 没有版本号、serveStatic 又只发 Last-Modified，浏览
+    // 器启发式缓存下连刷新都拿不到新文件。HTML 入口和 /static/* 都必须带
+    // no-cache，否则每次前端改动都要靠用户自己硬刷新才生效。
+    expect(indexResp.headers.get("cache-control")).toBe("no-cache");
     await indexResp.text();
+
+    const appJsResp = await fetch(`${base}/static/app.js`);
+    expect(appJsResp.status).toBe(200);
+    expect(appJsResp.headers.get("cache-control")).toBe("no-cache");
+    await appJsResp.text();
 
     // ---- POST /api/auth/login — admin/admin123 bootstrap (ensureAdminUser
     // ran during startServer() against the fresh tmp db) ----

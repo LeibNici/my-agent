@@ -1552,6 +1552,15 @@ body {
     background: var(--wire);
 }
 
+/* "目标优先级" 这类字段名 — 说明徽章是什么，不跟徽章本身抢视觉重量 */
+.issue-label-caption {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    color: var(--mute);
+    letter-spacing: 0.04em;
+}
+
 /* 优先级调整卡片上的目标值 — 用 amber(=待确认) 而不是默认的 wire(=只读/被动)：
    这一个标签是整张卡片唯一要写进 tracker 的东西，点确认前必须先看清它。
    两套主题都定义了 --amber/--amber-dim，无需再写 light-theme 分支。 */
