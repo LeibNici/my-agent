@@ -297,6 +297,36 @@ export function normalizeLabels(
   return { accepted, rejected };
 }
 
+// 2026-07-28: 业务人员需要能对已提交的 issue 发起优先级调整，开发再按优先级
+// 排期 — manage_issue 此前只有 comment/close/reopen，标签只在建单那一刻写得
+// 进去，提交后就再也改不了（见 applyRepoIssueAction 的注释）。这两个 helper
+// 把"哪些标签算优先级"这件事集中在一处：GitLab CE 17.9.6 没有 Weight/Health
+// status 之类的原生字段（xinhao 实例实测 enterprise:false），优先级只能靠
+// label 模拟，所以"改优先级"在实现上就是"换掉那一个优先级标签"。
+//
+// 判定刻意放宽到常见几种写法而不是硬编码某仓库的词表 —— 这份代码所有仓库共用。
+// 注意 isPriorityLabel 同时决定了互斥范围：设置新优先级时，issue 上其它命中
+// 这个判定的标签都会被摘掉（一个 issue 只能有一个优先级）。所以判定必须保守，
+// 宁可漏判（漏判只是旧标签没摘干净，人能看出来）也不要误判把流程标签摘了。
+const PRIORITY_KEYWORDS = ["urgent", "critical", "blocker", "紧急", "严重", "阻塞"];
+
+export function isPriorityLabel(name: string): boolean {
+  const n = name.trim().toLowerCase();
+  if (!n) return false;
+  // P0-P9 / p0 / P1 —— xinhao 项目 2026-07-27 建的就是这一套（项目级 P0-P4）
+  if (/^p\d$/.test(n)) return true;
+  // scoped 写法：priority::high / priority/high / 优先级::高
+  if (n.includes("priority") || n.includes("优先级")) return true;
+  return PRIORITY_KEYWORDS.includes(n);
+}
+
+/** 该仓库词表里所有的优先级标签，保持词表原始顺序。用来在 manage_issue 拒绝
+ * 一个不存在的优先级时，把这个仓库真正可选的值回给模型/用户，而不是只说
+ * "不认识这个标签"让人自己猜。 */
+export function listPriorityLabels(available: string[]): string[] {
+  return available.filter(isPriorityLabel);
+}
+
 // ==================== Submit a new issue ====================
 
 export type TrackerResult =
@@ -392,6 +422,7 @@ async function applyGithubIssueAction(
   issueNumber: number,
   action: string,
   comment: string,
+  priorityLabel: string | null = null,
 ): Promise<TrackerResult> {
   const token = credToken;
   if (!token) {
@@ -435,6 +466,65 @@ async function applyGithubIssueAction(
     return { success: true, number: data.number, url: data.html_url, title: data.title };
   }
 
+  if (action === "set_priority") {
+    const target = (priorityLabel ?? "").trim();
+    if (!target) return { error: "set_priority requires a priority label" };
+
+    // 必须先读一次 issue 现有标签才知道要摘掉哪个旧优先级。刻意不用
+    // PATCH {labels:[...]} 整体覆盖 —— 那会把并发加上去的其它标签一起冲掉；
+    // POST /labels(增) + DELETE /labels/{name}(删) 是增量的，只动优先级。
+    const getResp = await fetchWithTimeout(
+      `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}`,
+      { headers },
+      GITHUB_GET_TIMEOUT_MS,
+    );
+    if (getResp.status !== 200) {
+      const text = await getResp.text();
+      return { error: `GitHub issue read API error (${getResp.status}): ${text}` };
+    }
+    const issue = (await getResp.json()) as {
+      number: number;
+      html_url: string;
+      title: string;
+      labels?: Array<{ name: string } | string>;
+    };
+    const current = (issue.labels ?? []).map((l) => (typeof l === "string" ? l : l.name));
+    const alreadySet = current.some((n) => n.toLowerCase() === target.toLowerCase());
+    const stale = current.filter((n) => isPriorityLabel(n) && n.toLowerCase() !== target.toLowerCase());
+
+    // 先加后删：中途失败时 issue 上会同时挂着新旧两个优先级（人一眼看得出来
+    // 需要收拾），比反过来先删后失败、issue 变成完全没有优先级要好。
+    if (!alreadySet) {
+      const addResp = await fetchWithTimeout(
+        `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}/labels`,
+        {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({ labels: [target] }),
+        },
+        GITHUB_MUTATE_TIMEOUT_MS,
+      );
+      if (addResp.status !== 200) {
+        const text = await addResp.text();
+        return { error: `GitHub add-label API error (${addResp.status}): ${text}` };
+      }
+    }
+    for (const old of stale) {
+      const delResp = await fetchWithTimeout(
+        `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(old)}`,
+        { method: "DELETE", headers },
+        GITHUB_MUTATE_TIMEOUT_MS,
+      );
+      // 404 = 这个标签在我们读完之后已经被别人摘掉了，结果正是我们想要的，
+      // 不算失败。
+      if (delResp.status !== 200 && delResp.status !== 404) {
+        const text = await delResp.text();
+        return { error: `GitHub remove-label API error (${delResp.status}): ${text}` };
+      }
+    }
+    return { success: true, number: issue.number, url: issue.html_url, title: issue.title };
+  }
+
   // comment-only: synthesize the URL, no extra call needed.
   return {
     success: true,
@@ -450,6 +540,7 @@ async function applyGitlabIssueAction(
   issueNumber: number,
   action: string,
   comment: string,
+  priorityLabel: string | null = null,
 ): Promise<TrackerResult> {
   const { error, base: projectBase } = await gitlabProjectApiBaseFromRepoUrl(repoUrl, credToken);
   if (error || !projectBase) return { error: error ?? "unknown GitLab API base error" };
@@ -486,6 +577,37 @@ async function applyGitlabIssueAction(
     return { success: true, number: data.iid, url: data.web_url, title: data.title };
   }
 
+  if (action === "set_priority") {
+    const target = (priorityLabel ?? "").trim();
+    if (!target) return { error: "set_priority requires a priority label" };
+
+    // 同 GitHub：先读现有标签才知道摘哪个旧优先级。GitLab 的
+    // add_labels/remove_labels 是增量参数（不同于 labels= 的整体覆盖），
+    // 而且加和删能在同一个 PUT 里原子完成，不像 GitHub 要拆成两次调用。
+    const getResp = await fetchWithTimeout(baseUrl, { headers }, GITLAB_GET_TIMEOUT_MS);
+    if (getResp.status !== 200) {
+      const text = await getResp.text();
+      return { error: `GitLab issue read API error (${getResp.status}): ${text}` };
+    }
+    const issue = (await getResp.json()) as { iid: number; web_url: string; title: string; labels?: string[] };
+    const current = issue.labels ?? [];
+    const stale = current.filter((n) => isPriorityLabel(n) && n.toLowerCase() !== target.toLowerCase());
+
+    const payload: Record<string, string> = { add_labels: target };
+    if (stale.length > 0) payload.remove_labels = stale.join(",");
+    const resp = await fetchWithTimeout(
+      baseUrl,
+      { method: "PUT", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+      GITLAB_MUTATE_TIMEOUT_MS,
+    );
+    if (resp.status !== 200) {
+      const text = await resp.text();
+      return { error: `GitLab label update API error (${resp.status}): ${text}` };
+    }
+    const data = (await resp.json()) as { iid: number; web_url: string; title: string };
+    return { success: true, number: data.iid, url: data.web_url, title: data.title };
+  }
+
   // comment-only: GitLab's note response carries no issue-level url/title,
   // so re-fetch fresh state (unlike GitHub's synthesized-URL shortcut
   // above). A failed re-fetch still reports success — the note was already
@@ -498,16 +620,22 @@ async function applyGitlabIssueAction(
   return { success: true, number: issueNumber, url: null, title: null };
 }
 
-/** Dispatches a comment/close/reopen against an already-filed issue to the
- * right tracker API based on the repo's host. */
+/** Dispatches a comment/close/reopen/set_priority against an already-filed
+ * issue to the right tracker API based on the repo's host. `priorityLabel`
+ * is only read for set_priority, and must already have been validated
+ * against the repo's own label vocabulary by the caller (issue-routes.ts) —
+ * this layer never invents a label on the tracker. */
 export async function applyRepoIssueAction(
   repo: FullRepoRow,
   issueNumber: number,
   action: string,
   comment: string,
+  priorityLabel: string | null = null,
 ): Promise<TrackerResult> {
-  if (isGithubHosted(repo)) return applyGithubIssueAction(repo.url, repo.cred_token, issueNumber, action, comment);
-  return applyGitlabIssueAction(repo.url, repo.cred_token, issueNumber, action, comment);
+  if (isGithubHosted(repo)) {
+    return applyGithubIssueAction(repo.url, repo.cred_token, issueNumber, action, comment, priorityLabel);
+  }
+  return applyGitlabIssueAction(repo.url, repo.cred_token, issueNumber, action, comment, priorityLabel);
 }
 
 // ==================== Duplicate lookup (before submitting) ====================

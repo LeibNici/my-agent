@@ -1552,6 +1552,21 @@ body {
     background: var(--wire);
 }
 
+/* 优先级调整卡片上的目标值 — 用 amber(=待确认) 而不是默认的 wire(=只读/被动)：
+   这一个标签是整张卡片唯一要写进 tracker 的东西，点确认前必须先看清它。
+   两套主题都定义了 --amber/--amber-dim，无需再写 light-theme 分支。 */
+.issue-label-priority {
+    background: var(--amber-dim);
+    color: var(--amber);
+    border-color: var(--amber);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+
+.issue-label-priority::before {
+    background: var(--amber);
+}
+
 .issue-actions {
     display: flex;
     align-items: center;

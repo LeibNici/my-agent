@@ -711,7 +711,7 @@ describe("POST /api/issues/action", () => {
       body: JSON.stringify({ action: "bogus", repo_id: "nope", issue_number: "nope", comment: "a valid comment" }),
     });
     expect(resp.status).toBe(400);
-    expect(await resp.json()).toEqual({ detail: "action must be one of: comment, close, reopen" });
+    expect(await resp.json()).toEqual({ detail: "action must be one of: comment, close, reopen, set_priority" });
   });
 
   it("empty/whitespace comment -> 400", async () => {
@@ -885,6 +885,194 @@ describe("POST /api/issues/action", () => {
     // No prior submission for repo+issue 9 in this test — getSubmissionByIssue
     // finds nothing, so the post-action recheck is skipped entirely (no
     // extra fetch calls beyond the note+state routes already stubbed above).
+  });
+
+  // 2026-07-28: set_priority — 业务人员对已提交 issue 发起提级/降级。
+  // 这是 /api/issues/action 第一个会写标签（而不只是评论/状态）的 action，
+  // 所以除了 happy path，重点覆盖它自己的 fail-closed 校验：词表读不到、
+  // 仓库没有优先级标签、给的值不是优先级标签，三种都不许放行到 tracker。
+  describe("action=set_priority", () => {
+    const PRIORITY_LABELS_ROUTE: MockRoute = {
+      when: isLabelsGet,
+      status: 200,
+      body: [{ name: "bug" }, { name: "reviewed" }, { name: "P0" }, { name: "P1" }, { name: "P2" }],
+    };
+
+    it("missing priority -> 400 before any tracker call", async () => {
+      const { token } = await seedUser("admin", "prio-missing");
+      const repoId = await seedRepo();
+      const mock = stubFetch([]);
+      const app = buildTestApp();
+      const resp = await authed(app, token, "/api/issues/action", {
+        method: "POST",
+        body: JSON.stringify({ action: "set_priority", repo_id: repoId, issue_number: 9, comment: "产线停机" }),
+      });
+      expect(resp.status).toBe(400);
+      expect(await resp.json()).toEqual({ detail: "priority is required for action set_priority" });
+      expect(mock).not.toHaveBeenCalled();
+    });
+
+    it("label vocabulary unreadable -> 502, nothing written (submit degrades here; this action must NOT)", async () => {
+      const { token } = await seedUser("admin", "prio-novocab");
+      const repoId = await seedRepo();
+      const mock = stubFetch([{ when: isLabelsGet, status: 401, body: {} }]);
+      const app = buildTestApp();
+      const resp = await authed(app, token, "/api/issues/action", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "set_priority",
+          repo_id: repoId,
+          issue_number: 9,
+          comment: "产线停机",
+          priority: "P1",
+        }),
+      });
+      expect(resp.status).toBe(502);
+      expect((await resp.json()).detail).toContain("暂时读不到该仓库的标签词表");
+      // No note posted, no label touched — the vocabulary GET is all that ran.
+      expect(mock.mock.calls).toHaveLength(1);
+    });
+
+    it("repo vocabulary has no priority labels at all -> 400 saying so", async () => {
+      const { token } = await seedUser("admin", "prio-nolabels");
+      const repoId = await seedRepo();
+      stubFetch([LABELS_ROUTE]); // bug/enhancement only
+      const app = buildTestApp();
+      const resp = await authed(app, token, "/api/issues/action", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "set_priority",
+          repo_id: repoId,
+          issue_number: 9,
+          comment: "产线停机",
+          priority: "P1",
+        }),
+      });
+      expect(resp.status).toBe(400);
+      expect((await resp.json()).detail).toBe("该仓库尚未配置优先级标签，无法调整优先级。");
+    });
+
+    it("an existing but NON-priority label is rejected -> 400 listing only the real priority options", async () => {
+      const { token } = await seedUser("admin", "prio-wronglabel");
+      const repoId = await seedRepo();
+      stubFetch([PRIORITY_LABELS_ROUTE]);
+      const app = buildTestApp();
+      const resp = await authed(app, token, "/api/issues/action", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "set_priority",
+          repo_id: repoId,
+          issue_number: 9,
+          comment: "产线停机",
+          priority: "reviewed",
+        }),
+      });
+      expect(resp.status).toBe(400);
+      expect(await resp.json()).toEqual({
+        detail: "'reviewed' 不是该仓库的有效优先级标签。可选：P0, P1, P2。",
+      });
+    });
+
+    it("happy path: posts the comment, adds the new priority and removes the stale one in ONE GitLab PUT", async () => {
+      const { id: userId, token } = await seedUser("admin", "prio-ok");
+      const repoId = await seedRepo();
+      const sessionId = await client.createSession("New Chat", userId);
+      const mock = stubFetch([
+        PRIORITY_LABELS_ROUTE,
+        issueNoteRoute(201),
+        // 现状：这个 issue 已经挂着 P2 和一个无关的 bug 标签
+        issueGetRoute(200, { iid: 9, web_url: "https://gitlab.example.com/group/proj/-/issues/9", title: "T", labels: ["bug", "P2"] }),
+        issueStateRoute(200, { iid: 9, web_url: "https://gitlab.example.com/group/proj/-/issues/9", title: "T" }),
+      ]);
+      const app = buildTestApp();
+      const resp = await authed(app, token, "/api/issues/action", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "set_priority",
+          repo_id: repoId,
+          issue_number: 9,
+          comment: "客户产线停机 2 小时，业务方要求今天内处理",
+          priority: "P1",
+          session_id: sessionId,
+        }),
+      });
+      expect(resp.status).toBe(200);
+      expect(await resp.json()).toEqual({
+        ok: true,
+        issue_number: 9,
+        issue_url: "https://gitlab.example.com/group/proj/-/issues/9",
+      });
+
+      // 评论是强制的 —— 优先级变更必须在 tracker 上留下"为什么"
+      const note = findFetchCall(mock, isIssueNote);
+      expect(JSON.parse(note.init.body as string)).toEqual({
+        body: "客户产线停机 2 小时，业务方要求今天内处理",
+      });
+
+      // 增量改标签：只加 P1、只摘 P2，不碰无关的 bug
+      const put = findFetchCall(mock, isIssueState);
+      expect(JSON.parse(put.init.body as string)).toEqual({ add_labels: "P1", remove_labels: "P2" });
+
+      const rows = await client.getIssueActionsForSession(sessionId);
+      expect(rows).toHaveLength(1);
+      // 目标标签写进 action 列，否则这行审计记录看不出改成了什么
+      expect(rows[0]).toMatchObject({ issue_number: 9, action: "set_priority:P1" });
+    });
+
+    it("issue carries no priority label yet -> PUT only adds, no remove_labels key", async () => {
+      const { id: userId, token } = await seedUser("admin", "prio-firsttime");
+      const repoId = await seedRepo();
+      const sessionId = await client.createSession("New Chat", userId);
+      const mock = stubFetch([
+        PRIORITY_LABELS_ROUTE,
+        issueNoteRoute(201),
+        issueGetRoute(200, { iid: 9, web_url: "https://gitlab.example.com/group/proj/-/issues/9", title: "T", labels: ["bug"] }),
+        issueStateRoute(200, { iid: 9, web_url: "https://gitlab.example.com/group/proj/-/issues/9", title: "T" }),
+      ]);
+      const app = buildTestApp();
+      const resp = await authed(app, token, "/api/issues/action", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "set_priority",
+          repo_id: repoId,
+          issue_number: 9,
+          comment: "业务方要求排期",
+          priority: "P0",
+          session_id: sessionId,
+        }),
+      });
+      expect(resp.status).toBe(200);
+      expect(JSON.parse(findFetchCall(mock, isIssueState).init.body as string)).toEqual({ add_labels: "P0" });
+    });
+
+    it("two escalations in one session (P2 -> P1 -> P0) both apply — the target label is part of the dedupe key", async () => {
+      const { id: userId, token } = await seedUser("admin", "prio-escalate");
+      const repoId = await seedRepo();
+      const sessionId = await client.createSession("New Chat", userId);
+      stubFetch([
+        PRIORITY_LABELS_ROUTE,
+        issueNoteRoute(201),
+        issueGetRoute(200, { iid: 9, web_url: "https://gitlab.example.com/group/proj/-/issues/9", title: "T", labels: ["P2"] }),
+        issueStateRoute(200, { iid: 9, web_url: "https://gitlab.example.com/group/proj/-/issues/9", title: "T" }),
+      ]);
+      const app = buildTestApp();
+      for (const priority of ["P1", "P0"]) {
+        const resp = await authed(app, token, "/api/issues/action", {
+          method: "POST",
+          body: JSON.stringify({
+            action: "set_priority",
+            repo_id: repoId,
+            issue_number: 9,
+            comment: `升到 ${priority}`,
+            priority,
+            session_id: sessionId,
+          }),
+        });
+        expect(resp.status).toBe(200);
+      }
+      const rows = await client.getIssueActionsForSession(sessionId);
+      expect(rows.map((r) => r.action)).toEqual(["set_priority:P1", "set_priority:P0"]);
+    });
   });
 
   it("recheck fires when the acted-on issue DOES have a matching submission, and updates its tracker state", async () => {

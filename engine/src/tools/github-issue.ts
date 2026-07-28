@@ -18,7 +18,13 @@
 import { Type, type Static } from "@sinclair/typebox";
 import { registerTool, type ToolDef, type ToolContext } from "./registry.js";
 import { getActiveRepo } from "./access.js";
-import { getRepoLabels, normalizeLabels, searchRepoIssues } from "./issue-tracker-client.js";
+import {
+  getRepoLabels,
+  isPriorityLabel,
+  listPriorityLabels,
+  normalizeLabels,
+  searchRepoIssues,
+} from "./issue-tracker-client.js";
 import { embedTexts, l2Normalize } from "./embedding-client.js";
 import { loadSettings, type Settings } from "../config.js";
 
@@ -207,26 +213,41 @@ export const draftIssueTool: ToolDef<typeof DraftIssueParams> = {
 const ManageIssueParams = Type.Object({
   issue_number: Type.Integer(),
   // Deliberately Type.String(), not a literal union of ("comment"|"close"|
-  // "reopen") — an out-of-enum value must reach this tool's OWN error text
-  // below, not get rejected upstream by pi's own schema validation before
-  // the call ever happens (that would surface as a generic schema-mismatch
-  // failure instead of the tool's specific, actionable message).
+  // "reopen"|"set_priority") — an out-of-enum value must reach this tool's
+  // OWN error text below, not get rejected upstream by pi's own schema
+  // validation before the call ever happens (that would surface as a
+  // generic schema-mismatch failure instead of the tool's specific,
+  // actionable message).
   action: Type.String(),
   comment: Type.String(),
+  // Only read for action:"set_priority". Optional so the other three
+  // actions keep their existing call shape unchanged.
+  priority: Type.Optional(Type.String()),
 });
 
 const MANAGE_ISSUE_DESCRIPTION =
-  "Preview an action on an ALREADY-FILED issue — add a comment, close it, or reopen it. Use this when a " +
+  "Preview an action on an ALREADY-FILED issue — add a comment, close it, reopen it, or change its " +
+  "priority. Use this when a " +
   "previously-submitted issue turns out to need correction (the underlying bug/requirement understanding " +
   "was wrong, not just something the LLM misread) or turns out invalid/already-resolved — NOT for " +
   "reporting a new problem, that's draft_issue. Creates a preview card for the user to confirm before " +
   "anything is actually posted to the tracker. issue_number is the tracker's issue number (the user " +
   "usually has it — if not, try search_repo_issues by title first before asking them). action is 'comment' (add a note, issue stays " +
   "open — for a clarification/correction that doesn't change the outcome), 'close' (add the comment then " +
-  "close — for invalid/wontfix/already-fixed-elsewhere), or 'reopen' (for a previously-closed issue that " +
-  "needs revisiting). comment is REQUIRED for all three: always state plainly why — what was previously " +
-  "misunderstood and what's actually true — since whoever reads the tracker later needs that context as " +
-  "much as the user confirming now.";
+  "close — for invalid/wontfix/already-fixed-elsewhere), 'reopen' (for a previously-closed issue that " +
+  "needs revisiting), or 'set_priority' (raise or lower an already-filed issue's priority — this is the " +
+  "action for a business/reporting user saying something has become more or less urgent than when it was " +
+  "filed, e.g. 产线停了/客户催了/这个先放放). For set_priority also pass `priority`: the target priority " +
+  "label. It must be one the project already has configured (this repo's own vocabulary — commonly P0-P4 " +
+  "or priority::high); it is validated here, and if it's wrong the error tells you exactly which values " +
+  "this repo accepts, so pick from that list and call again rather than guessing a second time. Setting a " +
+  "priority replaces whatever priority label the issue currently carries — an issue only ever has one. " +
+  "comment is REQUIRED for all four: always state plainly why — what was previously " +
+  "misunderstood and what's actually true, or for set_priority what changed to justify the new priority " +
+  "(who is blocked, since when, what the business impact is) — since whoever reads the tracker later " +
+  "needs that context as much as the user confirming now. Do NOT change a priority on your own judgment " +
+  "of severity: this action exists to carry the reporting user's stated urgency to the tracker, so it " +
+  "needs something they actually told you, not an inference from the code.";
 
 /** v1's manage_issue — a sync function there (no I/O, no tool_context
  * await needed); this port has no real await inside either, but must
@@ -238,14 +259,19 @@ async function manageIssueExecute(
   input: Static<typeof ManageIssueParams>,
   ctx: ToolContext,
 ): Promise<string> {
-  if (input.action !== "comment" && input.action !== "close" && input.action !== "reopen") {
+  if (
+    input.action !== "comment" &&
+    input.action !== "close" &&
+    input.action !== "reopen" &&
+    input.action !== "set_priority"
+  ) {
     return JSON.stringify({
-      error: `Invalid action '${input.action}' — must be one of: comment, close, reopen`,
+      error: `Invalid action '${input.action}' — must be one of: comment, close, reopen, set_priority`,
     });
   }
   if (!input.comment.trim()) {
     return JSON.stringify({
-      error: "comment is required — explain why this issue is being commented on/closed/reopened",
+      error: "comment is required — explain why this issue is being commented on/closed/reopened/reprioritized",
     });
   }
 
@@ -260,14 +286,69 @@ async function manageIssueExecute(
     });
   }
 
-  return JSON.stringify({
+  const result: Record<string, unknown> = {
     type: "issue_action_draft",
     issue_number: input.issue_number,
     action: input.action,
     comment: input.comment,
     repo_id: activeRepo.id,
     repo_name: activeRepo.name,
-  });
+  };
+
+  if (input.action === "set_priority") {
+    // 不同于 draft_issue 的标签校验（那边校验失败就降级成"按原样提交 + 一条
+    // label_note"）：这里必须 fail-closed。set_priority 的全部内容就是那一个
+    // 标签，词表读不到就无从判断它是否存在，放行只会让用户在卡片上确认一个
+    // 服务端稍后必然拒绝、或者更糟——写进去一个仓库里并不存在的标签。
+    const requested = (input.priority ?? "").trim();
+    if (!requested) {
+      return JSON.stringify({
+        error: "action 'set_priority' requires the `priority` parameter — the target priority label",
+      });
+    }
+    if (!ctx.db) {
+      return JSON.stringify({ error: "无法校验优先级标签：当前上下文没有数据库连接。" });
+    }
+    let available: string[] | null = null;
+    try {
+      const repo = await ctx.db.getRepoAdmin(activeRepo.id);
+      available = repo ? await getRepoLabels(repo) : null;
+    } catch {
+      available = null;
+    }
+    if (available === null) {
+      return JSON.stringify({
+        error:
+          "暂时读不到该仓库的标签词表（tracker API 不可达或凭证失效），无法校验优先级标签。请让用户稍后重试，或在 仓库管理 → 编辑 里检查凭证。",
+      });
+    }
+
+    const priorityVocab = listPriorityLabels(available);
+    if (priorityVocab.length === 0) {
+      return JSON.stringify({
+        error:
+          `仓库 ${activeRepo.name} 尚未配置任何优先级标签（如 P0-P4 / priority::high），无法调整优先级。` +
+          "请告诉用户：需要先由项目管理员在 tracker 上建好优先级标签，之后才能用这个功能；" +
+          "在那之前可以改用 action:'comment' 把提级诉求作为评论留在 issue 上。",
+      });
+    }
+
+    // 同一套 normalizeLabels：大小写不敏感 + scoped 后缀唯一匹配（'high' →
+    // 'priority::high'），让模型的自然简写也能落到规范名上。
+    const { accepted } = normalizeLabels([requested], available);
+    const canonical = accepted[0];
+    if (!canonical || !isPriorityLabel(canonical)) {
+      return JSON.stringify({
+        error:
+          `'${requested}' 不是仓库 ${activeRepo.name} 的有效优先级标签。` +
+          `该仓库可选：${priorityVocab.join(", ")}。请从中选一个重新调用。`,
+      });
+    }
+    result.priority = canonical;
+    result.priority_options = priorityVocab;
+  }
+
+  return JSON.stringify(result);
 }
 
 export const manageIssueTool: ToolDef<typeof ManageIssueParams> = {

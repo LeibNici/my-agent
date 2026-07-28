@@ -248,7 +248,7 @@ describe("manageIssueTool (name manage_issue)", () => {
     );
     const parsed = JSON.parse(result);
     expect(parsed).toEqual({
-      error: "Invalid action 'delete' — must be one of: comment, close, reopen",
+      error: "Invalid action 'delete' — must be one of: comment, close, reopen, set_priority",
     });
   });
 
@@ -259,7 +259,7 @@ describe("manageIssueTool (name manage_issue)", () => {
     );
     const parsed = JSON.parse(result);
     expect(parsed).toEqual({
-      error: "comment is required — explain why this issue is being commented on/closed/reopened",
+      error: "comment is required — explain why this issue is being commented on/closed/reopened/reprioritized",
     });
   });
 
@@ -305,6 +305,102 @@ describe("manageIssueTool (name manage_issue)", () => {
       });
     },
   );
+
+  // 2026-07-28: set_priority — 业务人员在 issue 提交后发起提级/降级。
+  // 与另外三个 action 的关键区别是它会去读仓库标签词表，且校验是 fail-closed
+  // 的（draft_issue 那边读不到词表会降级放行，这里不行）。
+  describe("action='set_priority'", () => {
+    const comment = "客户产线已停机 2 小时，需要今天内处理";
+
+    it("no `priority` parameter -> {error} naming the missing parameter, before any vocabulary read", async () => {
+      const result = await manageIssueTool.execute(
+        { issue_number: 777, action: "set_priority", comment },
+        makeCtx({ grantedRepos: [repoA], db: makeDb() }),
+      );
+      expect(JSON.parse(result)).toEqual({
+        error: "action 'set_priority' requires the `priority` parameter — the target priority label",
+      });
+      expect(mockedGetRepoLabels).not.toHaveBeenCalled();
+    });
+
+    it("vocabulary unavailable (getRepoLabels -> null) -> hard {error}, NOT draft_issue's degrade-and-continue", async () => {
+      mockedGetRepoLabels.mockResolvedValue(null);
+      const result = await manageIssueTool.execute(
+        { issue_number: 777, action: "set_priority", comment, priority: "P1" },
+        makeCtx({ grantedRepos: [repoA], db: makeDb() }),
+      );
+      expect(JSON.parse(result).error).toContain("暂时读不到该仓库的标签词表");
+    });
+
+    it("repo has a vocabulary but NO priority labels in it -> {error} telling the user to configure them, suggesting comment instead", async () => {
+      mockedGetRepoLabels.mockResolvedValue(["bug", "enhancement", "confirmed"]);
+      const result = await manageIssueTool.execute(
+        { issue_number: 777, action: "set_priority", comment, priority: "P1" },
+        makeCtx({ grantedRepos: [repoA], db: makeDb() }),
+      );
+      const { error } = JSON.parse(result);
+      expect(error).toContain("尚未配置任何优先级标签");
+      expect(error).toContain("action:'comment'");
+    });
+
+    it("priority not in the vocabulary -> {error} listing exactly the repo's real priority labels", async () => {
+      mockedGetRepoLabels.mockResolvedValue(["bug", "P0", "P1", "P2"]);
+      const result = await manageIssueTool.execute(
+        { issue_number: 777, action: "set_priority", comment, priority: "P9" },
+        makeCtx({ grantedRepos: [repoA], db: makeDb() }),
+      );
+      const { error } = JSON.parse(result);
+      expect(error).toContain("'P9' 不是仓库 repo-a 的有效优先级标签");
+      expect(error).toContain("P0, P1, P2");
+      // 'bug' 在词表里但不是优先级标签，不能出现在可选项里
+      expect(error).not.toContain("bug");
+    });
+
+    it("a non-priority label that DOES exist in the vocabulary is still rejected (can't relabel arbitrarily through this action)", async () => {
+      mockedGetRepoLabels.mockResolvedValue(["bug", "reviewed", "P0", "P1"]);
+      const result = await manageIssueTool.execute(
+        { issue_number: 777, action: "set_priority", comment, priority: "reviewed" },
+        makeCtx({ grantedRepos: [repoA], db: makeDb() }),
+      );
+      expect(JSON.parse(result).error).toContain("不是仓库 repo-a 的有效优先级标签");
+    });
+
+    it("valid priority -> issue_action_draft carrying the label + the repo's options", async () => {
+      mockedGetRepoLabels.mockResolvedValue(["bug", "P0", "P1", "P2"]);
+      const result = await manageIssueTool.execute(
+        { issue_number: 777, action: "set_priority", comment, priority: "P1" },
+        makeCtx({ grantedRepos: [repoA], db: makeDb() }),
+      );
+      expect(JSON.parse(result)).toEqual({
+        type: "issue_action_draft",
+        issue_number: 777,
+        action: "set_priority",
+        comment,
+        repo_id: repoA.id,
+        repo_name: repoA.name,
+        priority: "P1",
+        priority_options: ["P0", "P1", "P2"],
+      });
+    });
+
+    it("normalizeLabels' case-insensitive / scoped-suffix matching applies here too ('high' -> 'priority::high')", async () => {
+      mockedGetRepoLabels.mockResolvedValue(["bug", "priority::high", "priority::low"]);
+      const result = await manageIssueTool.execute(
+        { issue_number: 777, action: "set_priority", comment, priority: "high" },
+        makeCtx({ grantedRepos: [repoA], db: makeDb() }),
+      );
+      expect(JSON.parse(result).priority).toBe("priority::high");
+    });
+
+    it("the active-repo check still runs first — ambiguous repo yields the target-repo error, not a priority error", async () => {
+      const result = await manageIssueTool.execute(
+        { issue_number: 777, action: "set_priority", comment, priority: "P1" },
+        ambiguousRepoCtx,
+      );
+      expect(JSON.parse(result).error).toContain("无法确定目标仓库");
+      expect(mockedGetRepoLabels).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // 2026-07-15: search_repo_issues — makes the same title/keyword search the

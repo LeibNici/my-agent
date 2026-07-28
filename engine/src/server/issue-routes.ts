@@ -21,6 +21,8 @@ import type { Env } from "./app.js";
 import { userOwnsSession, type CurrentUser } from "./sse.js";
 import {
   getRepoLabels,
+  isPriorityLabel,
+  listPriorityLabels,
   normalizeLabels,
   submitRepoIssue,
   applyRepoIssueAction,
@@ -399,6 +401,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
       issue_number?: unknown;
       action?: unknown;
       comment?: unknown;
+      priority?: unknown;
       session_id?: unknown;
       draft_tool_use_id?: unknown;
     }>(c);
@@ -407,8 +410,13 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     // v1's own explicit validation order (these two are hand-checked in
     // v1's handler body, unlike repo_id/issue_number which Pydantic would
     // reject before the handler even runs).
-    if (body.action !== "comment" && body.action !== "close" && body.action !== "reopen") {
-      return c.json({ detail: "action must be one of: comment, close, reopen" }, 400);
+    if (
+      body.action !== "comment" &&
+      body.action !== "close" &&
+      body.action !== "reopen" &&
+      body.action !== "set_priority"
+    ) {
+      return c.json({ detail: "action must be one of: comment, close, reopen, set_priority" }, 400);
     }
     if (typeof body.comment !== "string" || !body.comment.trim()) {
       return c.json({ detail: "comment is required" }, 400);
@@ -417,12 +425,44 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     if (typeof body.issue_number !== "number") {
       return c.json({ detail: "issue_number is required" }, 422);
     }
+    const requestedPriority = typeof body.priority === "string" ? body.priority.trim() : "";
+    if (body.action === "set_priority" && !requestedPriority) {
+      return c.json({ detail: "priority is required for action set_priority" }, 400);
+    }
     const sessionId = typeof body.session_id === "string" ? body.session_id : null;
     const draftToolUseId = typeof body.draft_tool_use_id === "string" ? body.draft_tool_use_id : null;
 
     const repoOrResp = await requireRepoWriteAccess(c, deps.db, body.repo_id, user);
     if (repoOrResp instanceof Response) return repoOrResp;
     const repo = repoOrResp;
+
+    // Backstop for manage_issue's own draft-time check, exactly like
+    // /api/issues/submit re-filters the card's labels: the client posts back
+    // whatever the card carried, so the label has to be re-validated against
+    // the tracker's real vocabulary here before anything is written. Unlike
+    // submit — which degrades to "file the issue with no labels" when the
+    // vocabulary is unavailable — there is no degraded version of this
+    // action, so an unreadable vocabulary is a hard failure.
+    let priorityLabel: string | null = null;
+    if (body.action === "set_priority") {
+      const vocabulary = await getRepoLabels(repo);
+      if (vocabulary === null) {
+        return c.json({ detail: "暂时读不到该仓库的标签词表，无法调整优先级，请稍后重试。" }, 502);
+      }
+      const canonical = normalizeLabels([requestedPriority], vocabulary).accepted[0];
+      if (!canonical || !isPriorityLabel(canonical)) {
+        const options = listPriorityLabels(vocabulary);
+        return c.json(
+          {
+            detail: options.length
+              ? `'${requestedPriority}' 不是该仓库的有效优先级标签。可选：${options.join(", ")}。`
+              : `该仓库尚未配置优先级标签，无法调整优先级。`,
+          },
+          400,
+        );
+      }
+      priorityLabel = canonical;
+    }
 
     const sessionResp = await requireOpenSession(c, deps.db, sessionId, user);
     if (sessionResp) return sessionResp;
@@ -437,9 +477,15 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
     // as /api/issues/submit: claim BEFORE calling the tracker, finalize on
     // success, release on failure. Same legacy no-draft-id fallback too
     // (synthetic key from session+repo+issue+action).
+    // The target label is part of the synthetic key, not just the action:
+    // two successive set_priority calls on the same issue in one session
+    // (P2 → P1 → P0 as a situation escalates) are genuinely different
+    // actions, and without the label they'd collide on this key and the
+    // second one would be silently swallowed as a duplicate of the first.
+    const actionKey = priorityLabel ? `${body.action}:${priorityLabel}` : body.action;
     const effectiveDraftKey =
       draftToolUseId ??
-      (sessionId ? `synthetic:${sessionKey(sessionId, body.repo_id, `${body.issue_number}:${body.action}`)}` : null);
+      (sessionId ? `synthetic:${sessionKey(sessionId, body.repo_id, `${body.issue_number}:${actionKey}`)}` : null);
 
     let claimedId: number | null = null;
     if (sessionId && effectiveDraftKey) {
@@ -448,7 +494,14 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
         repoId: body.repo_id,
         userId: user.id,
         issueNumber: body.issue_number,
-        action: body.action,
+        // actionKey, not body.action — issue_actions.action is this
+        // server's only record of what was applied (the target label lives
+        // in the tool result, which is message history, not an audit row),
+        // so "set_priority:P1" is what makes the row self-describing. The
+        // column is free-text with no CHECK constraint and nothing reads it
+        // back for control flow — the confirmation card re-renders from the
+        // tool result, not from here.
+        action: actionKey,
         comment: body.comment,
         draftToolUseId: effectiveDraftKey,
       });
@@ -469,7 +522,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
       claimedId = claim.id;
     }
 
-    const result = await applyRepoIssueAction(repo, body.issue_number, body.action, body.comment);
+    const result = await applyRepoIssueAction(repo, body.issue_number, body.action, body.comment, priorityLabel);
     if ("error" in result) {
       if (claimedId !== null) await deps.db.releaseDraftAction(claimedId);
       return c.json({ detail: result.error }, 502);
@@ -486,7 +539,7 @@ export function mountIssueRoutes(app: Hono<Env>, deps: IssueRoutesDeps): void {
         repoId: body.repo_id,
         userId: user.id,
         issueNumber: body.issue_number,
-        action: body.action,
+        action: actionKey, // same reasoning as the claim path above
         comment: body.comment,
         issueUrl: result.url,
         draftToolUseId,

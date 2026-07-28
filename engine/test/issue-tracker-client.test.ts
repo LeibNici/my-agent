@@ -23,6 +23,8 @@ import {
   githubHeaders,
   gitlabProjectApiBaseFromRepoUrl,
   getRepoLabels,
+  isPriorityLabel,
+  listPriorityLabels,
   normalizeLabels,
   submitRepoIssue,
   applyRepoIssueAction,
@@ -189,6 +191,43 @@ describe("normalizeLabels", () => {
 
   it("重复请求同一个标签只在 accepted 里出现一次", () => {
     expect(normalizeLabels(["bug", "Bug", "BUG"], ["bug"])).toEqual({ accepted: ["bug"], rejected: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isPriorityLabel / listPriorityLabels
+// ---------------------------------------------------------------------------
+
+// 这个判定同时决定了 set_priority 的互斥范围（命中的旧标签都会被摘掉），
+// 所以"不该命中的别命中"和"该命中的要命中"一样重要。
+describe("isPriorityLabel", () => {
+  it.each(["P0", "p3", "priority::high", "Priority/Low", "优先级::高", "urgent", "CRITICAL", "紧急"])(
+    "'%s' 判定为优先级标签",
+    (name) => expect(isPriorityLabel(name)).toBe(true),
+  );
+
+  it.each([
+    "bug",
+    "enhancement",
+    "reviewed",
+    "tested",
+    "hotfix", // 分支命名习惯的流程标签，不是优先级
+    "P10", // 两位数字不匹配 ^p\d$，避免误伤 'P10'/'PR' 之类
+    "",
+    "   ",
+  ])("'%s' 不判定为优先级标签", (name) => expect(isPriorityLabel(name)).toBe(false));
+});
+
+describe("listPriorityLabels", () => {
+  it("按词表原顺序挑出优先级标签，其余全部滤掉", () => {
+    // xinhao 项目的真实形态：群组继承来的流程标签 + 项目级新建的 P0-P4
+    expect(
+      listPriorityLabels(["bugfix", "confirmed", "P0", "document", "P1", "P2", "reviewed"]),
+    ).toEqual(["P0", "P1", "P2"]);
+  });
+
+  it("词表里一个优先级标签都没有 -> []", () => {
+    expect(listPriorityLabels(["bug", "enhancement"])).toEqual([]);
   });
 });
 
@@ -611,6 +650,104 @@ describe("applyRepoIssueAction", () => {
 
       const result = await applyRepoIssueAction(repo, 99, "close", "x");
       expect(result).toEqual({ error: "GitHub update API error (500): server error" });
+    });
+
+    // 2026-07-28 set_priority：GitHub 没有 GitLab 的 add_labels/remove_labels
+    // 增量参数，只能拆成"POST /labels 加"+"DELETE /labels/{name} 删"两步；
+    // 刻意不用 PATCH {labels:[...]} 整体覆盖，那会冲掉并发加上去的别的标签。
+    it("action=set_priority：评论 -> GET 现有标签 -> POST 加新的 -> DELETE 摘旧的，不碰无关标签", async () => {
+      const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+      const fetchMock = vi.fn();
+      fetchMock
+        .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
+        .mockResolvedValueOnce({
+          status: 200,
+          json: async () => ({
+            number: 99,
+            html_url: "https://github.com/acme/widget/issues/99",
+            title: "Line down",
+            labels: [{ name: "bug" }, { name: "P3" }],
+          }),
+          text: async () => "",
+        } as unknown as Response)
+        .mockResolvedValueOnce({ status: 200, json: async () => ([]), text: async () => "" } as unknown as Response)
+        .mockResolvedValueOnce({ status: 200, json: async () => ({}), text: async () => "" } as unknown as Response);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await applyRepoIssueAction(repo, 99, "set_priority", "产线停机", "P1");
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      const [addUrl, addInit] = fetchMock.mock.calls[2];
+      expect(addUrl).toBe("https://api.github.com/repos/acme/widget/issues/99/labels");
+      expect(addInit.method).toBe("POST");
+      expect(JSON.parse(addInit.body as string)).toEqual({ labels: ["P1"] });
+      // 只摘 P3，'bug' 不是优先级标签，必须原样留着
+      const [delUrl, delInit] = fetchMock.mock.calls[3];
+      expect(delUrl).toBe("https://api.github.com/repos/acme/widget/issues/99/labels/P3");
+      expect(delInit.method).toBe("DELETE");
+
+      expect(result).toEqual({
+        success: true,
+        number: 99,
+        url: "https://github.com/acme/widget/issues/99",
+        title: "Line down",
+      });
+    });
+
+    it("set_priority：目标标签已经在 issue 上 -> 跳过 POST，只摘掉别的优先级标签", async () => {
+      const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+      const fetchMock = vi.fn();
+      fetchMock
+        .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
+        .mockResolvedValueOnce({
+          status: 200,
+          json: async () => ({
+            number: 99,
+            html_url: "https://github.com/acme/widget/issues/99",
+            title: "T",
+            labels: [{ name: "P1" }, { name: "urgent" }],
+          }),
+          text: async () => "",
+        } as unknown as Response)
+        .mockResolvedValueOnce({ status: 200, json: async () => ({}), text: async () => "" } as unknown as Response);
+      vi.stubGlobal("fetch", fetchMock);
+
+      await applyRepoIssueAction(repo, 99, "set_priority", "x", "P1");
+      expect(fetchMock).toHaveBeenCalledTimes(3); // 评论 + GET + 一次 DELETE，没有 POST
+      const [delUrl, delInit] = fetchMock.mock.calls[2];
+      expect(delInit.method).toBe("DELETE");
+      expect(delUrl).toBe("https://api.github.com/repos/acme/widget/issues/99/labels/urgent");
+    });
+
+    it("set_priority：DELETE 返回 404（标签已被别人摘掉）视为成功，不当失败处理", async () => {
+      const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+      const fetchMock = vi.fn();
+      fetchMock
+        .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
+        .mockResolvedValueOnce({
+          status: 200,
+          json: async () => ({ number: 99, html_url: "u", title: "T", labels: [{ name: "P3" }] }),
+          text: async () => "",
+        } as unknown as Response)
+        .mockResolvedValueOnce({ status: 200, json: async () => ([]), text: async () => "" } as unknown as Response)
+        .mockResolvedValueOnce({ status: 404, json: async () => ({}), text: async () => "Label does not exist" } as unknown as Response);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await applyRepoIssueAction(repo, 99, "set_priority", "x", "P1");
+      expect(result).toEqual({ success: true, number: 99, url: "u", title: "T" });
+    });
+
+    it("set_priority：读 issue 失败 -> error，标签一个都不动", async () => {
+      const repo = makeRepo({ url: "https://github.com/acme/widget.git" });
+      const fetchMock = vi.fn();
+      fetchMock
+        .mockResolvedValueOnce({ status: 201, json: async () => ({}), text: async () => "" } as unknown as Response)
+        .mockResolvedValueOnce({ status: 403, json: async () => ({}), text: async () => "forbidden" } as unknown as Response);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await applyRepoIssueAction(repo, 99, "set_priority", "x", "P1");
+      expect(result).toEqual({ error: "GitHub issue read API error (403): forbidden" });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
     it("repo 没有 cred_token -> error，零请求", async () => {

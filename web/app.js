@@ -1766,7 +1766,12 @@ async function submitIssue(btn) {
 }
 
 // ===== Issue Action Card (manage_issue — comment/close/reopen an EXISTING issue) =====
-const ISSUE_ACTION_LABELS = { comment: "追加评论", close: "关闭 issue", reopen: "重新打开 issue" };
+const ISSUE_ACTION_LABELS = {
+    comment: "追加评论",
+    close: "关闭 issue",
+    reopen: "重新打开 issue",
+    set_priority: "调整优先级",
+};
 
 function appendIssueActionCard(container, draft, action = null, toolUseId = null) {
     const card = document.createElement("div");
@@ -1776,11 +1781,18 @@ function appendIssueActionCard(container, draft, action = null, toolUseId = null
     const { repoName } = resolveIssueCardRepo(card, draft, action);
     const actionLabel = ISSUE_ACTION_LABELS[draft.action] || draft.action;
 
+    // 优先级卡片多一行"要改成什么"——确认按钮下面就是真写 tracker 了，
+    // 目标值必须在卡片上直接看得见，不能只藏在评论正文里。
+    const priorityRow = draft.priority
+        ? `<div class="issue-labels"><span class="issue-label issue-label-priority">${escapeHtml(draft.priority)}</span></div>`
+        : "";
+
     card.innerHTML = `
         <div class="issue-header">
             <span class="issue-title">${actionLabel} · #${escapeHtml(String(draft.issue_number))}</span>
             <span class="issue-repo" title="目标仓库">${repoName ? "→ " + escapeHtml(repoName) : "→ 提交时选择的仓库"}</span>
         </div>
+        ${priorityRow}
         <div class="issue-body">${renderMarkdown(draft.comment)}</div>
         <div class="issue-actions">
             <button class="btn-confirm" onclick="submitIssueAction(this)" ${action ? "disabled" : ""}>确认${escapeHtml(actionLabel)}</button>
@@ -1810,6 +1822,7 @@ async function submitIssueAction(btn) {
         issue_number: draft.issue_number,
         action: draft.action,
         comment: draft.comment,
+        priority: draft.priority || null,
         session_id: currentSessionId,
         draft_tool_use_id: card.dataset.toolUseId || null,
     }), "已处理");
