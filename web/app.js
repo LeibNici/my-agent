@@ -48,6 +48,14 @@ const streamingSessions = new Map(); // key -> AbortController
 // they must never reach into streamingSessions for a DIFFERENT key.
 let viewingStreamKey = null;
 
+// Whether the transcript should auto-follow new content. Starts true (new
+// chat opens pinned to bottom); flips false the moment the user scrolls
+// away from the bottom, so a manual scroll-up to reread history survives
+// the next streamed token instead of being yanked back down. Flips back
+// once they scroll back near the bottom themselves, or on any explicit
+// scrollToBottom() call (sending a message, opening a session, etc).
+let stickToBottom = true;
+
 function isViewingStreamActive() {
     return viewingStreamKey != null && streamingSessions.has(viewingStreamKey);
 }
@@ -126,6 +134,19 @@ document.addEventListener("DOMContentLoaded", () => {
     loadSkills();
     loadSessions();
     refreshMyIssuesBadge(); // _isAuthenticated already guaranteed by the early return above
+
+    // Track whether the user has scrolled away from the bottom so the
+    // streaming handlers (scrollToBottomIfStuck) know to stop forcing the
+    // view back down — otherwise every streamed token/tool event snaps the
+    // transcript to the end, and a manual scroll-up never sticks.
+    const messagesDiv = document.getElementById("messages");
+    if (messagesDiv) {
+        const STICK_THRESHOLD_PX = 80;
+        messagesDiv.addEventListener("scroll", () => {
+            const distanceFromBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
+            stickToBottom = distanceFromBottom < STICK_THRESHOLD_PX;
+        });
+    }
 
     const inputArea = document.getElementById("input-area");
     if (inputArea) {
@@ -832,7 +853,7 @@ async function sendMessage() {
                         fullText += data.text;
                         // During streaming: show plain text (avoids broken partial markdown)
                         activeRun.el.innerHTML = escapeHtml(activeRun.text).replace(/\n/g, "<br>");
-                        scrollToBottom();
+                        scrollToBottomIfStuck();
                     } else if (eventType === "tool_use") {
                         activeRun = null; // any further text starts a new run, still inserted before the tool group
                         if (!messageToolGroup) {
@@ -843,7 +864,7 @@ async function sendMessage() {
                         messageToolGroup.counts[data.name] = (messageToolGroup.counts[data.name] || 0) + 1;
                         updateToolGroupSummary(messageToolGroup);
                         appendToolBlock(messageToolGroup.bodyEl, data.name, data.input, null);
-                        scrollToBottom();
+                        scrollToBottomIfStuck();
                     } else if (eventType === "tool_result") {
                         if (messageToolGroup) {
                             updateToolResult(messageToolGroup.bodyEl, data.name, data.result);
@@ -871,7 +892,7 @@ async function sendMessage() {
                         // tool call, or the final answer) — show a visible "still
                         // working" cue instead of going silent until it does.
                         showThinking(contentEl);
-                        scrollToBottom();
+                        scrollToBottomIfStuck();
                     } else if (eventType === "done") {
                         // Belt-and-suspenders re-key, same guard as the "session"
                         // handler above — the id shouldn't actually change between
@@ -1453,6 +1474,14 @@ function truncate(str, maxLen) {
 function scrollToBottom() {
     const messagesDiv = document.getElementById("messages");
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    stickToBottom = true;
+}
+
+// Same, but only while the user hasn't scrolled away from the bottom —
+// used by the per-token/per-event streaming handlers, which fire far too
+// often to force-scroll unconditionally without trapping the view.
+function scrollToBottomIfStuck() {
+    if (stickToBottom) scrollToBottom();
 }
 
 // ===== Shared by both issue-card types (draft + action) =====
